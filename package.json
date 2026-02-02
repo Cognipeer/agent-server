@@ -1,0 +1,97 @@
+{
+  "name": "@cognipeer/agent-server",
+  "version": "0.1.0",
+  "description": "REST API server infrastructure for AI agents - supports agent-sdk and custom implementations",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./express": {
+      "import": "./dist/adapters/express.js",
+      "types": "./dist/adapters/express.d.ts"
+    },
+    "./next": {
+      "import": "./dist/adapters/next.js",
+      "types": "./dist/adapters/next.d.ts"
+    },
+    "./postgres": {
+      "import": "./dist/providers/storage/postgres.js",
+      "types": "./dist/providers/storage/postgres.d.ts"
+    },
+    "./mongodb": {
+      "import": "./dist/providers/storage/mongodb.js",
+      "types": "./dist/providers/storage/mongodb.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "lint": "eslint src --ext .ts",
+    "test": "vitest",
+    "typecheck": "tsc --noEmit",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "rest-api",
+    "server",
+    "cognipeer",
+    "llm"
+  ],
+  "author": "Cognipeer",
+  "license": "MIT",
+  "dependencies": {
+    "nanoid": "^5.0.7",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "eslint": "^9.5.0",
+    "tsup": "^8.1.0",
+    "typescript": "^5.4.5",
+    "vitepress": "^1.0.0",
+    "vitest": "^1.6.0"
+  },
+  "peerDependencies": {
+    "@cognipeer/agent-sdk": ">=0.1.0",
+    "express": ">=4.0.0",
+    "mongodb": ">=6.0.0",
+    "next": ">=13.0.0",
+    "pg": ">=8.0.0",
+    "swagger-ui-express": ">=5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@cognipeer/agent-sdk": {
+      "optional": true
+    },
+    "express": {
+      "optional": true
+    },
+    "mongodb": {
+      "optional": true
+    },
+    "next": {
+      "optional": true
+    },
+    "pg": {
+      "optional": true
+    },
+    "swagger-ui-express": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

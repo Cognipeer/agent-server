@@ -1,0 +1,56 @@
+# Contributing
+
+Thank you for your interest in contributing to `@cognipeer/agent-server`!
+
+## Development Setup
+
+1. Clone the repository:
+
+```bash
+git clone https://github.com/Cognipeer/agent-server.git
+cd agent-server
+```
+
+2. Install dependencies:
+
+```bash
+npm install
+```
+
+3. Start development mode:
+
+```bash
+npm run dev
+```
+
+## Running Tests
+
+```bash
+npm test
+```
+
+## Building
+
+```bash
+npm run build
+```
+
+## Code Style
+
+We use ESLint for code linting:
+
+```bash
+npm run lint
+```
+
+## Pull Requests
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Run tests and linting
+5. Submit a pull request
+
+## Reporting Issues
+
+Please report bugs and feature requests on [GitHub Issues](https://github.com/Cognipeer/agent-server/issues).
