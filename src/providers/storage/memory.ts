@@ -10,12 +10,18 @@ import type {
   Conversation,
   Message,
   FileRecord,
+  Task,
+  TaskResult,
   CreateConversationParams,
   GetConversationsParams,
   UpdateConversationParams,
   CreateMessageParams,
   GetMessagesParams,
   SaveFileParams,
+  CreateTaskParams,
+  GetTasksParams,
+  UpdateTaskParams,
+  CreateTaskResultParams,
   PaginatedResult,
 } from "../../types.js";
 
@@ -43,6 +49,8 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
   private files: Map<string, FileRecord> = new Map();
   private fileContents: Map<string, Buffer> = new Map(); // storageKey -> content
   private totalFileSize = 0;
+  private tasks: Map<string, Task> = new Map();
+  private taskResults: Map<string, TaskResult> = new Map(); // taskId -> result
 
   constructor(config: InMemoryConfig = {}) {
     super();
@@ -70,6 +78,8 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
     this.messages.clear();
     this.files.clear();
     this.fileContents.clear();
+    this.tasks.clear();
+    this.taskResults.clear();
     this.totalFileSize = 0;
   }
 
@@ -356,6 +366,136 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
       }
       this.files.delete(id);
     }
+  }
+
+  // ============================================================================
+  // Tasks
+  // ============================================================================
+
+  protected async _createTask(
+    id: string,
+    params: CreateTaskParams
+  ): Promise<Task> {
+    const now = new Date();
+    const task: Task = {
+      id,
+      agentId: params.agentId,
+      userId: params.userId,
+      status: "pending",
+      callbackUrl: params.callbackUrl,
+      input: params.input,
+      files: params.files,
+      metadata: params.metadata || {},
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    this.tasks.set(id, task);
+    return task;
+  }
+
+  protected async _getTask(id: string): Promise<Task | null> {
+    return this.tasks.get(id) || null;
+  }
+
+  protected async _getTasks(
+    params: GetTasksParams
+  ): Promise<PaginatedResult<Task>> {
+    const normalized = this.normalizeParams(params, { limit: 20, offset: 0 });
+
+    // Filter tasks
+    let tasks = Array.from(this.tasks.values());
+
+    if (params.agentId) {
+      tasks = tasks.filter((t) => t.agentId === params.agentId);
+    }
+    if (params.userId) {
+      tasks = tasks.filter((t) => t.userId === params.userId);
+    }
+    if (params.status) {
+      tasks = tasks.filter((t) => t.status === params.status);
+    }
+
+    // Sort
+    const orderBy = params.orderBy === "updatedAt" ? "updatedAt" : "createdAt";
+    const order = params.order === "asc" ? 1 : -1;
+    tasks.sort((a, b) => {
+      const aTime = a[orderBy].getTime();
+      const bTime = b[orderBy].getTime();
+      return (aTime - bTime) * order;
+    });
+
+    const total = tasks.length;
+
+    // Paginate
+    const data = tasks.slice(
+      normalized.offset,
+      normalized.offset + normalized.limit
+    );
+
+    return {
+      data,
+      total,
+      limit: normalized.limit,
+      offset: normalized.offset,
+      hasMore: normalized.offset + data.length < total,
+    };
+  }
+
+  protected async _updateTask(
+    id: string,
+    params: UpdateTaskParams
+  ): Promise<Task> {
+    const task = this.tasks.get(id);
+    if (!task) {
+      throw new Error(`Task not found: ${id}`);
+    }
+
+    const updated: Task = {
+      ...task,
+      status: params.status !== undefined ? params.status : task.status,
+      startedAt: params.startedAt !== undefined ? params.startedAt : task.startedAt,
+      completedAt: params.completedAt !== undefined ? params.completedAt : task.completedAt,
+      error: params.error !== undefined ? params.error : task.error,
+      metadata: params.metadata !== undefined ? params.metadata : task.metadata,
+      updatedAt: new Date(),
+    };
+
+    this.tasks.set(id, updated);
+    return updated;
+  }
+
+  protected async _deleteTask(id: string): Promise<void> {
+    // Delete task result if exists
+    this.taskResults.delete(id);
+    this.tasks.delete(id);
+  }
+
+  // ============================================================================
+  // Task Results
+  // ============================================================================
+
+  protected async _createTaskResult(
+    id: string,
+    params: CreateTaskResultParams
+  ): Promise<TaskResult> {
+    const now = new Date();
+    const result: TaskResult = {
+      id,
+      taskId: params.taskId,
+      content: params.content,
+      files: params.files,
+      metadata: params.metadata || {},
+      usage: params.usage,
+      createdAt: now,
+    };
+
+    this.taskResults.set(params.taskId, result);
+    return result;
+  }
+
+  protected async _getTaskResult(taskId: string): Promise<TaskResult | null> {
+    return this.taskResults.get(taskId) || null;
   }
 
   // ============================================================================

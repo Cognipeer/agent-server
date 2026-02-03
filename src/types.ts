@@ -141,6 +141,17 @@ export interface StorageProvider {
   getFile(id: string): Promise<FileRecord | null>;
   getFileContent(id: string): Promise<Buffer | null>;
   deleteFile(id: string): Promise<void>;
+
+  // Tasks
+  createTask(params: CreateTaskParams): Promise<Task>;
+  getTask(id: string): Promise<Task | null>;
+  getTasks(params: GetTasksParams): Promise<PaginatedResult<Task>>;
+  updateTask(id: string, params: UpdateTaskParams): Promise<Task>;
+  deleteTask(id: string): Promise<void>;
+
+  // Task Results
+  createTaskResult(params: CreateTaskResultParams): Promise<TaskResult>;
+  getTaskResult(taskId: string): Promise<TaskResult | null>;
 }
 
 export interface CreateConversationParams {
@@ -615,5 +626,127 @@ export class AuthorizationError extends AgentServerError {
   constructor(message: string = "Access denied") {
     super(message, "AUTHORIZATION_ERROR", 403);
   }
+}
+
+// ============================================================================
+// Task Types
+// ============================================================================
+
+export type TaskStatus = "pending" | "running" | "completed" | "failed";
+
+export interface Task {
+  id: string;
+  agentId: string;
+  userId?: string;
+  status: TaskStatus;
+  callbackUrl?: string;
+  input: string;
+  files?: FileAttachment[];
+  metadata?: Record<string, unknown>;
+  createdAt: Date;
+  updatedAt: Date;
+  startedAt?: Date;
+  completedAt?: Date;
+  error?: string;
+}
+
+export interface TaskResult {
+  id: string;
+  taskId: string;
+  content: string;
+  files?: FileAttachment[];
+  metadata?: Record<string, unknown>;
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+  };
+  createdAt: Date;
+}
+
+export interface CreateTaskParams {
+  agentId: string;
+  userId?: string;
+  input: string;
+  files?: FileAttachment[];
+  callbackUrl?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface GetTasksParams {
+  agentId?: string;
+  userId?: string;
+  status?: TaskStatus;
+  limit?: number;
+  offset?: number;
+  orderBy?: "createdAt" | "updatedAt";
+  order?: "asc" | "desc";
+}
+
+export interface UpdateTaskParams {
+  status?: TaskStatus;
+  startedAt?: Date;
+  completedAt?: Date;
+  error?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CreateTaskResultParams {
+  taskId: string;
+  content: string;
+  files?: FileAttachment[];
+  metadata?: Record<string, unknown>;
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+  };
+}
+
+// ============================================================================
+// Task Request/Response Types
+// ============================================================================
+
+export interface CreateTaskRequest {
+  agentId: string;
+  input: string;
+  files?: Array<{
+    name: string;
+    content: string; // base64
+    mimeType: string;
+  }>;
+  callbackUrl?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CreateTaskResponse {
+  task: Task;
+}
+
+export interface ListTasksResponse {
+  tasks: Task[];
+  total: number;
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+}
+
+export interface GetTaskResponse {
+  task: Task;
+  result?: TaskResult;
+}
+
+export interface GetTaskStatusResponse {
+  taskId: string;
+  status: TaskStatus;
+  createdAt: Date;
+  updatedAt: Date;
+  startedAt?: Date;
+  completedAt?: Date;
+  error?: string;
+}
+
+export interface GetTaskResultResponse {
+  result: TaskResult;
 }
 
