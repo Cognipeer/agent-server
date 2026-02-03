@@ -13,6 +13,8 @@ import type {
   Conversation,
   Message,
   FileRecord,
+  Task,
+  TaskResult,
   SendMessageRequest,
   SendMessageResponse,
   CreateConversationRequest,
@@ -22,6 +24,12 @@ import type {
   GetConversationResponse,
   UploadFileRequest,
   UploadFileResponse,
+  CreateTaskRequest,
+  CreateTaskResponse,
+  ListTasksResponse,
+  GetTaskResponse,
+  GetTaskStatusResponse,
+  GetTaskResultResponse,
   AuthenticationError,
   NotFoundError,
   ValidationError,
@@ -247,6 +255,13 @@ export class AgentServer {
       "/files/:fileId/content",
       this.handleDownloadFile.bind(this)
     );
+
+    // Task routes
+    this.addRoute("POST", "/tasks", this.handleCreateTask.bind(this));
+    this.addRoute("GET", "/tasks", this.handleListTasks.bind(this));
+    this.addRoute("GET", "/tasks/:taskId", this.handleGetTask.bind(this));
+    this.addRoute("GET", "/tasks/:taskId/status", this.handleGetTaskStatus.bind(this));
+    this.addRoute("GET", "/tasks/:taskId/result", this.handleGetTaskResult.bind(this));
   }
 
   private addRoute(
@@ -1101,6 +1116,360 @@ export class AgentServer {
       },
       raw: content,
     };
+  }
+
+  // ============================================================================
+  // Task Routes
+  // ============================================================================
+
+  private async handleCreateTask(
+    ctx: RouteContext
+  ): Promise<RouteResult<CreateTaskResponse>> {
+    const body = ctx.body as CreateTaskRequest;
+
+    if (!body?.agentId || !body?.input) {
+      throw {
+        statusCode: 400,
+        code: "VALIDATION_ERROR",
+        message: "agentId and input are required",
+      } as ValidationError;
+    }
+
+    // Check if agent exists
+    if (!this.agents.has(body.agentId)) {
+      throw {
+        statusCode: 404,
+        code: "NOT_FOUND",
+        message: `Agent not found: ${body.agentId}`,
+      } as NotFoundError;
+    }
+
+    // Resolve userId
+    const userId = ctx.user?.id || await this.resolveUserId(ctx);
+
+    // Process file uploads if provided
+    const files: Task["files"] = [];
+    if (body.files && body.files.length > 0) {
+      for (const f of body.files) {
+        const content = Buffer.from(f.content, "base64");
+        const fileRecord = await this.config.storage.saveFile({
+          name: f.name,
+          mimeType: f.mimeType,
+          content,
+          metadata: { uploadedForTask: true },
+        });
+        files.push({
+          id: fileRecord.id,
+          name: fileRecord.name,
+          mimeType: fileRecord.mimeType,
+          size: fileRecord.size,
+          storageKey: fileRecord.storageKey,
+        });
+      }
+    }
+
+    // Create task
+    const task = await this.config.storage.createTask({
+      agentId: body.agentId,
+      userId,
+      input: body.input,
+      files,
+      callbackUrl: body.callbackUrl,
+      metadata: body.metadata,
+    });
+
+    // Start background processing
+    this.processTaskInBackground(task.id).catch((error) => {
+      console.error(`Error processing task ${task.id}:`, error);
+    });
+
+    return {
+      status: 201,
+      body: { task },
+    };
+  }
+
+  private async handleListTasks(
+    ctx: RouteContext
+  ): Promise<RouteResult<ListTasksResponse>> {
+    const agentId = ctx.query.agentId as string | undefined;
+    const status = ctx.query.status as Task["status"] | undefined;
+    const limit = parseInt(ctx.query.limit as string) || 20;
+    const offset = parseInt(ctx.query.offset as string) || 0;
+
+    // Resolve userId
+    const userId = ctx.user?.id || await this.resolveUserId(ctx);
+
+    const result = await this.config.storage.getTasks({
+      agentId,
+      userId,
+      status,
+      limit,
+      offset,
+    });
+
+    return {
+      status: 200,
+      body: {
+        tasks: result.data,
+        total: result.total,
+        limit: result.limit,
+        offset: result.offset,
+        hasMore: result.hasMore,
+      },
+    };
+  }
+
+  private async handleGetTask(
+    ctx: RouteContext
+  ): Promise<RouteResult<GetTaskResponse>> {
+    const { taskId } = ctx.params;
+
+    const task = await this.config.storage.getTask(taskId);
+    if (!task) {
+      throw {
+        statusCode: 404,
+        code: "NOT_FOUND",
+        message: `Task not found: ${taskId}`,
+      } as NotFoundError;
+    }
+
+    // Verify user has access to this task
+    if (task.userId) {
+      const currentUserId = ctx.user?.id || await this.resolveUserId(ctx);
+      if (currentUserId && task.userId !== currentUserId) {
+        throw {
+          statusCode: 403,
+          code: "FORBIDDEN",
+          message: "You do not have access to this task",
+        };
+      }
+    }
+
+    // Get result if task is completed
+    const result = await this.config.storage.getTaskResult(taskId);
+
+    return {
+      status: 200,
+      body: {
+        task,
+        result: result || undefined,
+      },
+    };
+  }
+
+  private async handleGetTaskStatus(
+    ctx: RouteContext
+  ): Promise<RouteResult<GetTaskStatusResponse>> {
+    const { taskId } = ctx.params;
+
+    const task = await this.config.storage.getTask(taskId);
+    if (!task) {
+      throw {
+        statusCode: 404,
+        code: "NOT_FOUND",
+        message: `Task not found: ${taskId}`,
+      } as NotFoundError;
+    }
+
+    // Verify user has access to this task
+    if (task.userId) {
+      const currentUserId = ctx.user?.id || await this.resolveUserId(ctx);
+      if (currentUserId && task.userId !== currentUserId) {
+        throw {
+          statusCode: 403,
+          code: "FORBIDDEN",
+          message: "You do not have access to this task",
+        };
+      }
+    }
+
+    return {
+      status: 200,
+      body: {
+        taskId: task.id,
+        status: task.status,
+        createdAt: task.createdAt,
+        updatedAt: task.updatedAt,
+        startedAt: task.startedAt,
+        completedAt: task.completedAt,
+        error: task.error,
+      },
+    };
+  }
+
+  private async handleGetTaskResult(
+    ctx: RouteContext
+  ): Promise<RouteResult<GetTaskResultResponse>> {
+    const { taskId } = ctx.params;
+
+    const task = await this.config.storage.getTask(taskId);
+    if (!task) {
+      throw {
+        statusCode: 404,
+        code: "NOT_FOUND",
+        message: `Task not found: ${taskId}`,
+      } as NotFoundError;
+    }
+
+    // Verify user has access to this task
+    if (task.userId) {
+      const currentUserId = ctx.user?.id || await this.resolveUserId(ctx);
+      if (currentUserId && task.userId !== currentUserId) {
+        throw {
+          statusCode: 403,
+          code: "FORBIDDEN",
+          message: "You do not have access to this task",
+        };
+      }
+    }
+
+    const result = await this.config.storage.getTaskResult(taskId);
+    if (!result) {
+      throw {
+        statusCode: 404,
+        code: "NOT_FOUND",
+        message: `Task result not found: ${taskId}`,
+      } as NotFoundError;
+    }
+
+    return {
+      status: 200,
+      body: { result },
+    };
+  }
+
+  // ============================================================================
+  // Task Processing
+  // ============================================================================
+
+  private async processTaskInBackground(taskId: string): Promise<void> {
+    try {
+      // Get the task
+      const task = await this.config.storage.getTask(taskId);
+      if (!task) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+
+      // Update task status to running
+      await this.config.storage.updateTask(taskId, {
+        status: "running",
+        startedAt: new Date(),
+      });
+
+      // Get the agent
+      const agentReg = this.agents.get(task.agentId);
+      if (!agentReg) {
+        throw new Error(`Agent not found: ${task.agentId}`);
+      }
+
+      let responseContent: string;
+      let responseFiles: Task["files"];
+      let usage: TaskResult["usage"];
+
+      // Process with SDK agent or custom handler
+      if (agentReg.sdkAgent) {
+        // SDK Agent processing
+        const agent = agentReg.sdkAgent as {
+          generateText?: (prompt: string) => Promise<{ text: string; usage?: unknown }>;
+          run?: (input: string) => Promise<{ output: string; usage?: unknown }>;
+        };
+
+        let result: { text?: string; output?: string; usage?: unknown };
+        if (agent.generateText) {
+          result = await agent.generateText(task.input);
+        } else if (agent.run) {
+          result = await agent.run(task.input);
+        } else {
+          throw new Error("Agent does not have generateText or run method");
+        }
+
+        responseContent = result.text || result.output || "Task completed";
+        usage = result.usage as TaskResult["usage"];
+      } else if (agentReg.handler) {
+        // Custom handler processing
+        const result = await agentReg.handler.processMessage({
+          conversationId: `task_${taskId}`,
+          message: task.input,
+          files: task.files,
+          metadata: task.metadata,
+        });
+
+        responseContent = result.content;
+        responseFiles = result.files;
+        usage = result.usage;
+      } else {
+        throw new Error("Agent has no SDK agent or custom handler");
+      }
+
+      // Create task result
+      await this.config.storage.createTaskResult({
+        taskId,
+        content: responseContent,
+        files: responseFiles,
+        usage,
+        metadata: {},
+      });
+
+      // Update task status to completed
+      await this.config.storage.updateTask(taskId, {
+        status: "completed",
+        completedAt: new Date(),
+      });
+
+      // Send callback notification
+      if (task.callbackUrl) {
+        await this.sendTaskCallback(task.callbackUrl, taskId, "complete");
+      }
+    } catch (error) {
+      // Update task status to failed
+      await this.config.storage.updateTask(taskId, {
+        status: "failed",
+        completedAt: new Date(),
+        error: (error as Error).message,
+      });
+
+      // Send callback notification with error
+      const task = await this.config.storage.getTask(taskId);
+      if (task?.callbackUrl) {
+        await this.sendTaskCallback(task.callbackUrl, taskId, "failed", (error as Error).message);
+      }
+
+      throw error;
+    }
+  }
+
+  private async sendTaskCallback(
+    callbackUrl: string,
+    taskId: string,
+    status: "complete" | "failed",
+    error?: string
+  ): Promise<void> {
+    try {
+      const payload = {
+        taskId,
+        status,
+        error,
+        timestamp: new Date().toISOString(),
+      };
+
+      const response = await fetch(callbackUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        console.error(
+          `Callback failed: ${response.status} ${response.statusText}`,
+          await response.text()
+        );
+      }
+    } catch (error) {
+      console.error(`Error sending callback to ${callbackUrl}:`, error);
+    }
   }
 
   // ============================================================================
