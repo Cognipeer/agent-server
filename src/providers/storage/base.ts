@@ -223,7 +223,6 @@ export abstract class BaseStorageProvider implements StorageProvider {
     this.ensureConnected();
     return this._getTaskResult(taskId);
   }
-  }
 
   // ============================================================================
   // Utility methods
