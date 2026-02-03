@@ -15,6 +15,7 @@ import type {
   FileRecord,
   Task,
   TaskResult,
+  TaskComment,
   SendMessageRequest,
   SendMessageResponse,
   CreateConversationRequest,
@@ -30,6 +31,9 @@ import type {
   GetTaskResponse,
   GetTaskStatusResponse,
   GetTaskResultResponse,
+  AddTaskCommentRequest,
+  AddTaskCommentResponse,
+  GetTaskCommentsResponse,
   AuthenticationError,
   NotFoundError,
   ValidationError,
@@ -262,6 +266,8 @@ export class AgentServer {
     this.addRoute("GET", "/tasks/:taskId", this.handleGetTask.bind(this));
     this.addRoute("GET", "/tasks/:taskId/status", this.handleGetTaskStatus.bind(this));
     this.addRoute("GET", "/tasks/:taskId/result", this.handleGetTaskResult.bind(this));
+    this.addRoute("POST", "/tasks/:taskId/comments", this.handleAddTaskComment.bind(this));
+    this.addRoute("GET", "/tasks/:taskId/comments", this.handleGetTaskComments.bind(this));
   }
 
   private addRoute(
@@ -1339,6 +1345,109 @@ export class AgentServer {
     };
   }
 
+  private async handleAddTaskComment(
+    ctx: RouteContext
+  ): Promise<RouteResult<AddTaskCommentResponse>> {
+    const { taskId } = ctx.params;
+    const body = ctx.body as AddTaskCommentRequest;
+
+    if (!body?.content) {
+      throw {
+        statusCode: 400,
+        code: "INVALID_REQUEST",
+        message: "content is required",
+      } as ValidationError;
+    }
+
+    const task = await this.config.storage.getTask(taskId);
+    if (!task) {
+      throw {
+        statusCode: 404,
+        code: "NOT_FOUND",
+        message: `Task not found: ${taskId}`,
+      } as NotFoundError;
+    }
+
+    // Verify user has access to this task
+    if (task.userId) {
+      const currentUserId = ctx.user?.id || await this.resolveUserId(ctx);
+      if (currentUserId && task.userId !== currentUserId) {
+        throw {
+          statusCode: 403,
+          code: "FORBIDDEN",
+          message: "You do not have access to this task",
+        };
+      }
+    }
+
+    // Create new comment
+    const comment: TaskComment = {
+      id: `comment_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+      taskId,
+      role: "user",
+      content: body.content,
+      metadata: body.metadata,
+      createdAt: new Date(),
+    };
+
+    // Add comment to task
+    const existingComments = task.comments || [];
+    const updatedTask = await this.config.storage.updateTask(taskId, {
+      comments: [...existingComments, comment],
+      status: "pending", // Reset status to pending so it can be reprocessed
+    });
+
+    // Reprocess the task with the new comment
+    this.processTaskInBackground(taskId).catch((err) => {
+      console.error(`Failed to reprocess task ${taskId}:`, err);
+    });
+
+    return {
+      status: 201,
+      body: {
+        comment,
+        task: updatedTask,
+      },
+    };
+  }
+
+  private async handleGetTaskComments(
+    ctx: RouteContext
+  ): Promise<RouteResult<GetTaskCommentsResponse>> {
+    const { taskId } = ctx.params;
+
+    const task = await this.config.storage.getTask(taskId);
+    if (!task) {
+      throw {
+        statusCode: 404,
+        code: "NOT_FOUND",
+        message: `Task not found: ${taskId}`,
+      } as NotFoundError;
+    }
+
+    // Verify user has access to this task
+    if (task.userId) {
+      const currentUserId = ctx.user?.id || await this.resolveUserId(ctx);
+      if (currentUserId && task.userId !== currentUserId) {
+        throw {
+          statusCode: 403,
+          code: "FORBIDDEN",
+          message: "You do not have access to this task",
+        };
+      }
+    }
+
+    const comments = task.comments || [];
+
+    return {
+      status: 200,
+      body: {
+        comments,
+        total: comments.length,
+      },
+    };
+  }
+
   // ============================================================================
   // Task Processing
   // ============================================================================
@@ -1367,37 +1476,82 @@ export class AgentServer {
       let responseFiles: Task["files"];
       let usage: TaskResult["usage"];
 
+      // Build messages from input and comments history
+      const messages: Array<{ role: string; content: string }> = [
+        { role: "user", content: task.input },
+      ];
+      
+      // Add comments as conversation history
+      if (task.comments && task.comments.length > 0) {
+        for (const comment of task.comments) {
+          messages.push({
+            role: comment.role === "agent" ? "assistant" : "user",
+            content: comment.content,
+          });
+        }
+      }
+
       // Process with SDK agent or custom handler
       if (agentReg.sdkAgent) {
-        // SDK Agent processing
-        const agent = agentReg.sdkAgent as {
-          generateText?: (prompt: string) => Promise<{ text: string; usage?: unknown }>;
-          run?: (input: string) => Promise<{ output: string; usage?: unknown }>;
+        // SDK Agent processing - use invoke method like regular message processing
+        const sdkAgent = agentReg.sdkAgent as {
+          invoke: (params: {
+            messages: Array<{ role: string; content: string }>;
+          }) => Promise<{ content: string; metadata?: { usage?: unknown } }>;
         };
 
-        let result: { text?: string; output?: string; usage?: unknown };
-        if (agent.generateText) {
-          result = await agent.generateText(task.input);
-        } else if (agent.run) {
-          result = await agent.run(task.input);
-        } else {
-          throw new Error("Agent does not have generateText or run method");
-        }
+        const result = await sdkAgent.invoke({ messages });
 
-        responseContent = result.text || result.output || "Task completed";
-        usage = result.usage as TaskResult["usage"];
+        responseContent = result.content || "Task completed";
+        usage = result.metadata?.usage as TaskResult["usage"];
       } else if (agentReg.handler) {
         // Custom handler processing
         const result = await agentReg.handler.processMessage({
           conversationId: `task_${taskId}`,
           message: task.input,
           files: task.files,
-          metadata: task.metadata,
+          metadata: {
+            ...task.metadata,
+            comments: task.comments || [],
+          },
         });
 
         responseContent = result.content;
         responseFiles = result.files;
         usage = result.usage;
+
+        // Check if agent requested clarification (waiting_for_input)
+        if (result.metadata?.waitingForInput) {
+          const agentComment: TaskComment = {
+            id: `comment_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+            taskId,
+            role: "agent",
+            content: responseContent,
+            metadata: result.metadata,
+            createdAt: new Date(),
+          };
+
+          const existingComments = task.comments || [];
+          await this.config.storage.updateTask(taskId, {
+            status: "waiting_for_input",
+            comments: [...existingComments, agentComment],
+          });
+
+          // Create partial task result
+          await this.config.storage.createTaskResult({
+            taskId,
+            content: responseContent,
+            files: responseFiles,
+            usage,
+            metadata: { waitingForInput: true },
+          });
+
+          // Send callback notification
+          if (task.callbackUrl) {
+            await this.sendTaskCallback(task.callbackUrl, taskId, "waiting_for_input");
+          }
+          return;
+        }
       } else {
         throw new Error("Agent has no SDK agent or custom handler");
       }
@@ -1442,7 +1596,7 @@ export class AgentServer {
   private async sendTaskCallback(
     callbackUrl: string,
     taskId: string,
-    status: "completed" | "failed",
+    status: "completed" | "failed" | "waiting_for_input",
     error?: string
   ): Promise<void> {
     try {

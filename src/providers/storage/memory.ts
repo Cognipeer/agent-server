@@ -458,6 +458,7 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
       completedAt: params.completedAt !== undefined ? params.completedAt : task.completedAt,
       error: params.error !== undefined ? params.error : task.error,
       metadata: params.metadata !== undefined ? params.metadata : task.metadata,
+      comments: params.comments !== undefined ? params.comments : task.comments,
       updatedAt: new Date(),
     };
 

@@ -632,7 +632,16 @@ export class AuthorizationError extends AgentServerError {
 // Task Types
 // ============================================================================
 
-export type TaskStatus = "pending" | "running" | "completed" | "failed";
+export type TaskStatus = "pending" | "running" | "completed" | "failed" | "waiting_for_input";
+
+export interface TaskComment {
+  id: string;
+  taskId: string;
+  role: "agent" | "user";
+  content: string;
+  metadata?: Record<string, unknown>;
+  createdAt: Date;
+}
 
 export interface Task {
   id: string;
@@ -642,6 +651,7 @@ export interface Task {
   callbackUrl?: string;
   input: string;
   files?: FileAttachment[];
+  comments?: TaskComment[];
   metadata?: Record<string, unknown>;
   createdAt: Date;
   updatedAt: Date;
@@ -688,6 +698,14 @@ export interface UpdateTaskParams {
   startedAt?: Date;
   completedAt?: Date;
   error?: string;
+  metadata?: Record<string, unknown>;
+  comments?: TaskComment[];
+}
+
+export interface AddTaskCommentParams {
+  taskId: string;
+  role: "agent" | "user";
+  content: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -748,5 +766,20 @@ export interface GetTaskStatusResponse {
 
 export interface GetTaskResultResponse {
   result: TaskResult;
+}
+
+export interface AddTaskCommentRequest {
+  content: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AddTaskCommentResponse {
+  comment: TaskComment;
+  task: Task;
+}
+
+export interface GetTaskCommentsResponse {
+  comments: TaskComment[];
+  total: number;
 }
 

@@ -361,13 +361,18 @@ function generateSchemas(): Record<string, unknown> {
         userId: { type: "string" },
         status: {
           type: "string",
-          enum: ["pending", "running", "completed", "failed"],
+          enum: ["pending", "running", "completed", "failed", "waiting_for_input"],
         },
         callbackUrl: { type: "string" },
         input: { type: "string" },
         files: {
           type: "array",
           items: { $ref: "#/components/schemas/FileAttachment" },
+        },
+        comments: {
+          type: "array",
+          items: { $ref: "#/components/schemas/TaskComment" },
+          description: "Comments between agent and user for clarification",
         },
         metadata: { type: "object", additionalProperties: true },
         createdAt: { type: "string", format: "date-time" },
@@ -377,6 +382,22 @@ function generateSchemas(): Record<string, unknown> {
         error: { type: "string" },
       },
       required: ["id", "agentId", "status", "input", "createdAt", "updatedAt"],
+    },
+    TaskComment: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        taskId: { type: "string" },
+        role: {
+          type: "string",
+          enum: ["agent", "user"],
+          description: "Who sent this comment",
+        },
+        content: { type: "string", description: "Comment content" },
+        metadata: { type: "object", additionalProperties: true },
+        createdAt: { type: "string", format: "date-time" },
+      },
+      required: ["id", "taskId", "role", "content", "createdAt"],
     },
     TaskResult: {
       type: "object",
@@ -458,7 +479,7 @@ function generateSchemas(): Record<string, unknown> {
         taskId: { type: "string" },
         status: {
           type: "string",
-          enum: ["pending", "running", "completed", "failed"],
+          enum: ["pending", "running", "completed", "failed", "waiting_for_input"],
         },
         createdAt: { type: "string", format: "date-time" },
         updatedAt: { type: "string", format: "date-time" },
@@ -474,6 +495,33 @@ function generateSchemas(): Record<string, unknown> {
         result: { $ref: "#/components/schemas/TaskResult" },
       },
       required: ["result"],
+    },
+    AddTaskCommentRequest: {
+      type: "object",
+      properties: {
+        content: { type: "string", description: "Comment content" },
+        metadata: { type: "object", additionalProperties: true },
+      },
+      required: ["content"],
+    },
+    AddTaskCommentResponse: {
+      type: "object",
+      properties: {
+        comment: { $ref: "#/components/schemas/TaskComment" },
+        task: { $ref: "#/components/schemas/Task" },
+      },
+      required: ["comment", "task"],
+    },
+    GetTaskCommentsResponse: {
+      type: "object",
+      properties: {
+        comments: {
+          type: "array",
+          items: { $ref: "#/components/schemas/TaskComment" },
+        },
+        total: { type: "integer" },
+      },
+      required: ["comments", "total"],
     },
   };
 }
@@ -1123,6 +1171,90 @@ function generatePaths(
           },
           404: {
             description: "Task or result not found",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/Error" },
+              },
+            },
+          },
+        },
+      },
+    },
+    "/tasks/{taskId}/comments": {
+      get: {
+        tags: ["Tasks"],
+        summary: "Get task comments",
+        description: "Get all comments (from both agent and user) for a task",
+        operationId: "getTaskComments",
+        parameters: [
+          {
+            name: "taskId",
+            in: "path",
+            required: true,
+            schema: { type: "string" },
+            description: "Task ID",
+          },
+        ],
+        responses: {
+          200: {
+            description: "List of task comments",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/GetTaskCommentsResponse" },
+              },
+            },
+          },
+          404: {
+            description: "Task not found",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/Error" },
+              },
+            },
+          },
+        },
+      },
+      post: {
+        tags: ["Tasks"],
+        summary: "Add comment to task",
+        description: "Add a user comment to a task. If the task is in 'waiting_for_input' status, it will be reprocessed with the new comment.",
+        operationId: "addTaskComment",
+        parameters: [
+          {
+            name: "taskId",
+            in: "path",
+            required: true,
+            schema: { type: "string" },
+            description: "Task ID",
+          },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/AddTaskCommentRequest" },
+            },
+          },
+        },
+        responses: {
+          201: {
+            description: "Comment added successfully. Task will be reprocessed.",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/AddTaskCommentResponse" },
+              },
+            },
+          },
+          400: {
+            description: "Invalid request",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/Error" },
+              },
+            },
+          },
+          404: {
+            description: "Task not found",
             content: {
               "application/json": {
                 schema: { $ref: "#/components/schemas/Error" },

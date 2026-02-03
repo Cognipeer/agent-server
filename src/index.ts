@@ -25,6 +25,7 @@ export type {
   Task,
   TaskResult,
   TaskStatus,
+  TaskComment,
 
   // Agent types
   AgentInfo,
@@ -45,6 +46,7 @@ export type {
   GetTasksParams,
   UpdateTaskParams,
   CreateTaskResultParams,
+  AddTaskCommentParams,
   FileRecord,
   PaginatedResult,
 
@@ -79,6 +81,9 @@ export type {
   GetTaskResponse,
   GetTaskStatusResponse,
   GetTaskResultResponse,
+  AddTaskCommentRequest,
+  AddTaskCommentResponse,
+  GetTaskCommentsResponse,
 
   // Stream event types (SSE)
   StreamEvent,
