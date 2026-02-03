@@ -1419,7 +1419,7 @@ export class AgentServer {
 
       // Send callback notification
       if (task.callbackUrl) {
-        await this.sendTaskCallback(task.callbackUrl, taskId, "complete");
+        await this.sendTaskCallback(task.callbackUrl, taskId, "completed");
       }
     } catch (error) {
       // Update task status to failed
@@ -1442,7 +1442,7 @@ export class AgentServer {
   private async sendTaskCallback(
     callbackUrl: string,
     taskId: string,
-    status: "complete" | "failed",
+    status: "completed" | "failed",
     error?: string
   ): Promise<void> {
     try {
