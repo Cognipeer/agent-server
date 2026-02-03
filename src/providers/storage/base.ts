@@ -8,12 +8,18 @@ import type {
   Conversation,
   Message,
   FileRecord,
+  Task,
+  TaskResult,
   CreateConversationParams,
   GetConversationsParams,
   UpdateConversationParams,
   CreateMessageParams,
   GetMessagesParams,
   SaveFileParams,
+  CreateTaskParams,
+  GetTasksParams,
+  UpdateTaskParams,
+  CreateTaskResultParams,
   PaginatedResult,
 } from "../../types.js";
 
@@ -66,6 +72,28 @@ export abstract class BaseStorageProvider implements StorageProvider {
   protected abstract _getFile(id: string): Promise<FileRecord | null>;
   protected abstract _getFileContent(id: string): Promise<Buffer | null>;
   protected abstract _deleteFile(id: string): Promise<void>;
+
+  // Tasks
+  protected abstract _createTask(
+    id: string,
+    params: CreateTaskParams
+  ): Promise<Task>;
+  protected abstract _getTask(id: string): Promise<Task | null>;
+  protected abstract _getTasks(
+    params: GetTasksParams
+  ): Promise<PaginatedResult<Task>>;
+  protected abstract _updateTask(
+    id: string,
+    params: UpdateTaskParams
+  ): Promise<Task>;
+  protected abstract _deleteTask(id: string): Promise<void>;
+
+  // Task Results
+  protected abstract _createTaskResult(
+    id: string,
+    params: CreateTaskResultParams
+  ): Promise<TaskResult>;
+  protected abstract _getTaskResult(taskId: string): Promise<TaskResult | null>;
 
   // ============================================================================
   // Public interface implementation
@@ -157,6 +185,43 @@ export abstract class BaseStorageProvider implements StorageProvider {
   async deleteFile(id: string): Promise<void> {
     this.ensureConnected();
     return this._deleteFile(id);
+  }
+
+  async createTask(params: CreateTaskParams): Promise<Task> {
+    this.ensureConnected();
+    const id = this.generateId("task");
+    return this._createTask(id, params);
+  }
+
+  async getTask(id: string): Promise<Task | null> {
+    this.ensureConnected();
+    return this._getTask(id);
+  }
+
+  async getTasks(params: GetTasksParams): Promise<PaginatedResult<Task>> {
+    this.ensureConnected();
+    return this._getTasks(params);
+  }
+
+  async updateTask(id: string, params: UpdateTaskParams): Promise<Task> {
+    this.ensureConnected();
+    return this._updateTask(id, params);
+  }
+
+  async deleteTask(id: string): Promise<void> {
+    this.ensureConnected();
+    return this._deleteTask(id);
+  }
+
+  async createTaskResult(params: CreateTaskResultParams): Promise<TaskResult> {
+    this.ensureConnected();
+    const id = this.generateId("taskres");
+    return this._createTaskResult(id, params);
+  }
+
+  async getTaskResult(taskId: string): Promise<TaskResult | null> {
+    this.ensureConnected();
+    return this._getTaskResult(taskId);
   }
 
   // ============================================================================

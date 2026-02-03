@@ -353,6 +353,128 @@ function generateSchemas(): Record<string, unknown> {
         },
       },
     },
+    Task: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        agentId: { type: "string" },
+        userId: { type: "string" },
+        status: {
+          type: "string",
+          enum: ["pending", "running", "completed", "failed"],
+        },
+        callbackUrl: { type: "string" },
+        input: { type: "string" },
+        files: {
+          type: "array",
+          items: { $ref: "#/components/schemas/FileAttachment" },
+        },
+        metadata: { type: "object", additionalProperties: true },
+        createdAt: { type: "string", format: "date-time" },
+        updatedAt: { type: "string", format: "date-time" },
+        startedAt: { type: "string", format: "date-time" },
+        completedAt: { type: "string", format: "date-time" },
+        error: { type: "string" },
+      },
+      required: ["id", "agentId", "status", "input", "createdAt", "updatedAt"],
+    },
+    TaskResult: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        taskId: { type: "string" },
+        content: { type: "string" },
+        files: {
+          type: "array",
+          items: { $ref: "#/components/schemas/FileAttachment" },
+        },
+        metadata: { type: "object", additionalProperties: true },
+        usage: {
+          type: "object",
+          properties: {
+            inputTokens: { type: "integer" },
+            outputTokens: { type: "integer" },
+            totalTokens: { type: "integer" },
+          },
+        },
+        createdAt: { type: "string", format: "date-time" },
+      },
+      required: ["id", "taskId", "content", "createdAt"],
+    },
+    CreateTaskRequest: {
+      type: "object",
+      properties: {
+        agentId: { type: "string" },
+        input: { type: "string" },
+        files: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              content: { type: "string", description: "Base64 encoded content" },
+              mimeType: { type: "string" },
+            },
+            required: ["name", "content", "mimeType"],
+          },
+        },
+        callbackUrl: { type: "string", description: "URL to receive task completion notification" },
+        metadata: { type: "object", additionalProperties: true },
+      },
+      required: ["agentId", "input"],
+    },
+    CreateTaskResponse: {
+      type: "object",
+      properties: {
+        task: { $ref: "#/components/schemas/Task" },
+      },
+      required: ["task"],
+    },
+    ListTasksResponse: {
+      type: "object",
+      properties: {
+        tasks: {
+          type: "array",
+          items: { $ref: "#/components/schemas/Task" },
+        },
+        total: { type: "integer" },
+        limit: { type: "integer" },
+        offset: { type: "integer" },
+        hasMore: { type: "boolean" },
+      },
+      required: ["tasks", "total", "limit", "offset", "hasMore"],
+    },
+    GetTaskResponse: {
+      type: "object",
+      properties: {
+        task: { $ref: "#/components/schemas/Task" },
+        result: { $ref: "#/components/schemas/TaskResult" },
+      },
+      required: ["task"],
+    },
+    GetTaskStatusResponse: {
+      type: "object",
+      properties: {
+        taskId: { type: "string" },
+        status: {
+          type: "string",
+          enum: ["pending", "running", "completed", "failed"],
+        },
+        createdAt: { type: "string", format: "date-time" },
+        updatedAt: { type: "string", format: "date-time" },
+        startedAt: { type: "string", format: "date-time" },
+        completedAt: { type: "string", format: "date-time" },
+        error: { type: "string" },
+      },
+      required: ["taskId", "status", "createdAt", "updatedAt"],
+    },
+    GetTaskResultResponse: {
+      type: "object",
+      properties: {
+        result: { $ref: "#/components/schemas/TaskResult" },
+      },
+      required: ["result"],
+    },
   };
 }
 
@@ -817,6 +939,190 @@ function generatePaths(
           },
           404: {
             description: "File not found",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/Error" },
+              },
+            },
+          },
+        },
+      },
+    },
+    "/tasks": {
+      post: {
+        tags: ["Tasks"],
+        summary: "Create a new task for background processing",
+        operationId: "createTask",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/CreateTaskRequest" },
+            },
+          },
+        },
+        responses: {
+          201: {
+            description: "Task created successfully",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/CreateTaskResponse" },
+              },
+            },
+          },
+          400: {
+            description: "Invalid request",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/Error" },
+              },
+            },
+          },
+          404: {
+            description: "Agent not found",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/Error" },
+              },
+            },
+          },
+        },
+      },
+      get: {
+        tags: ["Tasks"],
+        summary: "List tasks",
+        operationId: "listTasks",
+        parameters: [
+          {
+            name: "agentId",
+            in: "query",
+            schema: { type: "string" },
+            description: "Filter by agent ID",
+          },
+          {
+            name: "status",
+            in: "query",
+            schema: {
+              type: "string",
+              enum: ["pending", "running", "completed", "failed"],
+            },
+            description: "Filter by task status",
+          },
+          {
+            name: "limit",
+            in: "query",
+            schema: { type: "integer", default: 20 },
+            description: "Number of tasks to return",
+          },
+          {
+            name: "offset",
+            in: "query",
+            schema: { type: "integer", default: 0 },
+            description: "Number of tasks to skip",
+          },
+        ],
+        responses: {
+          200: {
+            description: "List of tasks",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/ListTasksResponse" },
+              },
+            },
+          },
+        },
+      },
+    },
+    "/tasks/{taskId}": {
+      get: {
+        tags: ["Tasks"],
+        summary: "Get task details",
+        operationId: "getTask",
+        parameters: [
+          {
+            name: "taskId",
+            in: "path",
+            required: true,
+            schema: { type: "string" },
+          },
+        ],
+        responses: {
+          200: {
+            description: "Task details",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/GetTaskResponse" },
+              },
+            },
+          },
+          404: {
+            description: "Task not found",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/Error" },
+              },
+            },
+          },
+        },
+      },
+    },
+    "/tasks/{taskId}/status": {
+      get: {
+        tags: ["Tasks"],
+        summary: "Get task status",
+        operationId: "getTaskStatus",
+        parameters: [
+          {
+            name: "taskId",
+            in: "path",
+            required: true,
+            schema: { type: "string" },
+          },
+        ],
+        responses: {
+          200: {
+            description: "Task status",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/GetTaskStatusResponse" },
+              },
+            },
+          },
+          404: {
+            description: "Task not found",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/Error" },
+              },
+            },
+          },
+        },
+      },
+    },
+    "/tasks/{taskId}/result": {
+      get: {
+        tags: ["Tasks"],
+        summary: "Get task result",
+        operationId: "getTaskResult",
+        parameters: [
+          {
+            name: "taskId",
+            in: "path",
+            required: true,
+            schema: { type: "string" },
+          },
+        ],
+        responses: {
+          200: {
+            description: "Task result",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/GetTaskResultResponse" },
+              },
+            },
+          },
+          404: {
+            description: "Task or result not found",
             content: {
               "application/json": {
                 schema: { $ref: "#/components/schemas/Error" },

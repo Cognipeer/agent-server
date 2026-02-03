@@ -21,6 +21,11 @@ export type {
   Conversation,
   ConversationWithMessages,
 
+  // Task types
+  Task,
+  TaskResult,
+  TaskStatus,
+
   // Agent types
   AgentInfo,
   AgentHandler,
@@ -36,6 +41,10 @@ export type {
   CreateMessageParams,
   GetMessagesParams,
   SaveFileParams,
+  CreateTaskParams,
+  GetTasksParams,
+  UpdateTaskParams,
+  CreateTaskResultParams,
   FileRecord,
   PaginatedResult,
 
@@ -64,6 +73,12 @@ export type {
   CreateConversationResponse,
   UploadFileRequest,
   UploadFileResponse,
+  CreateTaskRequest,
+  CreateTaskResponse,
+  ListTasksResponse,
+  GetTaskResponse,
+  GetTaskStatusResponse,
+  GetTaskResultResponse,
 
   // Stream event types (SSE)
   StreamEvent,

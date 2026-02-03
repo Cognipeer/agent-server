@@ -7,12 +7,18 @@ import type {
   Conversation,
   Message,
   FileRecord,
+  Task,
+  TaskResult,
   CreateConversationParams,
   GetConversationsParams,
   UpdateConversationParams,
   CreateMessageParams,
   GetMessagesParams,
   SaveFileParams,
+  CreateTaskParams,
+  GetTasksParams,
+  UpdateTaskParams,
+  CreateTaskResultParams,
   PaginatedResult,
 } from "../../types.js";
 
@@ -91,6 +97,8 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       messages: `"${this.schema}"."${this.tablePrefix}messages"`,
       files: `"${this.schema}"."${this.tablePrefix}files"`,
       fileContents: `"${this.schema}"."${this.tablePrefix}file_contents"`,
+      tasks: `"${this.schema}"."${this.tablePrefix}tasks"`,
+      taskResults: `"${this.schema}"."${this.tablePrefix}task_results"`,
     };
   }
 
@@ -207,6 +215,38 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       )
     `);
 
+    // Create tasks table
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS ${this.tables.tasks} (
+        id VARCHAR(64) PRIMARY KEY,
+        agent_id VARCHAR(255) NOT NULL,
+        user_id VARCHAR(255),
+        status VARCHAR(50) NOT NULL DEFAULT 'pending',
+        callback_url VARCHAR(2000),
+        input TEXT NOT NULL,
+        files JSONB DEFAULT '[]',
+        metadata JSONB DEFAULT '{}',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        started_at TIMESTAMPTZ,
+        completed_at TIMESTAMPTZ,
+        error TEXT
+      )
+    `);
+
+    // Create task results table
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS ${this.tables.taskResults} (
+        id VARCHAR(64) PRIMARY KEY,
+        task_id VARCHAR(64) NOT NULL REFERENCES ${this.tables.tasks}(id) ON DELETE CASCADE,
+        content TEXT NOT NULL,
+        files JSONB DEFAULT '[]',
+        metadata JSONB DEFAULT '{}',
+        usage JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
     // Create indexes
     await this.pool.query(`
       CREATE INDEX IF NOT EXISTS idx_conversations_agent_id 
@@ -223,6 +263,22 @@ export class PostgresStorageProvider extends BaseStorageProvider {
     await this.pool.query(`
       CREATE INDEX IF NOT EXISTS idx_files_conversation_id 
       ON ${this.tables.files}(conversation_id)
+    `);
+    await this.pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_tasks_agent_id 
+      ON ${this.tables.tasks}(agent_id)
+    `);
+    await this.pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_tasks_user_id 
+      ON ${this.tables.tasks}(user_id)
+    `);
+    await this.pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_tasks_status 
+      ON ${this.tables.tasks}(status)
+    `);
+    await this.pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_task_results_task_id 
+      ON ${this.tables.taskResults}(task_id)
     `);
   }
 
@@ -529,6 +585,194 @@ export class PostgresStorageProvider extends BaseStorageProvider {
   }
 
   // ============================================================================
+  // Tasks
+  // ============================================================================
+
+  protected async _createTask(
+    id: string,
+    params: CreateTaskParams
+  ): Promise<Task> {
+    if (!this.pool) throw new Error("Pool not initialized");
+
+    const result = await this.pool.query<DbTask>(
+      `INSERT INTO ${this.tables.tasks}
+       (id, agent_id, user_id, status, callback_url, input, files, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [
+        id,
+        params.agentId,
+        params.userId || null,
+        "pending",
+        params.callbackUrl || null,
+        params.input,
+        JSON.stringify(params.files || []),
+        JSON.stringify(params.metadata || {}),
+      ]
+    );
+
+    return this.mapTask(result.rows[0]);
+  }
+
+  protected async _getTask(id: string): Promise<Task | null> {
+    if (!this.pool) throw new Error("Pool not initialized");
+
+    const result = await this.pool.query<DbTask>(
+      `SELECT * FROM ${this.tables.tasks} WHERE id = $1`,
+      [id]
+    );
+
+    return result.rows[0] ? this.mapTask(result.rows[0]) : null;
+  }
+
+  protected async _getTasks(
+    params: GetTasksParams
+  ): Promise<PaginatedResult<Task>> {
+    if (!this.pool) throw new Error("Pool not initialized");
+
+    const normalized = this.normalizeParams(params, { limit: 20, offset: 0 });
+
+    const conditions: string[] = [];
+    const values: unknown[] = [];
+    let paramIndex = 1;
+
+    if (params.agentId) {
+      conditions.push(`agent_id = $${paramIndex++}`);
+      values.push(params.agentId);
+    }
+    if (params.userId) {
+      conditions.push(`user_id = $${paramIndex++}`);
+      values.push(params.userId);
+    }
+    if (params.status) {
+      conditions.push(`status = $${paramIndex++}`);
+      values.push(params.status);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+    // Get total count
+    const countResult = await this.pool.query<{ count: string }>(
+      `SELECT COUNT(*) as count FROM ${this.tables.tasks} ${whereClause}`,
+      values
+    );
+    const total = parseInt(countResult.rows[0].count);
+
+    // Get paginated data
+    const orderBy = params.orderBy === "updatedAt" ? "updated_at" : "created_at";
+    const order = params.order === "asc" ? "ASC" : "DESC";
+
+    const result = await this.pool.query<DbTask>(
+      `SELECT * FROM ${this.tables.tasks} ${whereClause}
+       ORDER BY ${orderBy} ${order}
+       LIMIT $${paramIndex++} OFFSET $${paramIndex++}`,
+      [...values, normalized.limit, normalized.offset]
+    );
+
+    return {
+      data: result.rows.map((row) => this.mapTask(row)),
+      total,
+      limit: normalized.limit,
+      offset: normalized.offset,
+      hasMore: normalized.offset + result.rows.length < total,
+    };
+  }
+
+  protected async _updateTask(
+    id: string,
+    params: UpdateTaskParams
+  ): Promise<Task> {
+    if (!this.pool) throw new Error("Pool not initialized");
+
+    const updates: string[] = ["updated_at = NOW()"];
+    const values: unknown[] = [];
+    let paramIndex = 1;
+
+    if (params.status !== undefined) {
+      updates.push(`status = $${paramIndex++}`);
+      values.push(params.status);
+    }
+    if (params.startedAt !== undefined) {
+      updates.push(`started_at = $${paramIndex++}`);
+      values.push(params.startedAt);
+    }
+    if (params.completedAt !== undefined) {
+      updates.push(`completed_at = $${paramIndex++}`);
+      values.push(params.completedAt);
+    }
+    if (params.error !== undefined) {
+      updates.push(`error = $${paramIndex++}`);
+      values.push(params.error);
+    }
+    if (params.metadata !== undefined) {
+      updates.push(`metadata = $${paramIndex++}`);
+      values.push(JSON.stringify(params.metadata));
+    }
+
+    values.push(id);
+
+    const result = await this.pool.query<DbTask>(
+      `UPDATE ${this.tables.tasks}
+       SET ${updates.join(", ")}
+       WHERE id = $${paramIndex}
+       RETURNING *`,
+      values
+    );
+
+    if (!result.rows[0]) {
+      throw new Error(`Task not found: ${id}`);
+    }
+
+    return this.mapTask(result.rows[0]);
+  }
+
+  protected async _deleteTask(id: string): Promise<void> {
+    if (!this.pool) throw new Error("Pool not initialized");
+
+    // Results are cascade deleted via foreign key
+    await this.pool.query(`DELETE FROM ${this.tables.tasks} WHERE id = $1`, [id]);
+  }
+
+  // ============================================================================
+  // Task Results
+  // ============================================================================
+
+  protected async _createTaskResult(
+    id: string,
+    params: CreateTaskResultParams
+  ): Promise<TaskResult> {
+    if (!this.pool) throw new Error("Pool not initialized");
+
+    const result = await this.pool.query<DbTaskResult>(
+      `INSERT INTO ${this.tables.taskResults}
+       (id, task_id, content, files, metadata, usage)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [
+        id,
+        params.taskId,
+        params.content,
+        JSON.stringify(params.files || []),
+        JSON.stringify(params.metadata || {}),
+        params.usage ? JSON.stringify(params.usage) : null,
+      ]
+    );
+
+    return this.mapTaskResult(result.rows[0]);
+  }
+
+  protected async _getTaskResult(taskId: string): Promise<TaskResult | null> {
+    if (!this.pool) throw new Error("Pool not initialized");
+
+    const result = await this.pool.query<DbTaskResult>(
+      `SELECT * FROM ${this.tables.taskResults} WHERE task_id = $1`,
+      [taskId]
+    );
+
+    return result.rows[0] ? this.mapTaskResult(result.rows[0]) : null;
+  }
+
+  // ============================================================================
   // Mappers
   // ============================================================================
 
@@ -592,6 +836,36 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       createdAt: new Date(row.created_at),
     };
   }
+
+  private mapTask(row: DbTask): Task {
+    return {
+      id: row.id,
+      agentId: row.agent_id,
+      userId: row.user_id || undefined,
+      status: row.status as Task["status"],
+      callbackUrl: row.callback_url || undefined,
+      input: row.input,
+      files: typeof row.files === "string" ? JSON.parse(row.files) : row.files || undefined,
+      metadata: typeof row.metadata === "string" ? JSON.parse(row.metadata) : row.metadata,
+      createdAt: new Date(row.created_at),
+      updatedAt: new Date(row.updated_at),
+      startedAt: row.started_at ? new Date(row.started_at) : undefined,
+      completedAt: row.completed_at ? new Date(row.completed_at) : undefined,
+      error: row.error || undefined,
+    };
+  }
+
+  private mapTaskResult(row: DbTaskResult): TaskResult {
+    return {
+      id: row.id,
+      taskId: row.task_id,
+      content: row.content,
+      files: typeof row.files === "string" ? JSON.parse(row.files) : row.files || undefined,
+      metadata: typeof row.metadata === "string" ? JSON.parse(row.metadata) : row.metadata,
+      usage: row.usage ? (typeof row.usage === "string" ? JSON.parse(row.usage) : row.usage) : undefined,
+      createdAt: new Date(row.created_at),
+    };
+  }
 }
 
 // ============================================================================
@@ -632,6 +906,32 @@ interface DbFile {
   conversation_id: string | null;
   message_id: string | null;
   metadata: Record<string, unknown> | string;
+  created_at: string;
+}
+
+interface DbTask {
+  id: string;
+  agent_id: string;
+  user_id: string | null;
+  status: string;
+  callback_url: string | null;
+  input: string;
+  files: unknown;
+  metadata: Record<string, unknown> | string;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  error: string | null;
+}
+
+interface DbTaskResult {
+  id: string;
+  task_id: string;
+  content: string;
+  files: unknown;
+  metadata: Record<string, unknown> | string;
+  usage: unknown | null;
   created_at: string;
 }
 

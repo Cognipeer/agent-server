@@ -7,12 +7,18 @@ import type {
   Conversation,
   Message,
   FileRecord,
+  Task,
+  TaskResult,
   CreateConversationParams,
   GetConversationsParams,
   UpdateConversationParams,
   CreateMessageParams,
   GetMessagesParams,
   SaveFileParams,
+  CreateTaskParams,
+  GetTasksParams,
+  UpdateTaskParams,
+  CreateTaskResultParams,
   PaginatedResult,
 } from "../../types.js";
 
@@ -94,6 +100,8 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       messages: `${this.collectionPrefix}messages`,
       files: `${this.collectionPrefix}files`,
       fileContents: `${this.collectionPrefix}file_contents`,
+      tasks: `${this.collectionPrefix}tasks`,
+      taskResults: `${this.collectionPrefix}task_results`,
     };
   }
 
@@ -153,6 +161,15 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
     const files = this.db.collection(this.collections.files);
     await files.createIndex({ conversationId: 1 });
     await files.createIndex({ storageKey: 1 }, { unique: true });
+
+    const tasks = this.db.collection(this.collections.tasks);
+    await tasks.createIndex({ agentId: 1 });
+    await tasks.createIndex({ userId: 1 });
+    await tasks.createIndex({ status: 1 });
+    await tasks.createIndex({ createdAt: -1 });
+
+    const taskResults = this.db.collection(this.collections.taskResults);
+    await taskResults.createIndex({ taskId: 1 }, { unique: true });
   }
 
   // ============================================================================
@@ -424,6 +441,168 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
   }
 
   // ============================================================================
+  // Tasks
+  // ============================================================================
+
+  protected async _createTask(
+    id: string,
+    params: CreateTaskParams
+  ): Promise<Task> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    const now = new Date();
+    const doc: MongoTask = {
+      _id: id,
+      agentId: params.agentId,
+      userId: params.userId || null,
+      status: "pending",
+      callbackUrl: params.callbackUrl || null,
+      input: params.input,
+      files: params.files || [],
+      metadata: params.metadata || {},
+      createdAt: now,
+      updatedAt: now,
+      startedAt: null,
+      completedAt: null,
+      error: null,
+    };
+
+    await this.db.collection<MongoTask>(this.collections.tasks).insertOne(doc);
+    return this.mapTask(doc);
+  }
+
+  protected async _getTask(id: string): Promise<Task | null> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    const doc = await this.db
+      .collection<MongoTask>(this.collections.tasks)
+      .findOne({ _id: id });
+
+    return doc ? this.mapTask(doc) : null;
+  }
+
+  protected async _getTasks(
+    params: GetTasksParams
+  ): Promise<PaginatedResult<Task>> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    const normalized = this.normalizeParams(params, { limit: 20, offset: 0 });
+
+    // Build filter
+    const filter: Record<string, unknown> = {};
+    if (params.agentId) filter.agentId = params.agentId;
+    if (params.userId) filter.userId = params.userId;
+    if (params.status) filter.status = params.status;
+
+    // Get total count
+    const total = await this.db
+      .collection<MongoTask>(this.collections.tasks)
+      .countDocuments(filter);
+
+    // Get paginated data
+    const orderBy = params.orderBy === "updatedAt" ? "updatedAt" : "createdAt";
+    const order = params.order === "asc" ? 1 : -1;
+
+    const docs = await this.db
+      .collection<MongoTask>(this.collections.tasks)
+      .find(filter)
+      .sort({ [orderBy]: order })
+      .skip(normalized.offset)
+      .limit(normalized.limit)
+      .toArray();
+
+    return {
+      data: docs.map((doc) => this.mapTask(doc)),
+      total,
+      limit: normalized.limit,
+      offset: normalized.offset,
+      hasMore: normalized.offset + docs.length < total,
+    };
+  }
+
+  protected async _updateTask(
+    id: string,
+    params: UpdateTaskParams
+  ): Promise<Task> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    const update: Record<string, unknown> = {
+      updatedAt: new Date(),
+    };
+
+    if (params.status !== undefined) update.status = params.status;
+    if (params.startedAt !== undefined) update.startedAt = params.startedAt;
+    if (params.completedAt !== undefined) update.completedAt = params.completedAt;
+    if (params.error !== undefined) update.error = params.error;
+    if (params.metadata !== undefined) update.metadata = params.metadata;
+
+    const result = await this.db
+      .collection<MongoTask>(this.collections.tasks)
+      .updateOne({ _id: id }, { $set: update });
+
+    if (result.modifiedCount === 0) {
+      throw new Error(`Task not found: ${id}`);
+    }
+
+    const doc = await this.db
+      .collection<MongoTask>(this.collections.tasks)
+      .findOne({ _id: id });
+
+    if (!doc) throw new Error(`Task not found: ${id}`);
+
+    return this.mapTask(doc);
+  }
+
+  protected async _deleteTask(id: string): Promise<void> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    // Delete task result first
+    await this.db
+      .collection<MongoTaskResult>(this.collections.taskResults)
+      .deleteOne({ taskId: id });
+
+    // Delete task
+    await this.db.collection<MongoTask>(this.collections.tasks).deleteOne({ _id: id });
+  }
+
+  // ============================================================================
+  // Task Results
+  // ============================================================================
+
+  protected async _createTaskResult(
+    id: string,
+    params: CreateTaskResultParams
+  ): Promise<TaskResult> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    const now = new Date();
+    const doc: MongoTaskResult = {
+      _id: id,
+      taskId: params.taskId,
+      content: params.content,
+      files: params.files || [],
+      metadata: params.metadata || {},
+      usage: params.usage || null,
+      createdAt: now,
+    };
+
+    await this.db
+      .collection<MongoTaskResult>(this.collections.taskResults)
+      .insertOne(doc);
+    return this.mapTaskResult(doc);
+  }
+
+  protected async _getTaskResult(taskId: string): Promise<TaskResult | null> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    const doc = await this.db
+      .collection<MongoTaskResult>(this.collections.taskResults)
+      .findOne({ taskId });
+
+    return doc ? this.mapTaskResult(doc) : null;
+  }
+
+  // ============================================================================
   // Mappers
   // ============================================================================
 
@@ -466,6 +645,36 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       conversationId: doc.conversationId || undefined,
       messageId: doc.messageId || undefined,
       metadata: doc.metadata,
+      createdAt: doc.createdAt,
+    };
+  }
+
+  private mapTask(doc: MongoTask): Task {
+    return {
+      id: doc._id as string,
+      agentId: doc.agentId,
+      userId: doc.userId || undefined,
+      status: doc.status,
+      callbackUrl: doc.callbackUrl || undefined,
+      input: doc.input,
+      files: doc.files.length > 0 ? doc.files : undefined,
+      metadata: doc.metadata,
+      createdAt: doc.createdAt,
+      updatedAt: doc.updatedAt,
+      startedAt: doc.startedAt || undefined,
+      completedAt: doc.completedAt || undefined,
+      error: doc.error || undefined,
+    };
+  }
+
+  private mapTaskResult(doc: MongoTaskResult): TaskResult {
+    return {
+      id: doc._id as string,
+      taskId: doc.taskId,
+      content: doc.content,
+      files: doc.files.length > 0 ? doc.files : undefined,
+      metadata: doc.metadata,
+      usage: doc.usage || undefined,
       createdAt: doc.createdAt,
     };
   }
@@ -515,6 +724,32 @@ interface MongoFile {
 interface MongoFileContent {
   _id: string;
   content: Buffer;
+}
+
+interface MongoTask {
+  _id: string;
+  agentId: string;
+  userId: string | null;
+  status: Task["status"];
+  callbackUrl: string | null;
+  input: string;
+  files: NonNullable<Task["files"]>;
+  metadata: Record<string, unknown>;
+  createdAt: Date;
+  updatedAt: Date;
+  startedAt: Date | null;
+  completedAt: Date | null;
+  error: string | null;
+}
+
+interface MongoTaskResult {
+  _id: string;
+  taskId: string;
+  content: string;
+  files: NonNullable<TaskResult["files"]>;
+  metadata: Record<string, unknown>;
+  usage: TaskResult["usage"] | null;
+  createdAt: Date;
 }
 
 // Export factory function
