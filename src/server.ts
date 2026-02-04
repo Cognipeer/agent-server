@@ -47,6 +47,22 @@ import type {
 } from "./types.js";
 import { generateOpenAPISpec, generateSwaggerHTML } from "./swagger.js";
 
+/**
+ * Helper to safely extract tool event properties with fallbacks
+ * Follows DRY and KISS principles
+ */
+function extractToolEventProps(event: any): {
+  toolName: string;
+  toolCallId: string;
+  args?: Record<string, unknown>;
+} {
+  return {
+    toolName: event.name || event.toolName || "Unknown Tool",
+    toolCallId: event.id || event.toolCallId || "",
+    args: event.args || {},
+  };
+}
+
 export interface RouteContext {
   user?: AuthUser;
   params: Record<string, string>;
@@ -336,6 +352,9 @@ export class AgentServer {
   }
 
   private handleError(error: unknown): RouteResult {
+    // Log all errors for debugging
+    console.error('[AgentServer] Error:', error);
+    
     if (error instanceof Error) {
       const agentError = error as {
         statusCode?: number;
@@ -880,57 +899,85 @@ export class AgentServer {
             ...(m.name && { name: m.name }),
           }));
 
-          // Collect chunks to yield
-          const chunks: string[] = [];
-          let chunkIndex = 0;
+          // Use async queue to bridge callback-based streaming with generator-based yielding
+          const queue: string[] = [];
+          let resolveWait: (() => void) | null = null;
+          let streamDone = false;
 
-          const result = await sdkAgent.invoke(
+          const pushToQueue = (item: string) => {
+            queue.push(item);
+            if (resolveWait) {
+              resolveWait();
+              resolveWait = null;
+            }
+          };
+
+          const waitForItem = (): Promise<void> => {
+            if (queue.length > 0 || streamDone) {
+              return Promise.resolve();
+            }
+            return new Promise((resolve) => {
+              resolveWait = resolve;
+            });
+          };
+
+          // Start the agent invocation in background
+          const invokePromise = sdkAgent.invoke(
             { messages },
             {
               stream: true,
               onStream: (chunk) => {
-                chunks.push(chunk.text);
+                const textEvent: StreamTextEvent = {
+                  type: "stream.text",
+                  timestamp: Date.now(),
+                  text: chunk.text,
+                  isFinal: false,
+                };
+                pushToQueue(`data: ${JSON.stringify(textEvent)}\n\n`);
               },
               onEvent: (event) => {
                 // Handle tool calls and other events
                 if (event.type === "tool_call") {
+                  const props = extractToolEventProps(event);
                   const toolEvent: StreamToolCallEvent = {
                     type: "stream.tool_call",
                     timestamp: Date.now(),
-                    toolName: event.toolName as string,
-                    toolCallId: event.toolCallId as string,
-                    args: event.args as Record<string, unknown>,
+                    toolName: props.toolName,
+                    toolCallId: props.toolCallId,
+                    args: props.args as Record<string, unknown>,
                   };
-                  chunks.push(`__EVENT__${JSON.stringify(toolEvent)}`);
+                  pushToQueue(`data: ${JSON.stringify(toolEvent)}\n\n`);
                 } else if (event.type === "tool_result") {
+                  const props = extractToolEventProps(event);
                   const toolResultEvent: StreamToolResultEvent = {
                     type: "stream.tool_result",
                     timestamp: Date.now(),
-                    toolName: event.toolName as string,
-                    toolCallId: event.toolCallId as string,
+                    toolName: props.toolName,
+                    toolCallId: props.toolCallId,
                     result: event.result,
                   };
-                  chunks.push(`__EVENT__${JSON.stringify(toolResultEvent)}`);
+                  pushToQueue(`data: ${JSON.stringify(toolResultEvent)}\n\n`);
                 }
               },
             }
-          );
-
-          // Yield all collected chunks
-          for (const chunk of chunks) {
-            if (chunk.startsWith("__EVENT__")) {
-              yield `data: ${chunk.slice(9)}\n\n`;
-            } else {
-              const textEvent: StreamTextEvent = {
-                type: "stream.text",
-                timestamp: Date.now(),
-                text: chunk,
-                isFinal: false,
-              };
-              yield `data: ${JSON.stringify(textEvent)}\n\n`;
+          ).then((result) => {
+            streamDone = true;
+            if (resolveWait) {
+              resolveWait();
+              resolveWait = null;
             }
-            chunkIndex++;
+            return result;
+          });
+
+          // Yield chunks as they arrive
+          while (!streamDone || queue.length > 0) {
+            await waitForItem();
+            while (queue.length > 0) {
+              yield queue.shift()!;
+            }
           }
+
+          const result = await invokePromise;
 
           responseContent = result.content;
           usage = result.metadata?.usage as SendMessageResponse["usage"];
