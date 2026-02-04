@@ -691,13 +691,24 @@ export class AgentServer {
       // Use SDK agent
       const sdkAgent = agent.sdkAgent as {
         invoke: (params: {
-          messages: Array<{ role: string; content: string }>;
+          messages: Array<{ role: string; content: string; tool_calls?: any; tool_call_id?: string; name?: string }>;
         }) => Promise<{ content: string; metadata?: { usage?: unknown } }>;
       };
 
+      // Map messages with tool_calls and tool_call_id preserved
       const messages = previousMessages.data.map((m) => ({
         role: m.role,
         content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+        // Preserve tool call information for proper LLM message history
+        ...(m.toolCalls && m.toolCalls.length > 0 && {
+          tool_calls: m.toolCalls.map(tc => ({
+            id: tc.id,
+            type: "function",
+            function: { name: tc.name, arguments: tc.arguments }
+          }))
+        }),
+        ...(m.toolCallId && { tool_call_id: m.toolCallId }),
+        ...(m.name && { name: m.name }),
       }));
 
       const result = await sdkAgent.invoke({ messages });
@@ -844,7 +855,7 @@ export class AgentServer {
           // Use SDK agent with streaming
           const sdkAgent = agent.sdkAgent as {
             invoke: (
-              params: { messages: Array<{ role: string; content: string }> },
+              params: { messages: Array<{ role: string; content: string; tool_calls?: any; tool_call_id?: string; name?: string }> },
               config?: {
                 stream?: boolean;
                 onStream?: (chunk: { text: string; isFinal?: boolean }) => void;
@@ -853,9 +864,20 @@ export class AgentServer {
             ) => Promise<{ content: string; metadata?: { usage?: unknown } }>;
           };
 
+          // Map messages with tool_calls and tool_call_id preserved
           const messages = previousMessages.data.map((m) => ({
             role: m.role,
             content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+            // Preserve tool call information for proper LLM message history
+            ...(m.toolCalls && m.toolCalls.length > 0 && {
+              tool_calls: m.toolCalls.map(tc => ({
+                id: tc.id,
+                type: "function",
+                function: { name: tc.name, arguments: tc.arguments }
+              }))
+            }),
+            ...(m.toolCallId && { tool_call_id: m.toolCallId }),
+            ...(m.name && { name: m.name }),
           }));
 
           // Collect chunks to yield
