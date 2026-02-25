@@ -1,39 +1,39 @@
 # @cognipeer/agent-server
 
-REST API sunucu altyapısı - AI agent'ları için hazır bir API katmanı.
+REST API server infrastructure - a ready-made API layer for AI agents.
 
-## Özellikler
+## Features
 
-- 🤖 **Agent SDK Entegrasyonu**: `@cognipeer/agent-sdk` ile oluşturulmuş agent'ları doğrudan register edebilme
-- 🔧 **Custom Handler Desteği**: Farklı kütüphanelerle oluşturulmuş agent'ları entegre etme
-- 💾 **Çoklu Storage**: PostgreSQL ve MongoDB desteği
-- 🔐 **Authentication**: Token-based ve JWT authentication
-- 📚 **Swagger UI**: Otomatik OpenAPI dokümantasyonu
-- 🌐 **Framework Agnostik**: Express, Next.js ve diğer framework'lerle çalışır
-- 📁 **Dosya Yönetimi**: Dosya yükleme ve AI'ın gönderdiği dosyaları görüntüleme
+- 🤖 **Agent SDK Integration**: Directly register agents built with `@cognipeer/agent-sdk`
+- 🔧 **Custom Handler Support**: Integrate agents built with other libraries
+- 💾 **Multiple Storage**: PostgreSQL and MongoDB support
+- 🔐 **Authentication**: Token-based and JWT authentication
+- 📚 **Swagger UI**: Automatic OpenAPI documentation
+- 🌐 **Framework Agnostic**: Works with Express, Next.js, and other frameworks
+- 📁 **File Management**: File uploads and viewing files sent by AI
 
-## Kurulum
+## Installation
 
 ```bash
 npm install @cognipeer/agent-server
 ```
 
-Ek olarak kullanmak istediğiniz storage provider ve framework'ü kurmanız gerekir:
+You also need to install the storage provider and framework you want to use:
 
 ```bash
-# PostgreSQL için
+# For PostgreSQL
 npm install pg
 
-# MongoDB için
+# For MongoDB
 npm install mongodb
 
-# Express için
+# For Express
 npm install express
 ```
 
-## Hızlı Başlangıç
+## Quick Start
 
-### Express ile Kullanım
+### Usage with Express
 
 ```typescript
 import express from 'express';
@@ -44,12 +44,12 @@ import {
 } from '@cognipeer/agent-server';
 import { createSmartAgent } from '@cognipeer/agent-sdk';
 
-// Storage provider oluştur
+// Create storage provider
 const storage = createPostgresProvider({
   connectionString: 'postgresql://user:pass@localhost:5432/mydb',
 });
 
-// Agent server oluştur
+// Create agent server
 const agentServer = createAgentServer({
   basePath: '/api/agents',
   storage,
@@ -59,11 +59,11 @@ const agentServer = createAgentServer({
     title: 'My Agent API',
   },
   auth: {
-    enabled: false, // Başlangıç için kapalı
+    enabled: false, // Disabled for now
   },
 });
 
-// SDK agent'ı register et
+// Register SDK agent
 const myAgent = createSmartAgent({
   name: 'Assistant',
   model: myLLMModel,
@@ -73,7 +73,7 @@ agentServer.registerSDKAgent('assistant', myAgent, {
   description: 'A helpful assistant',
 });
 
-// Custom agent register et
+// Register custom agent
 agentServer.registerCustomAgent('echo', {
   processMessage: async ({ message }) => ({
     content: `Echo: ${message}`,
@@ -83,11 +83,11 @@ agentServer.registerCustomAgent('echo', {
   description: 'Echoes your messages',
 });
 
-// Express app oluştur
+// Create Express app
 const app = express();
 app.use(express.json());
 
-// Storage'a bağlan ve server'ı başlat
+// Connect to storage and start server
 await storage.connect();
 app.use(createExpressMiddleware(agentServer));
 
@@ -97,7 +97,7 @@ app.listen(3000, () => {
 });
 ```
 
-### Next.js App Router ile Kullanım
+### Usage with Next.js App Router
 
 ```typescript
 // app/api/agents/[...path]/route.ts
@@ -117,33 +117,33 @@ const agentServer = createAgentServer({
   swagger: { enabled: true },
 });
 
-// Agent'ları register et
+// Register agents
 // ...
 
-// Storage'a bağlan
+// Connect to storage
 await storage.connect();
 
-// Route handler'ları export et
+// Export route handlers
 export const { GET, POST, PATCH, DELETE, OPTIONS } = createNextRouteHandlers(agentServer);
 ```
 
 ## API Endpoints
 
-| Method | Endpoint | Açıklama |
-|--------|----------|----------|
-| GET | /agents | Tüm agent'ları listele |
-| GET | /agents/:agentId | Agent detayı |
-| GET | /conversations | Konuşmaları listele |
-| POST | /conversations | Yeni konuşma oluştur |
-| GET | /conversations/:id | Konuşma detayı ve mesajlar |
-| PATCH | /conversations/:id | Konuşma güncelle |
-| DELETE | /conversations/:id | Konuşma sil |
-| GET | /conversations/:id/messages | Mesajları listele |
-| POST | /conversations/:id/messages | Mesaj gönder |
-| POST | /files | Dosya yükle |
-| GET | /files/:fileId | Dosya metadata |
-| GET | /files/:fileId/content | Dosya indir |
-| DELETE | /files/:fileId | Dosya sil |
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | /agents | List all agents |
+| GET | /agents/:agentId | Agent details |
+| GET | /conversations | List conversations |
+| POST | /conversations | Create new conversation |
+| GET | /conversations/:id | Conversation details and messages |
+| PATCH | /conversations/:id | Update conversation |
+| DELETE | /conversations/:id | Delete conversation |
+| GET | /conversations/:id/messages | List messages |
+| POST | /conversations/:id/messages | Send message |
+| POST | /files | Upload file |
+| GET | /files/:fileId | File metadata |
+| GET | /files/:fileId/content | Download file |
+| DELETE | /files/:fileId | Delete file |
 
 ## Storage Providers
 
@@ -153,20 +153,20 @@ export const { GET, POST, PATCH, DELETE, OPTIONS } = createNextRouteHandlers(age
 import { createPostgresProvider } from '@cognipeer/agent-server';
 
 const storage = createPostgresProvider({
-  // Connection string ile
+  // With connection string
   connectionString: 'postgresql://user:pass@localhost:5432/mydb',
 
-  // Veya ayrı parametrelerle
+  // Or with separate parameters
   host: 'localhost',
   port: 5432,
   database: 'mydb',
   user: 'user',
   password: 'pass',
 
-  // Opsiyonel
+  // Optional
   schema: 'public',          // Default: 'public'
   tablePrefix: 'agent_',     // Default: 'agent_server_'
-  autoMigrate: true,         // Default: true - tabloları otomatik oluştur
+  autoMigrate: true,         // Default: true - auto-create tables
   pool: {
     min: 2,
     max: 10,
@@ -183,7 +183,7 @@ import { createMongoDBProvider } from '@cognipeer/agent-server';
 
 const storage = createMongoDBProvider({
   connectionString: 'mongodb://localhost:27017/mydb',
-  database: 'mydb',              // Opsiyonel
+  database: 'mydb',              // Optional
   collectionPrefix: 'agent_',    // Default: 'agent_server_'
   autoIndex: true,               // Default: true
 });
@@ -199,13 +199,13 @@ await storage.connect();
 import { createTokenAuthProvider } from '@cognipeer/agent-server';
 
 const authProvider = createTokenAuthProvider({
-  // Static token'lar
+  // Static tokens
   tokens: {
     'my-api-key': 'user-1',
     'another-key': 'user-2',
   },
 
-  // Veya custom validation
+  // Or custom validation
   validateFn: async (token) => {
     const user = await myDatabase.findUserByToken(token);
     if (user) {
@@ -222,7 +222,7 @@ const agentServer = createAgentServer({
     provider: authProvider,
     headerName: 'Authorization',    // Default
     tokenPrefix: 'Bearer ',         // Default
-    excludeRoutes: ['/docs', '/docs/*'],  // Auth'suz erişilebilir route'lar
+    excludeRoutes: ['/docs', '/docs/*'],  // Routes accessible without auth
   },
 });
 ```
@@ -235,22 +235,22 @@ import { createJWTAuthProvider } from '@cognipeer/agent-server';
 const authProvider = createJWTAuthProvider({
   secret: 'my-jwt-secret',
   algorithm: 'HS256',           // Default
-  issuer: 'my-app',             // Opsiyonel - doğrulama için
-  audience: 'my-api',           // Opsiyonel - doğrulama için
+  issuer: 'my-app',             // Optional - for validation
+  audience: 'my-api',           // Optional - for validation
   extractUserId: (payload) => payload.sub as string,
 });
 ```
 
 ## Custom Agent Handler
 
-SDK kullanmadan kendi agent'ınızı entegre edebilirsiniz:
+You can integrate your own agent without using the SDK:
 
 ```typescript
 agentServer.registerCustomAgent('my-agent', {
   processMessage: async (params) => {
     const { conversationId, message, files, state, metadata } = params;
 
-    // Kendi AI logic'iniz
+    // Your own AI logic
     const response = await myAIService.chat(message, {
       history: await getHistory(conversationId),
       files,
@@ -277,31 +277,31 @@ agentServer.registerCustomAgent('my-agent', {
 
 ## Custom Storage Provider
 
-Kendi storage provider'ınızı oluşturabilirsiniz:
+You can create your own storage provider:
 
 ```typescript
 import { BaseStorageProvider } from '@cognipeer/agent-server';
 
 class MyStorageProvider extends BaseStorageProvider {
   async connect() {
-    // Bağlantı kur
+    // Establish connection
     this._connected = true;
   }
 
   async disconnect() {
-    // Bağlantıyı kapat
+    // Close connection
     this._connected = false;
   }
 
   protected async _createConversation(id, params) {
-    // Konuşma oluştur
+    // Create conversation
   }
 
-  // Diğer abstract metodları implement et...
+  // Implement other abstract methods...
 }
 ```
 
-## CORS Yapılandırması
+## CORS Configuration
 
 ```typescript
 const agentServer = createAgentServer({
@@ -323,24 +323,24 @@ const agentServer = createAgentServer({
   swagger: {
     enabled: true,
     path: '/docs',           // Default: '/docs'
-    title: 'My Agent API',   // API başlığı
-    version: '1.0.0',        // API versiyonu
+    title: 'My Agent API',   // API title
+    version: '1.0.0',        // API version
     description: 'AI Agent REST API',
   },
 });
 ```
 
-Swagger UI'a `{basePath}/docs` adresinden erişebilirsiniz.
-OpenAPI spec'i `{basePath}/docs/openapi.json` adresinde bulunur.
+You can access the Swagger UI at `{basePath}/docs`.
+The OpenAPI spec is available at `{basePath}/docs/openapi.json`.
 
-## İleriki Adımlar
+## Roadmap
 
-- [ ] HTTP Event Stream (SSE) desteği - real-time response streaming
-- [ ] WebSocket desteği
+- [ ] HTTP Event Stream (SSE) support - real-time response streaming
+- [ ] WebSocket support
 - [ ] Rate limiting
 - [ ] Request logging
-- [ ] Metrics ve monitoring
+- [ ] Metrics and monitoring
 
-## Lisans
+## License
 
 MIT
