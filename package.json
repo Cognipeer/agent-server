@@ -51,6 +51,14 @@
   ],
   "author": "Cognipeer",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Cognipeer/agent-server.git"
+  },
+  "homepage": "https://github.com/Cognipeer/agent-server#readme",
+  "bugs": {
+    "url": "https://github.com/Cognipeer/agent-server/issues"
+  },
   "dependencies": {
     "nanoid": "^5.0.7",
     "zod": "^3.23.8"
