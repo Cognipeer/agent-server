@@ -12,7 +12,7 @@ export default defineConfig({
   dts: true,
   sourcemap: true,
   clean: true,
-  splitting: false,
+  splitting: true,
   treeshake: true,
   target: "es2022",
   outDir: "dist",

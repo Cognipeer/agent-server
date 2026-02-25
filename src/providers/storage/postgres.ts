@@ -422,8 +422,7 @@ export class PostgresStorageProvider extends BaseStorageProvider {
   protected async _createMessage(id: string, params: CreateMessageParams): Promise<Message> {
     if (!this.pool) throw new Error("Pool not initialized");
 
-    const content =
-      typeof params.content === "string" ? params.content : JSON.stringify(params.content);
+    const content = JSON.stringify(params.content);
 
     const result = await this.pool.query<DbMessage>(
       `INSERT INTO ${this.tables.messages}
