@@ -105,14 +105,14 @@ import {
   createAgentServer,
   createMongoDBProvider,
   createNextRouteHandlers,
-} from '@cognipeer/agent-server';
+} from "@cognipeer/agent-server";
 
 const storage = createMongoDBProvider({
-  connectionString: 'mongodb://localhost:27017/mydb',
+  connectionString: "mongodb://localhost:27017/mydb",
 });
 
 const agentServer = createAgentServer({
-  basePath: '/api/agents',
+  basePath: "/api/agents",
   storage,
   swagger: { enabled: true },
 });
@@ -124,49 +124,50 @@ const agentServer = createAgentServer({
 await storage.connect();
 
 // Export route handlers
-export const { GET, POST, PATCH, DELETE, OPTIONS } = createNextRouteHandlers(agentServer);
+export const { GET, POST, PATCH, DELETE, OPTIONS } =
+  createNextRouteHandlers(agentServer);
 ```
 
 ## API Endpoints
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | /agents | List all agents |
-| GET | /agents/:agentId | Agent details |
-| GET | /conversations | List conversations |
-| POST | /conversations | Create new conversation |
-| GET | /conversations/:id | Conversation details and messages |
-| PATCH | /conversations/:id | Update conversation |
-| DELETE | /conversations/:id | Delete conversation |
-| GET | /conversations/:id/messages | List messages |
-| POST | /conversations/:id/messages | Send message |
-| POST | /files | Upload file |
-| GET | /files/:fileId | File metadata |
-| GET | /files/:fileId/content | Download file |
-| DELETE | /files/:fileId | Delete file |
+| Method | Endpoint                    | Description                       |
+| ------ | --------------------------- | --------------------------------- |
+| GET    | /agents                     | List all agents                   |
+| GET    | /agents/:agentId            | Agent details                     |
+| GET    | /conversations              | List conversations                |
+| POST   | /conversations              | Create new conversation           |
+| GET    | /conversations/:id          | Conversation details and messages |
+| PATCH  | /conversations/:id          | Update conversation               |
+| DELETE | /conversations/:id          | Delete conversation               |
+| GET    | /conversations/:id/messages | List messages                     |
+| POST   | /conversations/:id/messages | Send message                      |
+| POST   | /files                      | Upload file                       |
+| GET    | /files/:fileId              | File metadata                     |
+| GET    | /files/:fileId/content      | Download file                     |
+| DELETE | /files/:fileId              | Delete file                       |
 
 ## Storage Providers
 
 ### PostgreSQL
 
 ```typescript
-import { createPostgresProvider } from '@cognipeer/agent-server';
+import { createPostgresProvider } from "@cognipeer/agent-server";
 
 const storage = createPostgresProvider({
   // With connection string
-  connectionString: 'postgresql://user:pass@localhost:5432/mydb',
+  connectionString: "postgresql://user:pass@localhost:5432/mydb",
 
   // Or with separate parameters
-  host: 'localhost',
+  host: "localhost",
   port: 5432,
-  database: 'mydb',
-  user: 'user',
-  password: 'pass',
+  database: "mydb",
+  user: "user",
+  password: "pass",
 
   // Optional
-  schema: 'public',          // Default: 'public'
-  tablePrefix: 'agent_',     // Default: 'agent_server_'
-  autoMigrate: true,         // Default: true - auto-create tables
+  schema: "public", // Default: 'public'
+  tablePrefix: "agent_", // Default: 'agent_server_'
+  autoMigrate: true, // Default: true - auto-create tables
   pool: {
     min: 2,
     max: 10,
@@ -179,13 +180,13 @@ await storage.connect();
 ### MongoDB
 
 ```typescript
-import { createMongoDBProvider } from '@cognipeer/agent-server';
+import { createMongoDBProvider } from "@cognipeer/agent-server";
 
 const storage = createMongoDBProvider({
-  connectionString: 'mongodb://localhost:27017/mydb',
-  database: 'mydb',              // Optional
-  collectionPrefix: 'agent_',    // Default: 'agent_server_'
-  autoIndex: true,               // Default: true
+  connectionString: "mongodb://localhost:27017/mydb",
+  database: "mydb", // Optional
+  collectionPrefix: "agent_", // Default: 'agent_server_'
+  autoIndex: true, // Default: true
 });
 
 await storage.connect();
@@ -196,13 +197,13 @@ await storage.connect();
 ### Token-Based Auth
 
 ```typescript
-import { createTokenAuthProvider } from '@cognipeer/agent-server';
+import { createTokenAuthProvider } from "@cognipeer/agent-server";
 
 const authProvider = createTokenAuthProvider({
   // Static tokens
   tokens: {
-    'my-api-key': 'user-1',
-    'another-key': 'user-2',
+    "my-api-key": "user-1",
+    "another-key": "user-2",
   },
 
   // Or custom validation
@@ -211,7 +212,7 @@ const authProvider = createTokenAuthProvider({
     if (user) {
       return { valid: true, userId: user.id };
     }
-    return { valid: false, error: 'Invalid token' };
+    return { valid: false, error: "Invalid token" };
   },
 });
 
@@ -220,9 +221,9 @@ const agentServer = createAgentServer({
   auth: {
     enabled: true,
     provider: authProvider,
-    headerName: 'Authorization',    // Default
-    tokenPrefix: 'Bearer ',         // Default
-    excludeRoutes: ['/docs', '/docs/*'],  // Routes accessible without auth
+    headerName: "Authorization", // Default
+    tokenPrefix: "Bearer ", // Default
+    excludeRoutes: ["/docs", "/docs/*"], // Routes accessible without auth
   },
 });
 ```
@@ -230,13 +231,13 @@ const agentServer = createAgentServer({
 ### JWT Auth
 
 ```typescript
-import { createJWTAuthProvider } from '@cognipeer/agent-server';
+import { createJWTAuthProvider } from "@cognipeer/agent-server";
 
 const authProvider = createJWTAuthProvider({
-  secret: 'my-jwt-secret',
-  algorithm: 'HS256',           // Default
-  issuer: 'my-app',             // Optional - for validation
-  audience: 'my-api',           // Optional - for validation
+  secret: "my-jwt-secret",
+  algorithm: "HS256", // Default
+  issuer: "my-app", // Optional - for validation
+  audience: "my-api", // Optional - for validation
   extractUserId: (payload) => payload.sub as string,
 });
 ```
@@ -246,33 +247,37 @@ const authProvider = createJWTAuthProvider({
 You can integrate your own agent without using the SDK:
 
 ```typescript
-agentServer.registerCustomAgent('my-agent', {
-  processMessage: async (params) => {
-    const { conversationId, message, files, state, metadata } = params;
+agentServer.registerCustomAgent(
+  "my-agent",
+  {
+    processMessage: async (params) => {
+      const { conversationId, message, files, state, metadata } = params;
 
-    // Your own AI logic
-    const response = await myAIService.chat(message, {
-      history: await getHistory(conversationId),
-      files,
-    });
+      // Your own AI logic
+      const response = await myAIService.chat(message, {
+        history: await getHistory(conversationId),
+        files,
+      });
 
-    return {
-      content: response.text,
-      files: response.attachments,
-      state: { ...state, lastMessageAt: new Date() },
-      usage: {
-        inputTokens: response.usage.prompt,
-        outputTokens: response.usage.completion,
-        totalTokens: response.usage.total,
-      },
-    };
+      return {
+        content: response.text,
+        files: response.attachments,
+        state: { ...state, lastMessageAt: new Date() },
+        usage: {
+          inputTokens: response.usage.prompt,
+          outputTokens: response.usage.completion,
+          totalTokens: response.usage.total,
+        },
+      };
+    },
   },
-}, {
-  name: 'My Custom Agent',
-  description: 'A custom AI agent',
-  version: '1.0.0',
-  metadata: { capabilities: ['chat', 'files'] },
-});
+  {
+    name: "My Custom Agent",
+    description: "A custom AI agent",
+    version: "1.0.0",
+    metadata: { capabilities: ["chat", "files"] },
+  },
+);
 ```
 
 ## Custom Storage Provider
@@ -280,7 +285,7 @@ agentServer.registerCustomAgent('my-agent', {
 You can create your own storage provider:
 
 ```typescript
-import { BaseStorageProvider } from '@cognipeer/agent-server';
+import { BaseStorageProvider } from "@cognipeer/agent-server";
 
 class MyStorageProvider extends BaseStorageProvider {
   async connect() {
@@ -308,9 +313,9 @@ const agentServer = createAgentServer({
   // ...
   cors: {
     enabled: true,
-    origins: ['http://localhost:3000', 'https://myapp.com'],
-    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
-    headers: ['Content-Type', 'Authorization'],
+    origins: ["http://localhost:3000", "https://myapp.com"],
+    methods: ["GET", "POST", "PATCH", "DELETE"],
+    headers: ["Content-Type", "Authorization"],
   },
 });
 ```
@@ -322,10 +327,10 @@ const agentServer = createAgentServer({
   // ...
   swagger: {
     enabled: true,
-    path: '/docs',           // Default: '/docs'
-    title: 'My Agent API',   // API title
-    version: '1.0.0',        // API version
-    description: 'AI Agent REST API',
+    path: "/docs", // Default: '/docs'
+    title: "My Agent API", // API title
+    version: "1.0.0", // API version
+    description: "AI Agent REST API",
   },
 });
 ```
