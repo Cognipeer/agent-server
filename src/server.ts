@@ -46,6 +46,16 @@ import type {
   StreamDoneEvent,
 } from "./types.js";
 import { generateOpenAPISpec, generateSwaggerHTML } from "./swagger.js";
+import {
+  invokeChatCompletions,
+  streamChatCompletions,
+  type ChatCompletionsConfig,
+} from "./providers/ai/chat-completions.js";
+import {
+  invokeResponsesApi,
+  streamResponsesApi,
+  type ResponsesApiConfig,
+} from "./providers/ai/responses.js";
 
 /**
  * Helper to safely extract tool event properties with fallbacks
@@ -189,6 +199,63 @@ export class AgentServer {
     this.agents.set(id, {
       info: { id, ...info },
       handler,
+    });
+  }
+
+  /**
+   * Register a Chat Completions API agent.
+   * Works with any OpenAI-compatible endpoint (OpenAI, Azure, etc.)
+   *
+   * @example
+   * ```ts
+   * server.registerChatCompletionsAgent('my-gpt', {
+   *   baseUrl: 'https://api.openai.com',
+   *   apiKey: process.env.OPENAI_API_KEY!,
+   *   model: 'gpt-4o',
+   *   systemPrompt: 'You are a helpful assistant.',
+   * }, {
+   *   name: 'GPT-4o Agent',
+   *   description: 'OpenAI GPT-4o powered agent',
+   * });
+   * ```
+   */
+  registerChatCompletionsAgent(
+    id: string,
+    config: ChatCompletionsConfig,
+    info: Omit<AgentInfo, "id">
+  ): void {
+    this.agents.set(id, {
+      info: { id, ...info },
+      chatCompletions: config,
+    });
+  }
+
+  /**
+   * Register an OpenAI Responses API agent.
+   * Works with the new OpenAI Responses API endpoint.
+   *
+   * @example
+   * ```ts
+   * server.registerResponsesAgent('my-responses', {
+   *   baseUrl: 'https://api.openai.com',
+   *   apiKey: process.env.OPENAI_API_KEY!,
+   *   model: 'gpt-4o',
+   *   instructions: 'You are a helpful assistant.',
+   *   tools: [{ type: 'web_search_preview' }],
+   * }, {
+   *   name: 'GPT-4o Responses Agent',
+   *   description: 'OpenAI Responses API powered agent with web search',
+   * });
+   * ```
+   */
+  registerResponsesAgent(
+    id: string,
+    config: ResponsesApiConfig,
+    info: Omit<AgentInfo, "id">
+  ): void {
+    this.agents.set(id, {
+      info: { id, ...info },
+      responsesApi: config,
     });
   }
 
@@ -733,6 +800,40 @@ export class AgentServer {
       const result = await sdkAgent.invoke({ messages });
       responseContent = result.content;
       usage = result.metadata?.usage as SendMessageResponse["usage"];
+    } else if (agent.chatCompletions) {
+      // Use Chat Completions API
+      const messages = previousMessages.data.map((m) => ({
+        role: m.role,
+        content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+        ...(m.toolCalls && m.toolCalls.length > 0 && {
+          tool_calls: m.toolCalls.map(tc => ({
+            id: tc.id,
+            type: "function" as const,
+            function: { name: tc.name, arguments: tc.arguments }
+          }))
+        }),
+        ...(m.toolCallId && { tool_call_id: m.toolCallId }),
+        ...(m.name && { name: m.name }),
+      }));
+
+      const result = await invokeChatCompletions(agent.chatCompletions, messages);
+      responseContent = result.content;
+      usage = result.usage;
+    } else if (agent.responsesApi) {
+      // Use Responses API
+      const messages = previousMessages.data.map((m) => ({
+        role: m.role,
+        content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+      }));
+
+      const result = await invokeResponsesApi(agent.responsesApi, messages);
+      responseContent = result.content;
+      usage = result.usage;
+
+      // Store responseId in conversation state for potential chaining
+      await this.config.storage.updateConversation(conversationId, {
+        state: { ...conversation.state, lastResponseId: result.responseId },
+      });
     } else if (agent.handler) {
       // Use custom handler
       const result = await agent.handler.processMessage({
@@ -981,6 +1082,66 @@ export class AgentServer {
 
           responseContent = result.content;
           usage = result.metadata?.usage as SendMessageResponse["usage"];
+        } else if (agent.chatCompletions) {
+          // Use Chat Completions API with streaming
+          const messages = previousMessages.data.map((m) => ({
+            role: m.role,
+            content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+            ...(m.toolCalls && m.toolCalls.length > 0 && {
+              tool_calls: m.toolCalls.map(tc => ({
+                id: tc.id,
+                type: "function" as const,
+                function: { name: tc.name, arguments: tc.arguments }
+              }))
+            }),
+            ...(m.toolCallId && { tool_call_id: m.toolCallId }),
+            ...(m.name && { name: m.name }),
+          }));
+
+          const stream = streamChatCompletions(agent.chatCompletions, messages);
+          for await (const event of stream) {
+            if (event.type === "text") {
+              const textEvent: StreamTextEvent = {
+                type: "stream.text",
+                timestamp: Date.now(),
+                text: event.text,
+                isFinal: false,
+              };
+              yield `data: ${JSON.stringify(textEvent)}\n\n`;
+            } else if (event.type === "done") {
+              responseContent = event.content;
+              usage = event.usage;
+            }
+          }
+        } else if (agent.responsesApi) {
+          // Use Responses API with streaming
+          const messages = previousMessages.data.map((m) => ({
+            role: m.role,
+            content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+          }));
+
+          const stream = streamResponsesApi(agent.responsesApi, messages);
+          for await (const event of stream) {
+            if (event.type === "text") {
+              const textEvent: StreamTextEvent = {
+                type: "stream.text",
+                timestamp: Date.now(),
+                text: event.text,
+                isFinal: false,
+              };
+              yield `data: ${JSON.stringify(textEvent)}\n\n`;
+            } else if (event.type === "done") {
+              responseContent = event.content;
+              usage = event.usage;
+
+              // Store responseId in conversation state for potential chaining
+              if (event.responseId) {
+                await self.config.storage.updateConversation(conversationId, {
+                  state: { ...conversation.state, lastResponseId: event.responseId },
+                });
+              }
+            }
+          }
         } else if (agent.handler) {
           // Use custom handler (non-streaming, send progress updates)
           const progressEvent: StreamProgressEvent = {
@@ -1560,7 +1721,7 @@ export class AgentServer {
         }
       }
 
-      // Process with SDK agent or custom handler
+      // Process with SDK agent, AI provider, or custom handler
       if (agentReg.sdkAgent) {
         // SDK Agent processing - use invoke method like regular message processing
         const sdkAgent = agentReg.sdkAgent as {
@@ -1573,6 +1734,16 @@ export class AgentServer {
 
         responseContent = result.content || "Task completed";
         usage = result.metadata?.usage as TaskResult["usage"];
+      } else if (agentReg.chatCompletions) {
+        // Chat Completions API processing
+        const result = await invokeChatCompletions(agentReg.chatCompletions, messages);
+        responseContent = result.content || "Task completed";
+        usage = result.usage;
+      } else if (agentReg.responsesApi) {
+        // Responses API processing
+        const result = await invokeResponsesApi(agentReg.responsesApi, messages);
+        responseContent = result.content || "Task completed";
+        usage = result.usage;
       } else if (agentReg.handler) {
         // Custom handler processing
         const result = await agentReg.handler.processMessage({
@@ -1622,7 +1793,7 @@ export class AgentServer {
           return;
         }
       } else {
-        throw new Error("Agent has no SDK agent or custom handler");
+        throw new Error("Agent has no SDK agent, AI provider, or custom handler");
       }
 
       // Create task result

@@ -6,3 +6,8 @@ dist/
 .DS_Store
 coverage/
 .nyc_output/
+
+# SQLite database files
+*.db
+*.sqlite
+*.sqlite3

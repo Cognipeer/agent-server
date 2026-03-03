@@ -26,6 +26,10 @@
     "./mongodb": {
       "import": "./dist/providers/storage/mongodb.js",
       "types": "./dist/providers/storage/mongodb.d.ts"
+    },
+    "./sqlite": {
+      "import": "./dist/providers/storage/sqlite.js",
+      "types": "./dist/providers/storage/sqlite.d.ts"
     }
   },
   "files": [
@@ -73,6 +77,7 @@
   },
   "peerDependencies": {
     "@cognipeer/agent-sdk": ">=0.1.0",
+    "better-sqlite3": ">=11.0.0",
     "express": ">=4.0.0",
     "mongodb": ">=6.0.0",
     "next": ">=13.0.0",
@@ -93,6 +98,9 @@
       "optional": true
     },
     "pg": {
+      "optional": true
+    },
+    "better-sqlite3": {
       "optional": true
     },
     "swagger-ui-express": {

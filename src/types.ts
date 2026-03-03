@@ -103,7 +103,7 @@ export interface ProcessMessageResult {
 }
 
 /**
- * Agent registration - can be SDK agent or custom handler
+ * Agent registration - can be SDK agent, custom handler, or AI API provider
  */
 export interface AgentRegistration {
   info: AgentInfo;
@@ -111,6 +111,10 @@ export interface AgentRegistration {
   sdkAgent?: unknown;
   // Custom handler (optional)
   handler?: AgentHandler;
+  // Chat Completions API config (optional)
+  chatCompletions?: import("./providers/ai/chat-completions.js").ChatCompletionsConfig;
+  // Responses API config (optional)
+  responsesApi?: import("./providers/ai/responses.js").ResponsesApiConfig;
 }
 
 // ============================================================================

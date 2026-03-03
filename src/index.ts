@@ -123,6 +123,11 @@ export {
   createInMemoryProvider,
 } from "./providers/storage/memory.js";
 export type { InMemoryConfig } from "./providers/storage/memory.js";
+export {
+  SQLiteStorageProvider,
+  createSQLiteProvider,
+} from "./providers/storage/sqlite.js";
+export type { SQLiteConfig } from "./providers/storage/sqlite.js";
 
 // Auth provider exports
 export {
@@ -132,6 +137,22 @@ export {
   createJWTAuthProvider,
 } from "./providers/auth/token.js";
 export type { TokenAuthConfig, JWTAuthConfig } from "./providers/auth/token.js";
+
+// AI provider exports
+export {
+  invokeChatCompletions,
+  streamChatCompletions,
+  invokeResponsesApi,
+  streamResponsesApi,
+} from "./providers/ai/index.js";
+export type {
+  ChatCompletionsConfig,
+  ChatCompletionsResult,
+  ChatCompletionsStreamEvent,
+  ResponsesApiConfig,
+  ResponsesApiResult,
+  ResponsesApiStreamEvent,
+} from "./providers/ai/index.js";
 
 // Adapter exports
 export {
