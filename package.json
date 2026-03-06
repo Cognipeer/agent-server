@@ -1,6 +1,6 @@
 {
   "name": "@cognipeer/agent-server",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "REST API server infrastructure for AI agents - supports agent-sdk and custom implementations",
   "type": "module",
   "main": "./dist/index.js",
