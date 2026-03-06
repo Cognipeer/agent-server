@@ -290,6 +290,21 @@ export interface FileStorageProvider {
 // Server Configuration Types
 // ============================================================================
 
+/**
+ * Configuration for LLM-based automatic conversation title generation.
+ * Uses any OpenAI-compatible endpoint (e.g. OpenAI, Ollama, local models).
+ */
+export interface TitleGenerationConfig {
+  /** Base URL of the OpenAI-compatible API (e.g. "https://api.openai.com") */
+  baseUrl: string;
+  /** API key for authentication */
+  apiKey: string;
+  /** Model to use for title generation (e.g. "gpt-4o-mini") */
+  model: string;
+  /** Custom path override (default: "/v1/chat/completions") */
+  path?: string;
+}
+
 export interface AgentServerConfig {
   /**
    * Base path for all API routes (e.g., "/api/agents")
@@ -300,6 +315,12 @@ export interface AgentServerConfig {
    * Storage provider instance
    */
   storage: StorageProvider;
+
+  /**
+   * Auto-generate conversation titles using an LLM after the first message.
+   * If not set, titles will not be auto-generated.
+   */
+  titleGeneration?: TitleGenerationConfig;
 
   /**
    * Optional file storage provider (defaults to database storage)
@@ -447,6 +468,8 @@ export interface SendMessageRequest {
 export interface SendMessageResponse {
   message: Message;
   response: Message;
+  /** Auto-generated conversation title (only present on the first message) */
+  conversationTitle?: string;
   usage?: {
     inputTokens?: number;
     outputTokens?: number;
@@ -531,6 +554,8 @@ export interface StreamDoneEvent extends StreamEventBase {
   conversationId: string;
   messageId: string;
   content: string;
+  /** Auto-generated conversation title (only present on the first message) */
+  title?: string;
   usage?: {
     inputTokens?: number;
     outputTokens?: number;
@@ -555,7 +580,7 @@ export interface ListAgentsResponse {
 }
 
 export interface ListConversationsResponse {
-  conversations: Conversation[];
+  conversations: Array<Conversation & { agentName?: string }>;
   total: number;
   limit: number;
   offset: number;

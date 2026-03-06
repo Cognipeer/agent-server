@@ -158,6 +158,44 @@ export class AgentServer {
     }
   }
 
+  /**
+   * Auto-generate a short conversation title from the first user message
+   * using the configured OpenAI-compatible provider. Returns undefined if
+   * titleGeneration is not configured or the call fails.
+   */
+  private async generateTitle(userMessage: string): Promise<string | undefined> {
+    const cfg = this.config.titleGeneration;
+    if (!cfg) return undefined;
+    try {
+      const path = cfg.path ?? "/v1/chat/completions";
+      const prompt =
+        `Generate a conversation title for the following message using a maximum of 3-4 words. ` +
+        `The title must be in the same language as the message. ` +
+        `Return only the exact title — no quotes, no extra text.\n\n${userMessage}`;
+      const res = await fetch(`${cfg.baseUrl.replace(/\/$/, "")}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {}),
+        },
+        body: JSON.stringify({
+          model: cfg.model,
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0.5,
+          max_tokens: 20,
+        }),
+      });
+      if (!res.ok) return undefined;
+      const data = await res.json() as { choices?: Array<{ message?: { content?: string } }> };
+      const raw = data.choices?.[0]?.message?.content?.trim();
+      if (!raw) return undefined;
+      // Strip surrounding quotes if the model wraps the title
+      return raw.replace(/^["""''']|["""''']$/g, "").trim() || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   // ============================================================================
   // Agent Registration
   // ============================================================================
@@ -543,7 +581,10 @@ export class AgentServer {
     return {
       status: 200,
       body: {
-        conversations: result.data,
+        conversations: result.data.map((conv) => ({
+          ...conv,
+          agentName: this.agents.get(conv.agentId)?.info.name,
+        })),
         total: result.total,
         limit: result.limit,
         offset: result.offset,
@@ -869,11 +910,21 @@ export class AgentServer {
       files: responseFiles,
     });
 
+    // Auto-generate title on the first exchange
+    let conversationTitle: string | undefined;
+    if (!conversation.title && previousMessages.data.length === 1) {
+      conversationTitle = await this.generateTitle(body.message);
+      if (conversationTitle) {
+        await this.config.storage.updateConversation(conversationId, { title: conversationTitle });
+      }
+    }
+
     return {
       status: 200,
       body: {
         message: userMessage,
         response: assistantMessage,
+        conversationTitle,
         usage,
       },
     };
@@ -1198,6 +1249,15 @@ export class AgentServer {
           files: responseFiles,
         });
 
+        // Auto-generate title on the first exchange
+        let generatedTitle: string | undefined;
+        if (!conversation.title && previousMessages.data.length === 1) {
+          generatedTitle = await self.generateTitle(body.message);
+          if (generatedTitle) {
+            await self.config.storage.updateConversation(conversationId, { title: generatedTitle });
+          }
+        }
+
         // Send done event
         const doneEvent: StreamDoneEvent = {
           type: "stream.done",
@@ -1205,6 +1265,7 @@ export class AgentServer {
           conversationId,
           messageId: assistantMessage.id,
           content: responseContent,
+          title: generatedTitle,
           usage: usage
             ? {
                 inputTokens: usage.inputTokens,

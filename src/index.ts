@@ -60,6 +60,7 @@ export type {
 
   // Configuration types
   AgentServerConfig,
+  TitleGenerationConfig,
   AuthConfig,
   SwaggerConfig,
   CorsConfig,
