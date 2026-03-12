@@ -1079,6 +1079,9 @@ export class AgentServer {
             {
               stream: true,
               onStream: (chunk) => {
+                // Agent SDK emits a final full-text chunk (isFinal:true).
+                // Skip forwarding it as stream.text to avoid duplicated UI text.
+                if (chunk.isFinal) return;
                 const textEvent: StreamTextEvent = {
                   type: "stream.text",
                   timestamp: Date.now(),
