@@ -3,45 +3,52 @@ layout: home
 
 hero:
   name: Agent Server
-  text: REST API Infrastructure for AI Agents
-  tagline: Framework-agnostic server with built-in storage, authentication, streaming, and Swagger UI
-  image:
-    src: /agent-server/logo.svg
-    alt: Agent Server
+  text: Ship Agent APIs Without Rebuilding The Server Layer
+  tagline: Framework-agnostic infrastructure for storage, authentication, file handling, streaming, and Swagger-backed agent APIs across Express, Next.js, and custom runtimes.
   actions:
     - theme: brand
       text: Get Started
       link: /guide/getting-started
     - theme: alt
-      text: View on GitHub
-      link: https://github.com/Cognipeer/agent-server
+      text: Study Architecture
+      link: /guide/architecture
 
 features:
-  - icon: 🤖
-    title: Agent SDK Integration
-    details: Register agents created with @cognipeer/agent-sdk directly and expose them as REST APIs.
-  - icon: 🔧
-    title: Custom Handler Support
-    details: Integrate agents from any library with a simple handler interface.
-  - icon: 💾
-    title: Multiple Storage Backends
-    details: Built-in PostgreSQL and MongoDB providers with auto-migration support.
-  - icon: 🔐
-    title: Authentication
-    details: Token-based and JWT authentication with customizable providers.
-  - icon: 📡
-    title: SSE Streaming
-    details: Real-time response streaming with Server-Sent Events.
-  - icon: 📚
-    title: Swagger UI
-    details: Automatic OpenAPI documentation with interactive Swagger UI.
-  - icon: 📁
-    title: File Management
-    details: Built-in file upload and download with storage integration.
-  - icon: 🌐
-    title: Framework Agnostic
-    details: Works with Express, Next.js, and other frameworks via adapters.
+  - title: SDK Agents And Custom Handlers
+    details: Register agents built with `@cognipeer/agent-sdk` or expose your own runtime handlers through the same REST surface.
+  - title: Storage That Does Not Start From Scratch
+    details: Use the built-in PostgreSQL, MongoDB, and SQLite providers instead of rebuilding conversation and file persistence for every deployment.
+  - title: Auth, Files, And Streaming In One Runtime
+    details: Keep token or JWT auth, file uploads, and SSE response delivery inside the same server layer that already knows your agent routes.
+  - title: Framework Adapters That Match Real Integrations
+    details: Start with Express or Next.js and keep a clean path toward custom adapters when your hosting model does not fit the defaults.
+  - title: Swagger And REST Contracts Ready To Inspect
+    details: Publish interactive API docs and predictable endpoints without manually maintaining separate OpenAPI scaffolding.
+  - title: Examples And Guides That Stay Operational
+    details: Move from setup into adapters, providers, auth, and endpoint details without losing the shape of the existing docs tree.
 ---
+
+## Start Here
+
+If you are integrating Agent Server for the first time, this is the shortest useful reading order:
+
+1. [Getting Started](/guide/getting-started) to boot a working server quickly.
+2. [Core Concepts](/guide/core-concepts) to understand agents, conversations, storage, and files.
+3. [Architecture](/guide/architecture) to see how adapters, providers, and API routes fit together.
+
+If you already know the basics, jump directly to the part that matches your work:
+
+- Wiring an app runtime? Start with [Express.js](/guide/express) or [Next.js](/guide/nextjs).
+- Choosing persistence and auth? Start with [Storage Providers](/guide/storage) and [Authentication](/guide/authentication).
+- Building against the runtime contract? Start with [API Reference](/api/server) and [REST Endpoints](/api/endpoints).
+
+## Choose Your Integration Path
+
+| Start with | Best for | What you get |
+| --- | --- | --- |
+| Guide | Teams standing up the server for the first time | Setup, architecture, adapters, storage, auth, files, and streaming guidance |
+| API Reference | Backend teams implementing or extending the runtime | Server interfaces, types, adapters, providers, and endpoint contracts |
+| Examples | Teams that want a runnable starting point | Express, Next.js, storage-backed, and auth-aware sample integrations |
 
 ## Quick Start
 
@@ -61,23 +68,18 @@ pnpm add @cognipeer/agent-server
 
 :::
 
-## Basic Usage
-
-```typescript
+```ts
 import express from 'express';
 import {
   createAgentServer,
   createPostgresProvider,
   createExpressMiddleware,
 } from '@cognipeer/agent-server';
-import { createSmartAgent } from '@cognipeer/agent-sdk';
 
-// Storage provider
 const storage = createPostgresProvider({
-  connectionString: 'postgresql://user:pass@localhost:5432/mydb',
+  connectionString: process.env.DATABASE_URL!,
 });
 
-// Agent server
 const agentServer = createAgentServer({
   basePath: '/api/agents',
   storage,
@@ -88,43 +90,32 @@ const agentServer = createAgentServer({
   },
 });
 
-// Register your agent
-const myAgent = createSmartAgent({
-  name: 'Assistant',
-  model: myLLMModel,
-  tools: [...],
-});
-agentServer.registerSDKAgent('assistant', myAgent, {
-  description: 'A helpful assistant',
-});
-
-// Express app
 const app = express();
 app.use(express.json());
 
 await storage.connect();
 app.use(createExpressMiddleware(agentServer));
-
-app.listen(3000, () => {
-  console.log('Server running at http://localhost:3000');
-  console.log('Swagger UI at http://localhost:3000/api/agents/docs');
-});
+app.listen(3000);
 ```
 
-## API Endpoints
+## Docs Map
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | /agents | List all agents |
-| GET | /agents/:agentId | Get agent details |
-| GET | /conversations | List conversations |
-| POST | /conversations | Create new conversation |
-| GET | /conversations/:id | Get conversation with messages |
-| PATCH | /conversations/:id | Update conversation |
-| DELETE | /conversations/:id | Delete conversation |
-| GET | /conversations/:id/messages | List messages |
-| POST | /conversations/:id/messages | Send message |
-| POST | /files | Upload file |
-| GET | /files/:fileId | Get file metadata |
-| GET | /files/:fileId/content | Download file |
-| DELETE | /files/:fileId | Delete file |
+- [Guide](/guide/getting-started): setup, concepts, adapters, storage, auth, file management, streaming, and Swagger guidance.
+- [Architecture](/guide/architecture): how the server runtime, adapters, providers, and API surface are layered.
+- [API Reference](/api/server): core interfaces, types, adapters, providers, and REST endpoint contracts.
+- [Examples](/examples/): runnable integration paths for Express, Next.js, custom agents, and auth flows.
+
+## Production Checklist
+
+- Decide early which framework adapter and storage backend own your runtime so conversations and files do not get reworked later.
+- Confirm your auth model, base path, and streaming expectations before publishing endpoints to consuming clients.
+- Keep Swagger enabled in environments where API inspection shortens integration loops.
+- Validate file handling, conversation persistence, and error behavior together instead of treating them as separate subsystems.
+- Run `npm run docs:build` when docs or examples change so links and frontmatter stay valid.
+
+## What This Site Covers
+
+- A practical path from install to a production-ready agent API server without rebuilding transport, persistence, and auth plumbing by hand.
+- The runtime contracts behind adapters, providers, endpoint behavior, and framework integration.
+- The operational guidance needed to move from local examples into real deployments.
+- A docs shell aligned with the wider Cognipeer docs surfaces while preserving Agent Server's own structure and examples.
