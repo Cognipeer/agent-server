@@ -1092,16 +1092,40 @@ export class AgentServer {
               },
               onEvent: (event) => {
                 // Handle tool calls and other events
+                // The SDK emits tool_call events at multiple phases:
+                //   phase "start"   → tool execution is beginning
+                //   phase "success" → tool execution completed with result
+                //   phase "error"   → tool execution failed
+                //   phase "skipped" → tool was skipped (limit reached)
+                // Only emit stream.tool_call on "start"; convert "success"/"error" to stream.tool_result.
                 if (event.type === "tool_call") {
+                  const phase = (event as { phase?: string }).phase;
                   const props = extractToolEventProps(event);
-                  const toolEvent: StreamToolCallEvent = {
-                    type: "stream.tool_call",
-                    timestamp: Date.now(),
-                    toolName: props.toolName,
-                    toolCallId: props.toolCallId,
-                    args: props.args as Record<string, unknown>,
-                  };
-                  pushToQueue(`data: ${JSON.stringify(toolEvent)}\n\n`);
+
+                  if (phase === "success" || phase === "error") {
+                    // Tool finished — emit as tool_result
+                    const toolResultEvent: StreamToolResultEvent = {
+                      type: "stream.tool_result",
+                      timestamp: Date.now(),
+                      toolName: props.toolName,
+                      toolCallId: props.toolCallId,
+                      result: phase === "success"
+                        ? (event as { result?: unknown }).result
+                        : { error: ((event as { error?: { message?: string } }).error)?.message || "Tool execution failed" },
+                    };
+                    pushToQueue(`data: ${JSON.stringify(toolResultEvent)}\n\n`);
+                  } else if (!phase || phase === "start") {
+                    // Tool starting — emit as tool_call
+                    const toolEvent: StreamToolCallEvent = {
+                      type: "stream.tool_call",
+                      timestamp: Date.now(),
+                      toolName: props.toolName,
+                      toolCallId: props.toolCallId,
+                      args: props.args as Record<string, unknown>,
+                    };
+                    pushToQueue(`data: ${JSON.stringify(toolEvent)}\n\n`);
+                  }
+                  // phase "skipped" → do not emit (already at tool limit)
                 } else if (event.type === "tool_result") {
                   const props = extractToolEventProps(event);
                   const toolResultEvent: StreamToolResultEvent = {
