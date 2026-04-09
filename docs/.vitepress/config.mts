@@ -2,13 +2,17 @@ import { defineConfig } from 'vitepress';
 
 export default defineConfig({
   title: 'Agent Server',
-  description: 'REST API server infrastructure for AI agents - supports agent-sdk and custom implementations',
+  description: 'REST API server infrastructure for AI agents with storage, auth, streaming, and framework adapters.',
   base: '/agent-server/',
   ignoreDeadLinks: true,
+  appearance: false,
+
   themeConfig: {
-    logo: '/logo.svg',
+    logo: '/AgentServer.svg',
+    siteTitle: 'Agent Server',
     nav: [
       { text: 'Guide', link: '/guide/getting-started' },
+      { text: 'Architecture', link: '/guide/architecture' },
       { text: 'API Reference', link: '/api/server' },
       { text: 'Examples', link: '/examples/' },
       {
@@ -34,6 +38,8 @@ export default defineConfig({
           items: [
             { text: 'Express.js', link: '/guide/express' },
             { text: 'Next.js', link: '/guide/nextjs' },
+            { text: 'Custom Adapters', link: '/guide/custom-adapters' },
+            { text: 'Client Integration', link: '/guide/client-integration' },
           ],
         },
         {
@@ -41,9 +47,11 @@ export default defineConfig({
           items: [
             { text: 'Storage Providers', link: '/guide/storage' },
             { text: 'Authentication', link: '/guide/authentication' },
+            { text: 'Conversations & Messages', link: '/guide/conversations-messages' },
             { text: 'File Management', link: '/guide/file-management' },
             { text: 'Streaming', link: '/guide/streaming' },
             { text: 'Swagger UI', link: '/guide/swagger' },
+            { text: 'AI Providers', link: '/guide/ai-providers' },
           ],
         },
         {
@@ -86,16 +94,19 @@ export default defineConfig({
       { icon: 'github', link: 'https://github.com/Cognipeer/agent-server' },
     ],
     footer: {
-      message: 'Released under the MIT License.',
-      copyright: 'Copyright © 2025 CognipeerAI',
+      message: 'Agent Server is part of the Cognipeer platform.',
+      copyright: 'Copyright © 2026 Cognipeer',
     },
     search: {
       provider: 'local',
     },
   },
   head: [
-    ['link', { rel: 'icon', type: 'image/svg+xml', href: '/agent-server/favicon.svg' }],
-    ['meta', { name: 'theme-color', content: '#3eaf7c' }],
+    ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],
+    ['link', { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: '' }],
+    ['link', { rel: 'stylesheet', href: 'https://fonts.googleapis.com/css2?family=Lexend+Deca:wght@400;500;600;700;800&display=swap' }],
+    ['link', { rel: 'icon', type: 'image/svg+xml', href: '/agent-server/AgentServer.svg' }],
+    ['meta', { name: 'theme-color', content: '#00b5a5' }],
     ['meta', { name: 'og:type', content: 'website' }],
     ['meta', { name: 'og:locale', content: 'en' }],
     ['meta', { name: 'og:site_name', content: 'Agent Server Documentation' }],
