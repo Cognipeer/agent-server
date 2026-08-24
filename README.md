@@ -2,6 +2,8 @@
 
 REST API server infrastructure - a ready-made API layer for AI agents.
 
+
+Documentation: <https://docs.cognipeer.com/agent-server/guide/getting-started>
 ## Features
 
 - 🤖 **Agent SDK Integration**: Directly register agents built with `@cognipeer/agent-sdk`
