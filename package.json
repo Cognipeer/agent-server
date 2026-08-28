@@ -1,6 +1,6 @@
 {
   "name": "@cognipeer/agent-server",
-  "version": "0.1.4",
+  "version": "0.1.6",
   "description": "REST API server infrastructure for AI agents - supports agent-sdk and custom implementations",
   "type": "module",
   "main": "./dist/index.js",
@@ -39,7 +39,7 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "lint": "eslint src --ext .ts",
-    "test": "vitest",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
@@ -59,7 +59,7 @@
     "type": "git",
     "url": "https://github.com/Cognipeer/agent-server.git"
   },
-  "homepage": "https://github.com/Cognipeer/agent-server#readme",
+  "homepage": "https://docs.cognipeer.com/agent-server/",
   "bugs": {
     "url": "https://github.com/Cognipeer/agent-server/issues"
   },
