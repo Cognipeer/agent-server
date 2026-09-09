@@ -1,6 +1,8 @@
 # Contributing
 
-Thank you for your interest in contributing to `@cognipeer/agent-server`!
+Thank you for your interest in contributing to `@cognipeer/agent-server`.
+
+Agent Server docs live under `docs/` and are rendered with VitePress using the shared Cognipeer docs shell.
 
 ## Development Setup
 
@@ -23,6 +25,24 @@ npm install
 npm run dev
 ```
 
+4. Run docs locally:
+
+```bash
+npm run docs:dev
+```
+
+## Project Areas
+
+- `src/`: runtime source for the server, adapters, and providers
+- `docs/`: VitePress documentation source
+- `examples/`: integration examples and sample server setups
+
+## Documentation
+
+- Theme config: `docs/.vitepress/config.mts`
+- Theme styling: `docs/.vitepress/theme/`
+- Public docs assets: `docs/public/`
+
 ## Running Tests
 
 ```bash
@@ -33,6 +53,7 @@ npm test
 
 ```bash
 npm run build
+npm run docs:build
 ```
 
 ## Code Style
@@ -48,7 +69,7 @@ npm run lint
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
-4. Run tests and linting
+4. Run tests, linting, and docs build where relevant
 5. Submit a pull request
 
 ## Reporting Issues
