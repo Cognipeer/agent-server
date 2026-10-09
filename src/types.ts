@@ -61,6 +61,49 @@ export interface ConversationWithMessages extends Conversation {
 }
 
 // ============================================================================
+// Request Context Types
+// ============================================================================
+
+/**
+ * Per-request context. Produced by `config.resolveContext` (or, when that is not
+ * configured, built from the token-auth user) and handed to dynamic agent
+ * resolvers, agent handlers, every storage provider call and `resolveUserId`.
+ */
+export interface RequestContext {
+  /** The authenticated end user. Takes precedence over token-auth user. */
+  user?: AuthUser;
+  /** Arbitrary host data (tenant id, scopes, portal id, ...). Never sent to the client. */
+  data: Record<string, unknown>;
+}
+
+/**
+ * Framework-neutral description of an incoming request, passed to
+ * `config.resolveContext`.
+ */
+export interface ContextRequest {
+  method: string;
+  /** Route path relative to the server base path, e.g. "/conversations/abc/messages". */
+  path: string;
+  /** Request URL as seen by the adapter (path + query string) when known. */
+  url?: string;
+  /** Lower-cased header names. */
+  headers: Record<string, string | string[] | undefined>;
+  /** Parsed `Cookie` header. */
+  cookies: Record<string, string>;
+  query: Record<string, string | string[] | undefined>;
+  body?: unknown;
+  /** User authenticated by the token `auth` provider, if any. */
+  user?: AuthUser;
+  /**
+   * Dynamic parameters of the prefix the server is mounted under, e.g.
+   * `{ portalKey }` when mounted under `/api/portal/:portalKey` on Fastify.
+   */
+  mountParams: Record<string, string>;
+  /** The framework's native request (Express req, NextRequest, IncomingMessage, FastifyRequest). */
+  raw?: unknown;
+}
+
+// ============================================================================
 // Agent Types
 // ============================================================================
 
@@ -88,6 +131,8 @@ export interface ProcessMessageParams {
   files?: FileAttachment[];
   state?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+  /** Per-request context resolved by `config.resolveContext` (user + custom data). */
+  context?: RequestContext;
 }
 
 export interface ProcessMessageResult {
@@ -121,6 +166,12 @@ export interface AgentRegistration {
 // Storage Provider Types
 // ============================================================================
 
+/**
+ * Storage contract. Every data method receives the optional per-request
+ * `RequestContext` as its LAST argument so external stores can scope reads and
+ * writes by tenant/user. Implementations that do not need it can simply omit
+ * the parameter.
+ */
 export interface StorageProvider {
   // Lifecycle
   connect(): Promise<void>;
@@ -128,34 +179,34 @@ export interface StorageProvider {
   isConnected(): boolean;
 
   // Conversations
-  createConversation(params: CreateConversationParams): Promise<Conversation>;
-  getConversation(id: string): Promise<Conversation | null>;
-  getConversations(params: GetConversationsParams): Promise<PaginatedResult<Conversation>>;
-  updateConversation(id: string, params: UpdateConversationParams): Promise<Conversation>;
-  deleteConversation(id: string): Promise<void>;
+  createConversation(params: CreateConversationParams, ctx?: RequestContext): Promise<Conversation>;
+  getConversation(id: string, ctx?: RequestContext): Promise<Conversation | null>;
+  getConversations(params: GetConversationsParams, ctx?: RequestContext): Promise<PaginatedResult<Conversation>>;
+  updateConversation(id: string, params: UpdateConversationParams, ctx?: RequestContext): Promise<Conversation>;
+  deleteConversation(id: string, ctx?: RequestContext): Promise<void>;
 
   // Messages
-  createMessage(params: CreateMessageParams): Promise<Message>;
-  getMessages(conversationId: string, params?: GetMessagesParams): Promise<PaginatedResult<Message>>;
-  getMessage(id: string): Promise<Message | null>;
-  deleteMessage(id: string): Promise<void>;
+  createMessage(params: CreateMessageParams, ctx?: RequestContext): Promise<Message>;
+  getMessages(conversationId: string, params?: GetMessagesParams, ctx?: RequestContext): Promise<PaginatedResult<Message>>;
+  getMessage(id: string, ctx?: RequestContext): Promise<Message | null>;
+  deleteMessage(id: string, ctx?: RequestContext): Promise<void>;
 
   // Files
-  saveFile(params: SaveFileParams): Promise<FileRecord>;
-  getFile(id: string): Promise<FileRecord | null>;
-  getFileContent(id: string): Promise<Buffer | null>;
-  deleteFile(id: string): Promise<void>;
+  saveFile(params: SaveFileParams, ctx?: RequestContext): Promise<FileRecord>;
+  getFile(id: string, ctx?: RequestContext): Promise<FileRecord | null>;
+  getFileContent(id: string, ctx?: RequestContext): Promise<Buffer | null>;
+  deleteFile(id: string, ctx?: RequestContext): Promise<void>;
 
   // Tasks
-  createTask(params: CreateTaskParams): Promise<Task>;
-  getTask(id: string): Promise<Task | null>;
-  getTasks(params: GetTasksParams): Promise<PaginatedResult<Task>>;
-  updateTask(id: string, params: UpdateTaskParams): Promise<Task>;
-  deleteTask(id: string): Promise<void>;
+  createTask(params: CreateTaskParams, ctx?: RequestContext): Promise<Task>;
+  getTask(id: string, ctx?: RequestContext): Promise<Task | null>;
+  getTasks(params: GetTasksParams, ctx?: RequestContext): Promise<PaginatedResult<Task>>;
+  updateTask(id: string, params: UpdateTaskParams, ctx?: RequestContext): Promise<Task>;
+  deleteTask(id: string, ctx?: RequestContext): Promise<void>;
 
   // Task Results
-  createTaskResult(params: CreateTaskResultParams): Promise<TaskResult>;
-  getTaskResult(taskId: string): Promise<TaskResult | null>;
+  createTaskResult(params: CreateTaskResultParams, ctx?: RequestContext): Promise<TaskResult>;
+  getTaskResult(taskId: string, ctx?: RequestContext): Promise<TaskResult | null>;
 }
 
 export interface CreateConversationParams {
@@ -317,6 +368,23 @@ export interface AgentServerConfig {
   storage: StorageProvider;
 
   /**
+   * Resolve the per-request context (user + arbitrary data), e.g. from a session
+   * cookie. Returning `null` rejects the request with 401. When set, the
+   * resolved user is authoritative: client-supplied `userId` query/body values
+   * are ignored and conversations owned by another user are not accessible.
+   * Public swagger routes are not subject to it.
+   */
+  resolveContext?: (req: ContextRequest) => Promise<RequestContext | null> | RequestContext | null;
+
+  /**
+   * Agents served by this instance. An array is registered once; a function is
+   * resolved for every request (so the list can depend on the user/tenant).
+   * Agents registered through `registerSDKAgent` & co. are always included;
+   * a dynamic agent with the same id wins.
+   */
+  agents?: AgentRegistration[] | ((ctx: RequestContext) => AgentRegistration[] | Promise<AgentRegistration[]>);
+
+  /**
    * Auto-generate conversation titles using an LLM after the first message.
    * If not set, titles will not be auto-generated.
    */
@@ -346,6 +414,16 @@ export interface AgentServerConfig {
    * Request limits
    */
   limits?: RequestLimits;
+
+  /**
+   * Keep internal error text away from the client. When true, only errors the
+   * host authored for the caller show their message - an explicit 4xx
+   * `statusCode`, or `expose: true` for a deliberate 5xx; every other failure - a driver error, a bug, a 5xx -
+   * answers with a generic message in both the HTTP body and the SSE
+   * `stream.error` event, and the original is logged server-side. Default false.
+   * Turn it on whenever the audience is not the operator.
+   */
+  maskServerErrors?: boolean;
 }
 
 export interface AuthConfig {
@@ -363,7 +441,13 @@ export interface AuthConfig {
    * Custom function to resolve userId from request context
    * Used when auth is disabled or to override token-based userId
    */
-  resolveUserId?: (ctx: { headers?: Record<string, string>; query?: Record<string, unknown>; body?: unknown }) => string | undefined | Promise<string | undefined>;
+  resolveUserId?: (ctx: {
+    headers?: Record<string, string | string[] | undefined>;
+    query?: Record<string, unknown>;
+    body?: unknown;
+    /** Per-request context (see `AgentServerConfig.resolveContext`). */
+    context?: RequestContext;
+  }) => string | undefined | Promise<string | undefined>;
 
   /**
    * Header name for token (default: "Authorization")

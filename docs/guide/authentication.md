@@ -114,7 +114,7 @@ interface AuthConfig {
   excludeRoutes?: string[];
   
   // Custom userId resolver (when not using token auth)
-  resolveUserId?: (ctx: { query: Record<string, string>; body?: unknown }) => Promise<string | undefined>;
+  resolveUserId?: (ctx: { headers?: Record<string, string | string[] | undefined>; query: Record<string, string>; body?: unknown; context?: RequestContext }) => Promise<string | undefined>;
 }
 ```
 

@@ -7,7 +7,12 @@
 
 // Core exports
 export { AgentServer, createAgentServer } from "./server.js";
-export type { RouteContext, RouteResult } from "./server.js";
+export type { RouteContext, RouteResult, RouteRequest } from "./server.js";
+export {
+  getRequestContext,
+  runWithRequestContext,
+  parseCookies,
+} from "./context.js";
 
 // Type exports
 export type {
@@ -26,6 +31,10 @@ export type {
   TaskResult,
   TaskStatus,
   TaskComment,
+
+  // Request context
+  RequestContext,
+  ContextRequest,
 
   // Agent types
   AgentInfo,
@@ -170,6 +179,13 @@ export {
   createNextMiddleware,
 } from "./adapters/next.js";
 export type { NextAdapterOptions } from "./adapters/next.js";
+
+export { createNodeHandler } from "./adapters/node.js";
+export type {
+  NodeHandler,
+  NodeHandlerOptions,
+  NodeHandlerOverrides,
+} from "./adapters/node.js";
 
 // Swagger exports
 export { generateOpenAPISpec, generateSwaggerHTML } from "./swagger.js";

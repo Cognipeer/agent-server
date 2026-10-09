@@ -12,7 +12,7 @@ export default defineConfig({
       { text: 'API Reference', link: '/api/server' },
       { text: 'Examples', link: '/examples/' },
       {
-        text: 'v0.1.0',
+        text: 'v0.2.0',
         items: [
           { text: 'Changelog', link: '/changelog' },
           { text: 'Contributing', link: '/contributing' },
@@ -34,6 +34,7 @@ export default defineConfig({
           items: [
             { text: 'Express.js', link: '/guide/express' },
             { text: 'Next.js', link: '/guide/nextjs' },
+            { text: 'Fastify & Node HTTP', link: '/guide/fastify' },
           ],
         },
         {
@@ -49,6 +50,7 @@ export default defineConfig({
         {
           text: 'Advanced',
           items: [
+            { text: 'Request Context & Dynamic Agents', link: '/guide/request-context' },
             { text: 'Custom Agents', link: '/guide/custom-agents' },
             { text: 'Custom Storage', link: '/guide/custom-storage' },
             { text: 'Error Handling', link: '/guide/error-handling' },

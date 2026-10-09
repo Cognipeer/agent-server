@@ -11,7 +11,8 @@ Documentation: <https://docs.cognipeer.com/agent-server/guide/getting-started>
 - 💾 **Multiple Storage**: PostgreSQL and MongoDB support
 - 🔐 **Authentication**: Token-based and JWT authentication
 - 📚 **Swagger UI**: Automatic OpenAPI documentation
-- 🌐 **Framework Agnostic**: Works with Express, Next.js, and other frameworks
+- 🌐 **Framework Agnostic**: Works with Express, Next.js, Fastify, and raw Node HTTP
+- 🧩 **Request Context & Dynamic Agents**: Resolve user/tenant per request, serve a different agent list and storage scope per request
 - 📁 **File Management**: File uploads and viewing files sent by AI
 
 ## Installation
@@ -282,29 +283,69 @@ agentServer.registerCustomAgent(
 );
 ```
 
-## Custom Storage Provider
+## Request Context & Dynamic Agents
 
-You can create your own storage provider:
+Resolve who is calling (and anything else your host knows, e.g. tenant) once per
+request. The result reaches agents, storage and `resolveUserId`:
 
 ```typescript
-import { BaseStorageProvider } from "@cognipeer/agent-server";
+const server = createAgentServer({
+  basePath: "/api/portal",
+  storage, // receives the context as its last argument on every call
+  resolveContext: async (req) => {
+    const session = await lookupSession(req.cookies.sid); // req.headers / req.query / req.mountParams too
+    return session ? { user: { id: session.userId }, data: { tenantId: session.tenantId } } : null; // null -> 401
+  },
+  // array, or resolved per request
+  agents: async (ctx) => loadAgentsFor(ctx.data.tenantId as string),
+});
+```
+
+With `resolveContext` set the resolved identity is authoritative: `userId` sent by
+the client is ignored, and conversations owned by another user answer 403.
+Unknown agents (not served to this request) answer 404. See
+[docs/guide/request-context.md](docs/guide/request-context.md).
+
+### Fastify and raw Node
+
+```typescript
+import Fastify from "fastify";
+import { mountOnFastify } from "@cognipeer/agent-server/fastify";
+
+const app = Fastify();
+// the prefix may be parameterised; params arrive as req.mountParams in resolveContext
+mountOnFastify(app, server, { prefix: "/api/portal/:portalKey" });
+```
+
+```typescript
+import http from "node:http";
+import { createNodeHandler } from "@cognipeer/agent-server";
+
+const handle = createNodeHandler(server); // serves under server basePath
+http.createServer(async (req, res) => {
+  if (!(await handle(req, res))) { res.statusCode = 404; res.end(); }
+}).listen(3000);
+```
+
+## Custom Storage Provider
+
+Extend `BaseStorageProvider` (connection check + ids) and implement the `_`-hooks,
+or implement the `StorageProvider` interface directly. Every hook receives the
+per-request `RequestContext` as its last argument:
+
+```typescript
+import { BaseStorageProvider, type RequestContext } from "@cognipeer/agent-server";
 
 class MyStorageProvider extends BaseStorageProvider {
-  async connect() {
-    // Establish connection
-    this._connected = true;
-  }
+  async connect() { this._connected = true; }
+  async disconnect() { this._connected = false; }
 
-  async disconnect() {
-    // Close connection
-    this._connected = false;
+  protected async _createConversation(id, params, ctx?: RequestContext) {
+    // e.g. stamp ctx?.data.tenantId so reads can be scoped
   }
+  protected async _getConversation(id, ctx?: RequestContext) { /* scope by ctx */ }
 
-  protected async _createConversation(id, params) {
-    // Create conversation
-  }
-
-  // Implement other abstract methods...
+  // ...implement the other abstract methods (see docs/guide/custom-storage.md)
 }
 ```
 

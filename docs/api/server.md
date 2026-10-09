@@ -24,6 +24,12 @@ interface AgentServerConfig {
   // Storage provider for persistence
   storage: StorageProvider;
 
+  // Per-request context (user + data); null -> 401. See guide/request-context
+  resolveContext?: (req: ContextRequest) => Promise<RequestContext | null> | RequestContext | null;
+
+  // Agents: array, or resolved per request
+  agents?: AgentRegistration[] | ((ctx: RequestContext) => AgentRegistration[] | Promise<AgentRegistration[]>);
+
   // Swagger UI configuration
   swagger?: {
     enabled: boolean;
@@ -62,6 +68,14 @@ interface AgentServerConfig {
 The main server class.
 
 ### Methods
+
+#### getAgentsFor / getAgentFor / handleRoute
+
+```typescript
+await server.getAgentsFor(ctx);       // static + dynamic agent infos for a request context
+await server.getAgentFor('id', ctx);  // AgentRegistration | undefined
+await server.handleRoute('GET', '/agents', { query: {}, headers, context }); // path relative to the server
+```
 
 #### registerSDKAgent
 

@@ -21,6 +21,7 @@ import type {
   UpdateTaskParams,
   CreateTaskResultParams,
   PaginatedResult,
+  RequestContext,
 } from "../../types.js";
 
 /**
@@ -40,60 +41,70 @@ export abstract class BaseStorageProvider implements StorageProvider {
   // Conversations
   protected abstract _createConversation(
     id: string,
-    params: CreateConversationParams
+    params: CreateConversationParams,
+    ctx?: RequestContext
   ): Promise<Conversation>;
-  protected abstract _getConversation(id: string): Promise<Conversation | null>;
+  protected abstract _getConversation(id: string, ctx?: RequestContext): Promise<Conversation | null>;
   protected abstract _getConversations(
-    params: GetConversationsParams
+    params: GetConversationsParams,
+    ctx?: RequestContext
   ): Promise<PaginatedResult<Conversation>>;
   protected abstract _updateConversation(
     id: string,
-    params: UpdateConversationParams
+    params: UpdateConversationParams,
+    ctx?: RequestContext
   ): Promise<Conversation>;
-  protected abstract _deleteConversation(id: string): Promise<void>;
+  protected abstract _deleteConversation(id: string, ctx?: RequestContext): Promise<void>;
 
   // Messages
   protected abstract _createMessage(
     id: string,
-    params: CreateMessageParams
+    params: CreateMessageParams,
+    ctx?: RequestContext
   ): Promise<Message>;
   protected abstract _getMessages(
     conversationId: string,
-    params?: GetMessagesParams
+    params?: GetMessagesParams,
+    ctx?: RequestContext
   ): Promise<PaginatedResult<Message>>;
-  protected abstract _getMessage(id: string): Promise<Message | null>;
-  protected abstract _deleteMessage(id: string): Promise<void>;
+  protected abstract _getMessage(id: string, ctx?: RequestContext): Promise<Message | null>;
+  protected abstract _deleteMessage(id: string, ctx?: RequestContext): Promise<void>;
 
   // Files
   protected abstract _saveFile(
     id: string,
-    params: SaveFileParams & { storageKey: string; size: number }
+    params: SaveFileParams & { storageKey: string; size: number },
+    ctx?: RequestContext
   ): Promise<FileRecord>;
-  protected abstract _getFile(id: string): Promise<FileRecord | null>;
-  protected abstract _getFileContent(id: string): Promise<Buffer | null>;
-  protected abstract _deleteFile(id: string): Promise<void>;
+  protected abstract _getFile(id: string, ctx?: RequestContext): Promise<FileRecord | null>;
+  protected abstract _getFileContent(id: string, ctx?: RequestContext): Promise<Buffer | null>;
+  protected abstract _deleteFile(id: string, ctx?: RequestContext): Promise<void>;
 
   // Tasks
   protected abstract _createTask(
     id: string,
-    params: CreateTaskParams
+    params: CreateTaskParams,
+    ctx?: RequestContext
   ): Promise<Task>;
-  protected abstract _getTask(id: string): Promise<Task | null>;
+  protected abstract _getTask(id: string, ctx?: RequestContext): Promise<Task | null>;
   protected abstract _getTasks(
-    params: GetTasksParams
+    params: GetTasksParams,
+    ctx?: RequestContext
   ): Promise<PaginatedResult<Task>>;
   protected abstract _updateTask(
     id: string,
-    params: UpdateTaskParams
+    params: UpdateTaskParams,
+    ctx?: RequestContext
   ): Promise<Task>;
-  protected abstract _deleteTask(id: string): Promise<void>;
+  protected abstract _deleteTask(id: string, ctx?: RequestContext): Promise<void>;
 
   // Task Results
   protected abstract _createTaskResult(
     id: string,
-    params: CreateTaskResultParams
+    params: CreateTaskResultParams,
+    ctx?: RequestContext
   ): Promise<TaskResult>;
-  protected abstract _getTaskResult(taskId: string): Promise<TaskResult | null>;
+  protected abstract _getTaskResult(taskId: string, ctx?: RequestContext): Promise<TaskResult | null>;
 
   // ============================================================================
   // Public interface implementation
@@ -109,119 +120,122 @@ export abstract class BaseStorageProvider implements StorageProvider {
     }
   }
 
-  async createConversation(params: CreateConversationParams): Promise<Conversation> {
+  async createConversation(params: CreateConversationParams, ctx?: RequestContext): Promise<Conversation> {
     this.ensureConnected();
     const id = this.generateId("conv");
-    return this._createConversation(id, params);
+    return this._createConversation(id, params, ctx);
   }
 
-  async getConversation(id: string): Promise<Conversation | null> {
+  async getConversation(id: string, ctx?: RequestContext): Promise<Conversation | null> {
     this.ensureConnected();
-    return this._getConversation(id);
+    return this._getConversation(id, ctx);
   }
 
   async getConversations(
-    params: GetConversationsParams
+    params: GetConversationsParams,
+    ctx?: RequestContext
   ): Promise<PaginatedResult<Conversation>> {
     this.ensureConnected();
-    return this._getConversations(params);
+    return this._getConversations(params, ctx);
   }
 
   async updateConversation(
     id: string,
-    params: UpdateConversationParams
+    params: UpdateConversationParams,
+    ctx?: RequestContext
   ): Promise<Conversation> {
     this.ensureConnected();
-    return this._updateConversation(id, params);
+    return this._updateConversation(id, params, ctx);
   }
 
-  async deleteConversation(id: string): Promise<void> {
+  async deleteConversation(id: string, ctx?: RequestContext): Promise<void> {
     this.ensureConnected();
-    return this._deleteConversation(id);
+    return this._deleteConversation(id, ctx);
   }
 
-  async createMessage(params: CreateMessageParams): Promise<Message> {
+  async createMessage(params: CreateMessageParams, ctx?: RequestContext): Promise<Message> {
     this.ensureConnected();
     const id = this.generateId("msg");
-    return this._createMessage(id, params);
+    return this._createMessage(id, params, ctx);
   }
 
   async getMessages(
     conversationId: string,
-    params?: GetMessagesParams
+    params?: GetMessagesParams,
+    ctx?: RequestContext
   ): Promise<PaginatedResult<Message>> {
     this.ensureConnected();
-    return this._getMessages(conversationId, params);
+    return this._getMessages(conversationId, params, ctx);
   }
 
-  async getMessage(id: string): Promise<Message | null> {
+  async getMessage(id: string, ctx?: RequestContext): Promise<Message | null> {
     this.ensureConnected();
-    return this._getMessage(id);
+    return this._getMessage(id, ctx);
   }
 
-  async deleteMessage(id: string): Promise<void> {
+  async deleteMessage(id: string, ctx?: RequestContext): Promise<void> {
     this.ensureConnected();
-    return this._deleteMessage(id);
+    return this._deleteMessage(id, ctx);
   }
 
-  async saveFile(params: SaveFileParams): Promise<FileRecord> {
+  async saveFile(params: SaveFileParams, ctx?: RequestContext): Promise<FileRecord> {
     this.ensureConnected();
     const id = this.generateId("file");
     const storageKey = this.generateStorageKey(params.name);
     const size = params.content.length;
-    return this._saveFile(id, { ...params, storageKey, size });
+    return this._saveFile(id, { ...params, storageKey, size }, ctx);
   }
 
-  async getFile(id: string): Promise<FileRecord | null> {
+  async getFile(id: string, ctx?: RequestContext): Promise<FileRecord | null> {
     this.ensureConnected();
-    return this._getFile(id);
+    return this._getFile(id, ctx);
   }
 
-  async getFileContent(id: string): Promise<Buffer | null> {
+  async getFileContent(id: string, ctx?: RequestContext): Promise<Buffer | null> {
     this.ensureConnected();
-    return this._getFileContent(id);
+    return this._getFileContent(id, ctx);
   }
 
-  async deleteFile(id: string): Promise<void> {
+  async deleteFile(id: string, ctx?: RequestContext): Promise<void> {
     this.ensureConnected();
-    return this._deleteFile(id);
+    return this._deleteFile(id, ctx);
   }
 
-  async createTask(params: CreateTaskParams): Promise<Task> {
+  async createTask(params: CreateTaskParams, ctx?: RequestContext): Promise<Task> {
     this.ensureConnected();
     const id = this.generateId("task");
-    return this._createTask(id, params);
+    return this._createTask(id, params, ctx);
   }
 
-  async getTask(id: string): Promise<Task | null> {
+  async getTask(id: string, ctx?: RequestContext): Promise<Task | null> {
     this.ensureConnected();
-    return this._getTask(id);
+    return this._getTask(id, ctx);
   }
 
-  async getTasks(params: GetTasksParams): Promise<PaginatedResult<Task>> {
+  async getTasks(params: GetTasksParams, ctx?: RequestContext): Promise<PaginatedResult<Task>> {
     this.ensureConnected();
-    return this._getTasks(params);
+    return this._getTasks(params, ctx);
   }
 
-  async updateTask(id: string, params: UpdateTaskParams): Promise<Task> {
+  async updateTask(id: string, params: UpdateTaskParams, ctx?: RequestContext): Promise<Task> {
     this.ensureConnected();
-    return this._updateTask(id, params);
+    return this._updateTask(id, params, ctx);
   }
 
-  async deleteTask(id: string): Promise<void> {
+  async deleteTask(id: string, ctx?: RequestContext): Promise<void> {
     this.ensureConnected();
-    return this._deleteTask(id);
+    return this._deleteTask(id, ctx);
   }
 
-  async createTaskResult(params: CreateTaskResultParams): Promise<TaskResult> {
+  async createTaskResult(params: CreateTaskResultParams, ctx?: RequestContext): Promise<TaskResult> {
     this.ensureConnected();
     const id = this.generateId("taskres");
-    return this._createTaskResult(id, params);
+    return this._createTaskResult(id, params, ctx);
   }
 
-  async getTaskResult(taskId: string): Promise<TaskResult | null> {
+  async getTaskResult(taskId: string, ctx?: RequestContext): Promise<TaskResult | null> {
     this.ensureConnected();
-    return this._getTaskResult(taskId);
+    return this._getTaskResult(taskId, ctx);
   }
 
   // ============================================================================

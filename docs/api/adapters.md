@@ -213,44 +213,24 @@ function extractToken(headers: Record<string, string>): string | undefined {
 }
 ```
 
-## Fastify Example
+## Node HTTP Adapter
 
 ```typescript
-import Fastify from 'fastify';
-import { createAgentServer } from '@cognipeer/agent-server';
+import { createNodeHandler } from '@cognipeer/agent-server'; // or '@cognipeer/agent-server/node'
 
-const fastify = Fastify();
-const agentServer = createAgentServer({ basePath: '/api', storage });
+const handle = createNodeHandler(server, { basePath: '/api', maxBodyBytes: 15_000_000 });
+// (req: IncomingMessage, res: ServerResponse, overrides?: { path, body, mountParams, raw }) => Promise<boolean>
+```
 
-// Custom Fastify handler
-fastify.all('/api/*', async (request, reply) => {
-  const path = request.url.replace('/api', '');
-  
-  const context = {
-    params: {},
-    query: request.query as Record<string, string>,
-    body: request.body,
-  };
-  
-  const result = await agentServer.handleRequest(
-    request.method,
-    path,
-    context
-  );
-  
-  if (result.stream) {
-    reply.header('Content-Type', 'text/event-stream');
-    for await (const chunk of result.stream) {
-      reply.raw.write(chunk);
-    }
-    reply.raw.end();
-  } else {
-    reply.status(result.status).send(result.body);
-  }
-});
+See the [Fastify & Node HTTP guide](../guide/fastify.md).
 
-await storage.connect();
-await fastify.listen({ port: 3000 });
+## Fastify Adapter
+
+```typescript
+import { mountOnFastify, createFastifyPlugin } from '@cognipeer/agent-server/fastify';
+
+mountOnFastify(app, server, { prefix: '/api/portal/:portalKey', bodyLimit });
+app.register(createFastifyPlugin(server, { maxBodyBytes }), { prefix: '/api' });
 ```
 
 ## Hono Example

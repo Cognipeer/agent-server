@@ -6,6 +6,7 @@
 
 import type { AgentServer } from "../server.js";
 import type { AuthUser } from "../types.js";
+import { normalizeHeaders } from "../context.js";
 
 // Next.js types - minimal to avoid requiring next as a dependency
 interface NextRequest {
@@ -122,6 +123,9 @@ export function createNextHandler(
         user,
         query,
         body,
+        headers: normalizeHeaders(request.headers as unknown as Parameters<typeof normalizeHeaders>[0]),
+        url: request.url,
+        raw: request,
       });
 
       // Build response headers

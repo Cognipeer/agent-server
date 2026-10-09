@@ -16,6 +16,7 @@ interface Request {
   query: Record<string, string | string[] | undefined>;
   body?: unknown;
   user?: AuthUser;
+  params?: Record<string, string>;
 }
 
 interface Response {
@@ -101,6 +102,11 @@ export function createExpressMiddleware(
         user,
         query: req.query as Record<string, string | string[] | undefined>,
         body: req.body,
+        headers: req.headers,
+        url: req.originalUrl,
+        // Params of a parameterised mount path, e.g. app.use("/p/:key/agents", ...)
+        mountParams: req.params,
+        raw: req,
       });
 
       // Set headers

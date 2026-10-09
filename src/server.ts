@@ -8,6 +8,8 @@
 import type {
   AgentServerConfig,
   AgentRegistration,
+  ContextRequest,
+  RequestContext,
   AgentInfo,
   AuthUser,
   Conversation,
@@ -56,6 +58,7 @@ import {
   streamResponsesApi,
   type ResponsesApiConfig,
 } from "./providers/ai/responses.js";
+import { bindStreamToContext, normalizeHeaders, parseCookies, runWithRequestContext } from "./context.js";
 
 /**
  * Helper to safely extract tool event properties with fallbacks
@@ -78,7 +81,23 @@ export interface RouteContext {
   params: Record<string, string>;
   query: Record<string, string | string[] | undefined>;
   body?: unknown;
+  /** Request headers (any casing) - given to `resolveContext` / `resolveUserId`. */
+  headers?: Record<string, string | string[] | undefined>;
+  /** URL (path + query) as seen by the adapter. */
+  url?: string;
+  /** Params of the dynamic prefix the server is mounted under (e.g. Fastify `/p/:key`). */
+  mountParams?: Record<string, string>;
+  /** The framework's native request object. */
+  raw?: unknown;
+  /**
+   * Per-request context. Pass a pre-resolved one to skip `config.resolveContext`;
+   * inside route handlers it is always set.
+   */
+  context?: RequestContext;
 }
+
+/** What adapters hand to `handleRequest` / `handleRoute`. */
+export type RouteRequest = Omit<RouteContext, "params">;
 
 export interface RouteResult<T = unknown> {
   status: number;
@@ -98,6 +117,19 @@ interface Route {
   pattern: RegExp;
   paramNames: string[];
   handler: RouteHandler;
+  /** Public routes (swagger docs) skip `resolveContext`. */
+  public?: boolean;
+}
+
+/** Page size is capped and offset floored, so a hostile query string never reaches the storage layer raw. */
+const MAX_PAGE_SIZE = 200;
+function parsePaging(query: Record<string, unknown>, defaultLimit: number): { limit: number; offset: number } {
+  const limit = parseInt(String(query.limit ?? ""), 10);
+  const offset = parseInt(String(query.offset ?? ""), 10);
+  return {
+    limit: Number.isFinite(limit) && limit > 0 ? Math.min(limit, MAX_PAGE_SIZE) : defaultLimit,
+    offset: Number.isFinite(offset) && offset > 0 ? offset : 0,
+  };
 }
 
 export class AgentServer {
@@ -105,10 +137,15 @@ export class AgentServer {
   private agents: Map<string, AgentRegistration> = new Map();
   private routes: Route[] = [];
   private basePath: string;
+  /** Per-request memo of the resolved dynamic agent registry. */
+  private dynamicAgentCache = new WeakMap<RequestContext, Promise<Map<string, AgentRegistration>>>();
 
   constructor(config: AgentServerConfig) {
     this.config = config;
     this.basePath = config.basePath.replace(/\/$/, "");
+    if (Array.isArray(config.agents)) {
+      for (const registration of config.agents) this.agents.set(registration.info.id, registration);
+    }
     this.setupRoutes();
   }
 
@@ -130,12 +167,24 @@ export class AgentServer {
     // Try custom resolver from config
     if (this.config.auth?.resolveUserId) {
       return await this.config.auth.resolveUserId({
+        headers: ctx.headers,
         query: ctx.query,
         body: ctx.body,
+        context: ctx.context,
       });
     }
 
     return undefined;
+  }
+
+  /**
+   * Owner to stamp on / filter by. With `resolveContext` configured the resolved
+   * identity is authoritative and client-supplied ids are ignored (otherwise any
+   * caller could read or create data as someone else by passing `userId`).
+   */
+  private async effectiveUserId(ctx: RouteContext, requested?: string): Promise<string | undefined> {
+    if (this.config.resolveContext) return ctx.context?.user?.id;
+    return requested || ctx.user?.id || (await this.resolveUserId(ctx));
   }
 
   /**
@@ -145,16 +194,49 @@ export class AgentServer {
     conversation: Conversation,
     ctx: RouteContext
   ): Promise<void> {
+    // Trusted-identity mode is fail-closed: a conversation that carries no owner
+    // would otherwise be open to every authenticated caller of the mount.
+    if (this.config.resolveContext && !conversation.userId) {
+      throw {
+        statusCode: 403,
+        code: "FORBIDDEN",
+        message: "You do not have access to this conversation",
+      };
+    }
     // If conversation has a userId, verify the current user matches
     if (conversation.userId) {
       const currentUserId = ctx.user?.id || await this.resolveUserId(ctx);
-      if (currentUserId && conversation.userId !== currentUserId) {
+      // Trusted-identity mode: an anonymous caller never owns an owned conversation.
+      const mismatch = this.config.resolveContext
+        ? currentUserId !== conversation.userId
+        : !!currentUserId && conversation.userId !== currentUserId;
+      if (mismatch) {
         throw {
           statusCode: 403,
           code: "FORBIDDEN",
           message: "You do not have access to this conversation",
         };
       }
+    }
+  }
+
+  private async verifyTaskAccess(task: Task, ctx: RouteContext): Promise<void> {
+    if (!task.userId) {
+      if (this.config.resolveContext) {
+        throw { statusCode: 403, code: "FORBIDDEN", message: "You do not have access to this task" };
+      }
+      return;
+    }
+    const currentUserId = ctx.user?.id || await this.resolveUserId(ctx);
+    const mismatch = this.config.resolveContext
+      ? currentUserId !== task.userId
+      : !!currentUserId && task.userId !== currentUserId;
+    if (mismatch) {
+      throw {
+        statusCode: 403,
+        code: "FORBIDDEN",
+        message: "You do not have access to this task",
+      };
     }
   }
 
@@ -298,17 +380,50 @@ export class AgentServer {
   }
 
   /**
-   * Get all registered agents
+   * Get all statically registered agents (does not include dynamic agents -
+   * use `getAgentsFor` for the per-request list)
    */
   getAgents(): AgentInfo[] {
     return Array.from(this.agents.values()).map((reg) => reg.info);
   }
 
   /**
-   * Get agent by ID
+   * Get a statically registered agent by ID
    */
   getAgent(id: string): AgentRegistration | undefined {
     return this.agents.get(id);
+  }
+
+  /**
+   * Agent registry for one request: static registrations plus the result of
+   * `config.agents(ctx)` when that is a function (dynamic ids win). Memoised per
+   * context object so list/create/send in one request resolve it once.
+   */
+  private resolveRegistry(rc: RequestContext): Promise<Map<string, AgentRegistration>> {
+    const source = this.config.agents;
+    if (typeof source !== "function") return Promise.resolve(this.agents);
+    let pending = this.dynamicAgentCache.get(rc);
+    if (!pending) {
+      pending = Promise.resolve(source(rc)).then((dynamic) => {
+        const merged = new Map(this.agents);
+        for (const registration of dynamic ?? []) merged.set(registration.info.id, registration);
+        return merged;
+      });
+      this.dynamicAgentCache.set(rc, pending);
+      // A failed resolution must not poison later calls with the same context.
+      pending.catch(() => this.dynamicAgentCache.delete(rc));
+    }
+    return pending;
+  }
+
+  /** Agents visible to a request context (static + dynamic). */
+  async getAgentsFor(rc: RequestContext = { data: {} }): Promise<AgentInfo[]> {
+    return Array.from((await this.resolveRegistry(rc)).values()).map((reg) => reg.info);
+  }
+
+  /** Look an agent up for a request context (static + dynamic). */
+  async getAgentFor(id: string, rc: RequestContext = { data: {} }): Promise<AgentRegistration | undefined> {
+    return (await this.resolveRegistry(rc)).get(id);
   }
 
   // ============================================================================
@@ -327,13 +442,13 @@ export class AgentServer {
           this.config.swagger?.title || "Agent Server API"
         ),
         headers: { "Content-Type": "text/html" },
-      }));
+      }), true);
 
       this.addRoute("GET", `${docsPath}/openapi.json`, async () => ({
         status: 200,
         body: generateOpenAPISpec(this.config, this.getAgents()),
         headers: { "Content-Type": "application/json" },
-      }));
+      }), true);
     }
 
     // Agent routes
@@ -394,7 +509,8 @@ export class AgentServer {
   private addRoute(
     method: Route["method"],
     path: string,
-    handler: RouteHandler
+    handler: RouteHandler,
+    isPublic = false
   ): void {
     const paramNames: string[] = [];
     const patternStr = path.replace(/:([^/]+)/g, (_, name) => {
@@ -403,7 +519,7 @@ export class AgentServer {
     });
     const pattern = new RegExp(`^${patternStr}$`);
 
-    this.routes.push({ method, pattern, paramNames, handler });
+    this.routes.push({ method, pattern, paramNames, handler, public: isPublic });
   }
 
   // ============================================================================
@@ -411,19 +527,40 @@ export class AgentServer {
   // ============================================================================
 
   /**
-   * Handle an incoming request
+   * Handle an incoming request. `path` may include the server base path, which
+   * is stripped before routing.
    */
   async handleRequest(
     method: string,
     path: string,
-    ctx: Omit<RouteContext, "params">
+    ctx: RouteRequest
   ): Promise<RouteResult> {
     // Remove base path prefix
     let routePath = path;
     if (path.startsWith(this.basePath)) {
       routePath = path.slice(this.basePath.length) || "/";
     }
+    return this.dispatch(method, routePath, path, ctx);
+  }
 
+  /**
+   * Handle a request whose path is already relative to the server (no base path
+   * to strip). Used by adapters that mount under a dynamic prefix.
+   */
+  async handleRoute(
+    method: string,
+    routePath: string,
+    ctx: RouteRequest
+  ): Promise<RouteResult> {
+    return this.dispatch(method, routePath || "/", routePath || "/", ctx);
+  }
+
+  private async dispatch(
+    method: string,
+    routePath: string,
+    displayPath: string,
+    ctx: RouteRequest
+  ): Promise<RouteResult> {
     // Find matching route
     for (const route of this.routes) {
       if (route.method !== method.toUpperCase()) continue;
@@ -438,7 +575,11 @@ export class AgentServer {
       });
 
       try {
-        return await route.handler({ ...ctx, params });
+        const routeCtx = await this.buildRouteContext(method, routePath, route, ctx, params);
+        const rc = routeCtx.context!;
+        const result = await runWithRequestContext(rc, () => route.handler(routeCtx));
+        if (result.stream) result.stream = bindStreamToContext(result.stream, rc);
+        return result;
       } catch (error) {
         return this.handleError(error);
       }
@@ -450,35 +591,98 @@ export class AgentServer {
       body: {
         error: {
           code: "NOT_FOUND",
-          message: `Route not found: ${method} ${path}`,
+          message: `Route not found: ${method} ${displayPath}`,
         },
       },
     };
   }
 
-  private handleError(error: unknown): RouteResult {
-    // Log all errors for debugging
-    console.error('[AgentServer] Error:', error);
-    
-    if (error instanceof Error) {
-      const agentError = error as {
-        statusCode?: number;
-        code?: string;
-        details?: Record<string, unknown>;
-      };
+  /**
+   * Resolve the request context: a pre-resolved one wins, then
+   * `config.resolveContext` (null -> 401), then a context derived from the
+   * token-auth user.
+   */
+  private async buildRouteContext(
+    method: string,
+    routePath: string,
+    route: Route,
+    ctx: RouteRequest,
+    params: Record<string, string>
+  ): Promise<RouteContext> {
+    let rc: RequestContext | undefined = ctx.context;
 
+    if (!rc && this.config.resolveContext && !route.public) {
+      const headers = normalizeHeaders(ctx.headers);
+      const request: ContextRequest = {
+        method: method.toUpperCase(),
+        path: routePath,
+        url: ctx.url,
+        headers,
+        cookies: parseCookies(headers.cookie),
+        query: ctx.query,
+        body: ctx.body,
+        user: ctx.user,
+        mountParams: ctx.mountParams ?? {},
+        raw: ctx.raw,
+      };
+      const resolved = await this.config.resolveContext(request);
+      if (!resolved) {
+        throw {
+          statusCode: 401,
+          code: "AUTHENTICATION_ERROR",
+          message: "Authentication required",
+        };
+      }
+      rc = { ...resolved, data: resolved.data ?? {} };
+    }
+
+    if (!rc) rc = { user: ctx.user, data: {} };
+    return { ...ctx, params, user: rc.user ?? ctx.user, context: rc };
+  }
+
+  /**
+   * Whether an error's message may reach the client. Without `maskServerErrors`
+   * everything does (backwards compatible). With it, only errors the host wrote
+   * for the caller do: an explicit 4xx `statusCode`, or `expose: true` (the
+   * `http-errors` convention, for deliberate 5xx such as "assistant unavailable").
+   * Anything else (driver errors, bugs) is replaced by a generic message and only logged.
+   */
+  private isExposedError(err: { statusCode?: number; expose?: boolean } | null | undefined): boolean {
+    if (!this.config.maskServerErrors) return true;
+    if (err?.expose === true) return true;
+    const status = err?.statusCode;
+    return typeof status === "number" && status >= 400 && status < 500;
+  }
+
+  private handleError(error: unknown): RouteResult {
+    const err = error as {
+      statusCode?: number;
+      code?: string;
+      message?: string;
+      details?: Record<string, unknown>;
+    } | null;
+
+    // Errors are thrown both as Error instances and as plain
+    // `{ statusCode, code, message }` objects; treat both as HTTP errors.
+    if (err && typeof err === "object" && (error instanceof Error || typeof err.statusCode === "number")) {
+      const status = err.statusCode || 500;
+      if (status >= 500) console.error("[AgentServer] Error:", error);
+      const exposed = this.isExposedError(err);
       return {
-        status: agentError.statusCode || 500,
+        status,
         body: {
           error: {
-            code: agentError.code || "INTERNAL_ERROR",
-            message: error.message,
-            details: agentError.details,
+            code: exposed ? err.code || "INTERNAL_ERROR" : "INTERNAL_ERROR",
+            message: exposed
+              ? err.message || "An unexpected error occurred"
+              : "An unexpected error occurred",
+            details: exposed ? err.details : undefined,
           },
         },
       };
     }
 
+    console.error("[AgentServer] Error:", error);
     return {
       status: 500,
       body: {
@@ -535,16 +739,16 @@ export class AgentServer {
   // Route Handlers
   // ============================================================================
 
-  private async handleListAgents(_ctx: RouteContext): Promise<RouteResult<ListAgentsResponse>> {
+  private async handleListAgents(ctx: RouteContext): Promise<RouteResult<ListAgentsResponse>> {
     return {
       status: 200,
-      body: { agents: this.getAgents() },
+      body: { agents: await this.getAgentsFor(ctx.context) },
     };
   }
 
   private async handleGetAgent(ctx: RouteContext): Promise<RouteResult> {
     const { agentId } = ctx.params;
-    const agent = this.getAgent(agentId);
+    const agent = await this.getAgentFor(agentId, ctx.context);
 
     if (!agent) {
       throw {
@@ -565,25 +769,25 @@ export class AgentServer {
   ): Promise<RouteResult<ListConversationsResponse>> {
     const agentId = ctx.query.agentId as string | undefined;
     const userId = ctx.query.userId as string | undefined;
-    const limit = parseInt(ctx.query.limit as string) || 20;
-    const offset = parseInt(ctx.query.offset as string) || 0;
+    const { limit, offset } = parsePaging(ctx.query, 20);
 
     // Resolve userId: from query param, ctx.user (token), or resolveUserId callback
-    const resolvedUserId = userId || ctx.user?.id || await this.resolveUserId(ctx);
+    const resolvedUserId = await this.effectiveUserId(ctx, userId);
+    const registry = await this.resolveRegistry(ctx.context!);
 
     const result = await this.config.storage.getConversations({
       agentId,
       userId: resolvedUserId,
       limit,
       offset,
-    });
+    }, ctx.context);
 
     return {
       status: 200,
       body: {
         conversations: result.data.map((conv) => ({
           ...conv,
-          agentName: this.agents.get(conv.agentId)?.info.name,
+          agentName: registry.get(conv.agentId)?.info.name,
         })),
         total: result.total,
         limit: result.limit,
@@ -607,7 +811,7 @@ export class AgentServer {
     }
 
     // Check if agent exists
-    if (!this.agents.has(body.agentId)) {
+    if (!(await this.getAgentFor(body.agentId, ctx.context))) {
       throw {
         statusCode: 404,
         code: "NOT_FOUND",
@@ -616,14 +820,14 @@ export class AgentServer {
     }
 
     // Resolve userId: from body, ctx.user (token), or resolveUserId callback
-    const userId = body.userId || ctx.user?.id || await this.resolveUserId(ctx);
+    const userId = await this.effectiveUserId(ctx, body.userId);
 
     const conversation = await this.config.storage.createConversation({
       agentId: body.agentId,
       userId,
       title: body.title,
       metadata: body.metadata,
-    });
+    }, ctx.context);
 
     return {
       status: 201,
@@ -636,7 +840,7 @@ export class AgentServer {
   ): Promise<RouteResult<GetConversationResponse>> {
     const { conversationId } = ctx.params;
 
-    const conversation = await this.config.storage.getConversation(conversationId);
+    const conversation = await this.config.storage.getConversation(conversationId, ctx.context);
     if (!conversation) {
       throw {
         statusCode: 404,
@@ -648,7 +852,7 @@ export class AgentServer {
     // Verify user has access to this conversation
     await this.verifyConversationAccess(conversation, ctx);
 
-    const messagesResult = await this.config.storage.getMessages(conversationId);
+    const messagesResult = await this.config.storage.getMessages(conversationId, undefined, ctx.context);
 
     return {
       status: 200,
@@ -665,7 +869,7 @@ export class AgentServer {
     const { conversationId } = ctx.params;
     const body = ctx.body as { title?: string; metadata?: Record<string, unknown> };
 
-    const existing = await this.config.storage.getConversation(conversationId);
+    const existing = await this.config.storage.getConversation(conversationId, ctx.context);
     if (!existing) {
       throw {
         statusCode: 404,
@@ -680,7 +884,7 @@ export class AgentServer {
     const conversation = await this.config.storage.updateConversation(conversationId, {
       title: body?.title,
       metadata: body?.metadata,
-    });
+    }, ctx.context);
 
     return {
       status: 200,
@@ -691,7 +895,7 @@ export class AgentServer {
   private async handleDeleteConversation(ctx: RouteContext): Promise<RouteResult> {
     const { conversationId } = ctx.params;
 
-    const existing = await this.config.storage.getConversation(conversationId);
+    const existing = await this.config.storage.getConversation(conversationId, ctx.context);
     if (!existing) {
       throw {
         statusCode: 404,
@@ -703,19 +907,18 @@ export class AgentServer {
     // Verify user has access to this conversation
     await this.verifyConversationAccess(existing, ctx);
 
-    await this.config.storage.deleteConversation(conversationId);
+    await this.config.storage.deleteConversation(conversationId, ctx.context);
 
     return { status: 204 };
   }
 
   private async handleListMessages(ctx: RouteContext): Promise<RouteResult> {
     const { conversationId } = ctx.params;
-    const limit = parseInt(ctx.query.limit as string) || 100;
-    const offset = parseInt(ctx.query.offset as string) || 0;
+    const { limit, offset } = parsePaging(ctx.query, 100);
     const order = (ctx.query.order as string) === "desc" ? "desc" : "asc";
 
     // Check if conversation exists
-    const conversation = await this.config.storage.getConversation(conversationId);
+    const conversation = await this.config.storage.getConversation(conversationId, ctx.context);
     if (!conversation) {
       throw {
         statusCode: 404,
@@ -731,7 +934,7 @@ export class AgentServer {
       limit,
       offset,
       order,
-    });
+    }, ctx.context);
 
     return {
       status: 200,
@@ -765,7 +968,7 @@ export class AgentServer {
     }
 
     // Get conversation
-    const conversation = await this.config.storage.getConversation(conversationId);
+    const conversation = await this.config.storage.getConversation(conversationId, ctx.context);
     if (!conversation) {
       throw {
         statusCode: 404,
@@ -778,7 +981,7 @@ export class AgentServer {
     await this.verifyConversationAccess(conversation, ctx);
 
     // Get agent
-    const agent = this.agents.get(conversation.agentId);
+    const agent = await this.getAgentFor(conversation.agentId, ctx.context);
     if (!agent) {
       throw {
         statusCode: 404,
@@ -802,12 +1005,12 @@ export class AgentServer {
       content: body.message,
       files,
       metadata: body.metadata,
-    });
+    }, ctx.context);
 
     // Get previous messages for context
     const previousMessages = await this.config.storage.getMessages(conversationId, {
       order: "asc",
-    });
+    }, ctx.context);
 
     // Process with agent
     let responseContent: string;
@@ -817,9 +1020,12 @@ export class AgentServer {
     if (agent.sdkAgent) {
       // Use SDK agent
       const sdkAgent = agent.sdkAgent as {
-        invoke: (params: {
-          messages: Array<{ role: string; content: string; tool_calls?: any; tool_call_id?: string; name?: string }>;
-        }) => Promise<{ content: string; metadata?: { usage?: unknown } }>;
+        invoke: (
+          params: {
+            messages: Array<{ role: string; content: string; tool_calls?: any; tool_call_id?: string; name?: string }>;
+          },
+          config?: { context?: RequestContext }
+        ) => Promise<{ content: string; metadata?: { usage?: unknown } }>;
       };
 
       // Map messages with tool_calls and tool_call_id preserved
@@ -838,7 +1044,7 @@ export class AgentServer {
         ...(m.name && { name: m.name }),
       }));
 
-      const result = await sdkAgent.invoke({ messages });
+      const result = await sdkAgent.invoke({ messages }, { context: ctx.context });
       responseContent = result.content;
       usage = result.metadata?.usage as SendMessageResponse["usage"];
     } else if (agent.chatCompletions) {
@@ -874,7 +1080,7 @@ export class AgentServer {
       // Store responseId in conversation state for potential chaining
       await this.config.storage.updateConversation(conversationId, {
         state: { ...conversation.state, lastResponseId: result.responseId },
-      });
+      }, ctx.context);
     } else if (agent.handler) {
       // Use custom handler
       const result = await agent.handler.processMessage({
@@ -883,6 +1089,7 @@ export class AgentServer {
         files,
         state: conversation.state,
         metadata: body.metadata,
+        context: ctx.context,
       });
       responseContent = result.content;
       responseFiles = result.files;
@@ -892,7 +1099,7 @@ export class AgentServer {
       if (result.state) {
         await this.config.storage.updateConversation(conversationId, {
           state: result.state,
-        });
+        }, ctx.context);
       }
     } else {
       throw {
@@ -908,14 +1115,14 @@ export class AgentServer {
       role: "assistant",
       content: responseContent,
       files: responseFiles,
-    });
+    }, ctx.context);
 
     // Auto-generate title on the first exchange
     let conversationTitle: string | undefined;
     if (!conversation.title && previousMessages.data.length === 1) {
       conversationTitle = await this.generateTitle(body.message);
       if (conversationTitle) {
-        await this.config.storage.updateConversation(conversationId, { title: conversationTitle });
+        await this.config.storage.updateConversation(conversationId, { title: conversationTitle }, ctx.context);
       }
     }
 
@@ -947,7 +1154,7 @@ export class AgentServer {
 
       try {
         // Get conversation
-        const conversation = await self.config.storage.getConversation(conversationId);
+        const conversation = await self.config.storage.getConversation(conversationId, ctx.context);
         if (!conversation) {
           const errorEvent: StreamErrorEvent = {
             type: "stream.error",
@@ -974,7 +1181,7 @@ export class AgentServer {
         }
 
         // Get agent
-        const agent = self.agents.get(conversation.agentId);
+        const agent = await self.getAgentFor(conversation.agentId, ctx.context);
         if (!agent) {
           const errorEvent: StreamErrorEvent = {
             type: "stream.error",
@@ -1001,7 +1208,7 @@ export class AgentServer {
           content: body.message,
           files,
           metadata: body.metadata,
-        });
+        }, ctx.context);
 
         // Send start event
         const startEvent: StreamStartEvent = {
@@ -1015,7 +1222,7 @@ export class AgentServer {
         // Get previous messages for context
         const previousMessages = await self.config.storage.getMessages(conversationId, {
           order: "asc",
-        });
+        }, ctx.context);
 
         // Process with agent
         let responseContent = "";
@@ -1029,6 +1236,7 @@ export class AgentServer {
               params: { messages: Array<{ role: string; content: string; tool_calls?: any; tool_call_id?: string; name?: string }> },
               config?: {
                 stream?: boolean;
+                context?: RequestContext;
                 onStream?: (chunk: { text: string; isFinal?: boolean }) => void;
                 onEvent?: (event: { type: string; [key: string]: unknown }) => void;
               }
@@ -1055,6 +1263,9 @@ export class AgentServer {
           const queue: string[] = [];
           let resolveWait: (() => void) | null = null;
           let streamDone = false;
+          let streamedAnyText = false;
+          let finalChunkText = "";
+          let invokeFailure: { error: unknown } | undefined;
 
           const pushToQueue = (item: string) => {
             queue.push(item);
@@ -1078,10 +1289,17 @@ export class AgentServer {
             { messages },
             {
               stream: true,
+              context: ctx.context,
               onStream: (chunk) => {
-                // Agent SDK emits a final full-text chunk (isFinal:true).
-                // Skip forwarding it as stream.text to avoid duplicated UI text.
-                if (chunk.isFinal) return;
+                // Agent SDK emits a final full-text chunk (isFinal:true). Don't
+                // forward it as stream.text (it would duplicate the streamed
+                // text) - but remember it: an agent that never streamed
+                // (tool agents run non-streaming) only delivers the answer here.
+                if (chunk.isFinal) {
+                  finalChunkText = chunk.text;
+                  return;
+                }
+                streamedAnyText = streamedAnyText || chunk.text.length > 0;
                 const textEvent: StreamTextEvent = {
                   type: "stream.text",
                   timestamp: Date.now(),
@@ -1139,14 +1357,28 @@ export class AgentServer {
                 }
               },
             }
-          ).then((result) => {
-            streamDone = true;
-            if (resolveWait) {
-              resolveWait();
-              resolveWait = null;
+          ).then(
+            (result) => {
+              streamDone = true;
+              if (resolveWait) {
+                resolveWait();
+                resolveWait = null;
+              }
+              return result;
+            },
+            (error: unknown) => {
+              // A rejected invoke must end the wait loop below. Left unhandled it
+              // both hangs the stream (streamDone never flips) and surfaces as an
+              // unhandledRejection, which takes down a host process.
+              invokeFailure = { error };
+              streamDone = true;
+              if (resolveWait) {
+                resolveWait();
+                resolveWait = null;
+              }
+              return undefined;
             }
-            return result;
-          });
+          );
 
           // Yield chunks as they arrive
           while (!streamDone || queue.length > 0) {
@@ -1156,10 +1388,29 @@ export class AgentServer {
             }
           }
 
-          const result = await invokePromise;
+          const settled = await invokePromise;
+          // Reported as a stream.error event by the catch below (text already sent stays sent).
+          if (invokeFailure) throw invokeFailure.error;
+          const result = settled!;
 
           responseContent = result.content;
           usage = result.metadata?.usage as SendMessageResponse["usage"];
+
+          // The agent returned its answer without streaming any text: emit it once
+          // so streaming clients (chat-ui) don't end up with an empty bubble.
+          if (!streamedAnyText) {
+            const fallbackText = responseContent || finalChunkText;
+            if (fallbackText) {
+              const textEvent: StreamTextEvent = {
+                type: "stream.text",
+                timestamp: Date.now(),
+                text: fallbackText,
+                isFinal: true,
+              };
+              yield `data: ${JSON.stringify(textEvent)}\n\n`;
+            }
+            responseContent = fallbackText;
+          }
         } else if (agent.chatCompletions) {
           // Use Chat Completions API with streaming
           const messages = previousMessages.data.map((m) => ({
@@ -1216,7 +1467,7 @@ export class AgentServer {
               if (event.responseId) {
                 await self.config.storage.updateConversation(conversationId, {
                   state: { ...conversation.state, lastResponseId: event.responseId },
-                });
+                }, ctx.context);
               }
             }
           }
@@ -1236,6 +1487,7 @@ export class AgentServer {
             files,
             state: conversation.state,
             metadata: body.metadata,
+            context: ctx.context,
           });
 
           responseContent = result.content;
@@ -1255,7 +1507,7 @@ export class AgentServer {
           if (result.state) {
             await self.config.storage.updateConversation(conversationId, {
               state: result.state,
-            });
+            }, ctx.context);
           }
         } else {
           const errorEvent: StreamErrorEvent = {
@@ -1274,14 +1526,14 @@ export class AgentServer {
           role: "assistant",
           content: responseContent,
           files: responseFiles,
-        });
+        }, ctx.context);
 
         // Auto-generate title on the first exchange
         let generatedTitle: string | undefined;
         if (!conversation.title && previousMessages.data.length === 1) {
           generatedTitle = await self.generateTitle(body.message);
           if (generatedTitle) {
-            await self.config.storage.updateConversation(conversationId, { title: generatedTitle });
+            await self.config.storage.updateConversation(conversationId, { title: generatedTitle }, ctx.context);
           }
         }
 
@@ -1303,12 +1555,21 @@ export class AgentServer {
         };
         yield `data: ${JSON.stringify(doneEvent)}\n\n`;
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "Unknown error";
+        const exposed = self.isExposedError(error as { statusCode?: number; expose?: boolean } | null);
+        if (!exposed) console.error("[AgentServer] Stream error:", error);
+        const errorMessage = !exposed
+          ? "An unexpected error occurred"
+          : error instanceof Error
+            ? error.message
+            : "Unknown error";
         const errorEvent: StreamErrorEvent = {
           type: "stream.error",
           timestamp: Date.now(),
           error: errorMessage,
-          code: "INTERNAL_ERROR",
+          // Host-authored errors (statusCode + code) keep their own code, e.g. CONVERSATION_BUSY.
+          code: exposed && typeof (error as { statusCode?: unknown })?.statusCode === "number" && typeof (error as { code?: unknown }).code === "string"
+            ? (error as { code: string }).code
+            : "INTERNAL_ERROR",
         };
         yield `data: ${JSON.stringify(errorEvent)}\n\n`;
       }
@@ -1367,7 +1628,7 @@ export class AgentServer {
       content: contentBuffer,
       conversationId: body.conversationId,
       metadata: body.metadata,
-    });
+    }, ctx.context);
 
     return {
       status: 201,
@@ -1378,7 +1639,7 @@ export class AgentServer {
   private async handleGetFile(ctx: RouteContext): Promise<RouteResult<FileRecord>> {
     const { fileId } = ctx.params;
 
-    const file = await this.config.storage.getFile(fileId);
+    const file = await this.config.storage.getFile(fileId, ctx.context);
     if (!file) {
       throw {
         statusCode: 404,
@@ -1396,7 +1657,7 @@ export class AgentServer {
   private async handleDeleteFile(ctx: RouteContext): Promise<RouteResult> {
     const { fileId } = ctx.params;
 
-    const file = await this.config.storage.getFile(fileId);
+    const file = await this.config.storage.getFile(fileId, ctx.context);
     if (!file) {
       throw {
         statusCode: 404,
@@ -1405,7 +1666,7 @@ export class AgentServer {
       } as NotFoundError;
     }
 
-    await this.config.storage.deleteFile(fileId);
+    await this.config.storage.deleteFile(fileId, ctx.context);
 
     return { status: 204 };
   }
@@ -1413,7 +1674,7 @@ export class AgentServer {
   private async handleDownloadFile(ctx: RouteContext): Promise<RouteResult> {
     const { fileId } = ctx.params;
 
-    const file = await this.config.storage.getFile(fileId);
+    const file = await this.config.storage.getFile(fileId, ctx.context);
     if (!file) {
       throw {
         statusCode: 404,
@@ -1422,7 +1683,7 @@ export class AgentServer {
       } as NotFoundError;
     }
 
-    const content = await this.config.storage.getFileContent(fileId);
+    const content = await this.config.storage.getFileContent(fileId, ctx.context);
     if (!content) {
       throw {
         statusCode: 404,
@@ -1460,7 +1721,7 @@ export class AgentServer {
     }
 
     // Check if agent exists
-    if (!this.agents.has(body.agentId)) {
+    if (!(await this.getAgentFor(body.agentId, ctx.context))) {
       throw {
         statusCode: 404,
         code: "NOT_FOUND",
@@ -1469,7 +1730,7 @@ export class AgentServer {
     }
 
     // Resolve userId
-    const userId = ctx.user?.id || await this.resolveUserId(ctx);
+    const userId = await this.effectiveUserId(ctx);
 
     // Process file uploads if provided
     const files: Task["files"] = [];
@@ -1481,7 +1742,7 @@ export class AgentServer {
           mimeType: f.mimeType,
           content,
           metadata: { uploadedForTask: true },
-        });
+        }, ctx.context);
         files.push({
           id: fileRecord.id,
           name: fileRecord.name,
@@ -1500,10 +1761,10 @@ export class AgentServer {
       files,
       callbackUrl: body.callbackUrl,
       metadata: body.metadata,
-    });
+    }, ctx.context);
 
     // Start background processing
-    this.processTaskInBackground(task.id).catch((error) => {
+    this.processTaskInBackground(task.id, ctx.context!).catch((error) => {
       console.error(`Error processing task ${task.id}:`, error);
     });
 
@@ -1518,11 +1779,10 @@ export class AgentServer {
   ): Promise<RouteResult<ListTasksResponse>> {
     const agentId = ctx.query.agentId as string | undefined;
     const status = ctx.query.status as Task["status"] | undefined;
-    const limit = parseInt(ctx.query.limit as string) || 20;
-    const offset = parseInt(ctx.query.offset as string) || 0;
+    const { limit, offset } = parsePaging(ctx.query, 20);
 
     // Resolve userId
-    const userId = ctx.user?.id || await this.resolveUserId(ctx);
+    const userId = await this.effectiveUserId(ctx);
 
     const result = await this.config.storage.getTasks({
       agentId,
@@ -1530,7 +1790,7 @@ export class AgentServer {
       status,
       limit,
       offset,
-    });
+    }, ctx.context);
 
     return {
       status: 200,
@@ -1549,7 +1809,7 @@ export class AgentServer {
   ): Promise<RouteResult<GetTaskResponse>> {
     const { taskId } = ctx.params;
 
-    const task = await this.config.storage.getTask(taskId);
+    const task = await this.config.storage.getTask(taskId, ctx.context);
     if (!task) {
       throw {
         statusCode: 404,
@@ -1559,19 +1819,10 @@ export class AgentServer {
     }
 
     // Verify user has access to this task
-    if (task.userId) {
-      const currentUserId = ctx.user?.id || await this.resolveUserId(ctx);
-      if (currentUserId && task.userId !== currentUserId) {
-        throw {
-          statusCode: 403,
-          code: "FORBIDDEN",
-          message: "You do not have access to this task",
-        };
-      }
-    }
+    await this.verifyTaskAccess(task, ctx);
 
     // Get result if task is completed
-    const result = await this.config.storage.getTaskResult(taskId);
+    const result = await this.config.storage.getTaskResult(taskId, ctx.context);
 
     return {
       status: 200,
@@ -1587,7 +1838,7 @@ export class AgentServer {
   ): Promise<RouteResult<GetTaskStatusResponse>> {
     const { taskId } = ctx.params;
 
-    const task = await this.config.storage.getTask(taskId);
+    const task = await this.config.storage.getTask(taskId, ctx.context);
     if (!task) {
       throw {
         statusCode: 404,
@@ -1597,16 +1848,7 @@ export class AgentServer {
     }
 
     // Verify user has access to this task
-    if (task.userId) {
-      const currentUserId = ctx.user?.id || await this.resolveUserId(ctx);
-      if (currentUserId && task.userId !== currentUserId) {
-        throw {
-          statusCode: 403,
-          code: "FORBIDDEN",
-          message: "You do not have access to this task",
-        };
-      }
-    }
+    await this.verifyTaskAccess(task, ctx);
 
     return {
       status: 200,
@@ -1627,7 +1869,7 @@ export class AgentServer {
   ): Promise<RouteResult<GetTaskResultResponse>> {
     const { taskId } = ctx.params;
 
-    const task = await this.config.storage.getTask(taskId);
+    const task = await this.config.storage.getTask(taskId, ctx.context);
     if (!task) {
       throw {
         statusCode: 404,
@@ -1637,18 +1879,9 @@ export class AgentServer {
     }
 
     // Verify user has access to this task
-    if (task.userId) {
-      const currentUserId = ctx.user?.id || await this.resolveUserId(ctx);
-      if (currentUserId && task.userId !== currentUserId) {
-        throw {
-          statusCode: 403,
-          code: "FORBIDDEN",
-          message: "You do not have access to this task",
-        };
-      }
-    }
+    await this.verifyTaskAccess(task, ctx);
 
-    const result = await this.config.storage.getTaskResult(taskId);
+    const result = await this.config.storage.getTaskResult(taskId, ctx.context);
     if (!result) {
       throw {
         statusCode: 404,
@@ -1677,7 +1910,7 @@ export class AgentServer {
       } as ValidationError;
     }
 
-    const task = await this.config.storage.getTask(taskId);
+    const task = await this.config.storage.getTask(taskId, ctx.context);
     if (!task) {
       throw {
         statusCode: 404,
@@ -1687,16 +1920,7 @@ export class AgentServer {
     }
 
     // Verify user has access to this task
-    if (task.userId) {
-      const currentUserId = ctx.user?.id || await this.resolveUserId(ctx);
-      if (currentUserId && task.userId !== currentUserId) {
-        throw {
-          statusCode: 403,
-          code: "FORBIDDEN",
-          message: "You do not have access to this task",
-        };
-      }
-    }
+    await this.verifyTaskAccess(task, ctx);
 
     // Create new comment
     const comment: TaskComment = {
@@ -1713,10 +1937,10 @@ export class AgentServer {
     const updatedTask = await this.config.storage.updateTask(taskId, {
       comments: [...existingComments, comment],
       status: "pending", // Reset status to pending so it can be reprocessed
-    });
+    }, ctx.context);
 
     // Reprocess the task with the new comment
-    this.processTaskInBackground(taskId).catch((err) => {
+    this.processTaskInBackground(taskId, ctx.context!).catch((err) => {
       console.error(`Failed to reprocess task ${taskId}:`, err);
     });
 
@@ -1734,7 +1958,7 @@ export class AgentServer {
   ): Promise<RouteResult<GetTaskCommentsResponse>> {
     const { taskId } = ctx.params;
 
-    const task = await this.config.storage.getTask(taskId);
+    const task = await this.config.storage.getTask(taskId, ctx.context);
     if (!task) {
       throw {
         statusCode: 404,
@@ -1744,16 +1968,7 @@ export class AgentServer {
     }
 
     // Verify user has access to this task
-    if (task.userId) {
-      const currentUserId = ctx.user?.id || await this.resolveUserId(ctx);
-      if (currentUserId && task.userId !== currentUserId) {
-        throw {
-          statusCode: 403,
-          code: "FORBIDDEN",
-          message: "You do not have access to this task",
-        };
-      }
-    }
+    await this.verifyTaskAccess(task, ctx);
 
     const comments = task.comments || [];
 
@@ -1770,10 +1985,10 @@ export class AgentServer {
   // Task Processing
   // ============================================================================
 
-  private async processTaskInBackground(taskId: string): Promise<void> {
+  private async processTaskInBackground(taskId: string, rc: RequestContext): Promise<void> {
     try {
       // Get the task
-      const task = await this.config.storage.getTask(taskId);
+      const task = await this.config.storage.getTask(taskId, rc);
       if (!task) {
         throw new Error(`Task not found: ${taskId}`);
       }
@@ -1782,10 +1997,10 @@ export class AgentServer {
       await this.config.storage.updateTask(taskId, {
         status: "running",
         startedAt: new Date(),
-      });
+      }, rc);
 
       // Get the agent
-      const agentReg = this.agents.get(task.agentId);
+      const agentReg = await this.getAgentFor(task.agentId, rc);
       if (!agentReg) {
         throw new Error(`Agent not found: ${task.agentId}`);
       }
@@ -1813,12 +2028,13 @@ export class AgentServer {
       if (agentReg.sdkAgent) {
         // SDK Agent processing - use invoke method like regular message processing
         const sdkAgent = agentReg.sdkAgent as {
-          invoke: (params: {
-            messages: Array<{ role: string; content: string }>;
-          }) => Promise<{ content: string; metadata?: { usage?: unknown } }>;
+          invoke: (
+            params: { messages: Array<{ role: string; content: string }> },
+            config?: { context?: RequestContext }
+          ) => Promise<{ content: string; metadata?: { usage?: unknown } }>;
         };
 
-        const result = await sdkAgent.invoke({ messages });
+        const result = await sdkAgent.invoke({ messages }, { context: rc });
 
         responseContent = result.content || "Task completed";
         usage = result.metadata?.usage as TaskResult["usage"];
@@ -1842,6 +2058,7 @@ export class AgentServer {
             ...task.metadata,
             comments: task.comments || [],
           },
+          context: rc,
         });
 
         responseContent = result.content;
@@ -1863,7 +2080,7 @@ export class AgentServer {
           await this.config.storage.updateTask(taskId, {
             status: "waiting_for_input",
             comments: [...existingComments, agentComment],
-          });
+          }, rc);
 
           // Create partial task result
           await this.config.storage.createTaskResult({
@@ -1872,7 +2089,7 @@ export class AgentServer {
             files: responseFiles,
             usage,
             metadata: { waitingForInput: true },
-          });
+          }, rc);
 
           // Send callback notification
           if (task.callbackUrl) {
@@ -1891,13 +2108,13 @@ export class AgentServer {
         files: responseFiles,
         usage,
         metadata: {},
-      });
+      }, rc);
 
       // Update task status to completed
       await this.config.storage.updateTask(taskId, {
         status: "completed",
         completedAt: new Date(),
-      });
+      }, rc);
 
       // Send callback notification
       if (task.callbackUrl) {
@@ -1909,10 +2126,10 @@ export class AgentServer {
         status: "failed",
         completedAt: new Date(),
         error: (error as Error).message,
-      });
+      }, rc);
 
       // Send callback notification with error
-      const task = await this.config.storage.getTask(taskId);
+      const task = await this.config.storage.getTask(taskId, rc);
       if (task?.callbackUrl) {
         await this.sendTaskCallback(task.callbackUrl, taskId, "failed", (error as Error).message);
       }
