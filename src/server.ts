@@ -13,6 +13,7 @@ import type {
   AgentInfo,
   AuthUser,
   Conversation,
+  FileAttachment,
   Message,
   FileRecord,
   Task,
@@ -1159,6 +1160,9 @@ export class AgentServer {
       } as ValidationError;
     }
 
+    // Files the message attaches by id are checked before anything starts, streamed or not.
+    const fileRefs = await this.resolveFileRefs(conversationId, body, ctx);
+
     // Check if streaming is requested
     if (body.stream) {
       // Waiting on a human? Answer 409 as a real HTTP status (or cancel and continue)
@@ -1168,7 +1172,7 @@ export class AgentServer {
         await this.verifyConversationAccess(existing, ctx);
         await this.guardPendingActions(existing, ctx);
       }
-      return this.handleSendMessageStream(ctx);
+      return this.handleSendMessageStream(ctx, fileRefs);
     }
 
     // Get conversation
@@ -1198,12 +1202,7 @@ export class AgentServer {
     conversation = await this.guardPendingActions(conversation, ctx);
 
     // Handle file attachments
-    const files = body.files?.map((file) => ({
-      id: `file_${Date.now()}_${Math.random().toString(36).slice(2)}`,
-      name: file.name,
-      mimeType: file.mimeType,
-      size: Buffer.from(file.content, "base64").length,
-    }));
+    const files = this.messageFiles(body, fileRefs);
 
     // Save user message
     const userMessage = await this.config.storage.createMessage({
@@ -1377,7 +1376,8 @@ export class AgentServer {
    * Handle streaming message send via SSE
    */
   private async handleSendMessageStream(
-    ctx: RouteContext
+    ctx: RouteContext,
+    fileRefs: FileAttachment[] = []
   ): Promise<RouteResult<SendMessageResponse>> {
     const { conversationId } = ctx.params;
     const body = ctx.body as SendMessageRequest;
@@ -1430,12 +1430,7 @@ export class AgentServer {
         }
 
         // Handle file attachments
-        const files = body.files?.map((file) => ({
-          id: `file_${Date.now()}_${Math.random().toString(36).slice(2)}`,
-          name: file.name,
-          mimeType: file.mimeType,
-          size: Buffer.from(file.content, "base64").length,
-        }));
+        const files = self.messageFiles(body, fileRefs);
 
         // Save user message
         const userMessage = await self.config.storage.createMessage({
@@ -2100,6 +2095,64 @@ export class AgentServer {
     }
   }
 
+  /**
+   * The stored files a message attaches by id (`fileIds`). Refuses before the
+   * turn starts: too many (400), or an id that is not a file of this
+   * conversation (404, the same answer for a missing file and someone else's).
+   */
+  private async resolveFileRefs(
+    conversationId: string,
+    body: SendMessageRequest | undefined,
+    ctx: RouteContext
+  ): Promise<FileAttachment[]> {
+    const raw = body?.fileIds;
+    if (raw === undefined) return [];
+    if (!Array.isArray(raw) || raw.some((id) => typeof id !== "string" || id.length === 0)) {
+      throw {
+        statusCode: 400,
+        code: "VALIDATION_ERROR",
+        message: "fileIds must be an array of file ids",
+      } as ValidationError;
+    }
+    const ids = [...new Set(raw)];
+    const maxFiles = this.config.limits?.maxFiles ?? 10;
+    if (ids.length + (body?.files?.length ?? 0) > maxFiles) {
+      throw {
+        statusCode: 400,
+        code: "VALIDATION_ERROR",
+        message: `A message can attach at most ${maxFiles} files`,
+      } as ValidationError;
+    }
+    const refs: FileAttachment[] = [];
+    for (const id of ids) {
+      const file = await this.config.storage.getFile(id, ctx.context);
+      if (!file || (file.conversationId && file.conversationId !== conversationId)) {
+        throw {
+          statusCode: 404,
+          code: "NOT_FOUND",
+          message: `File not found: ${id}`,
+        } as NotFoundError;
+      }
+      refs.push({ id: file.id, name: file.name, mimeType: file.mimeType, size: file.size });
+    }
+    return refs;
+  }
+
+  /** The files of a user message: stored ones attached by id, then inline ones (not stored by the server). */
+  private messageFiles(
+    body: SendMessageRequest | undefined,
+    fileRefs: FileAttachment[]
+  ): FileAttachment[] | undefined {
+    const inline = (body?.files ?? []).map((file) => ({
+      id: `file_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+      name: file.name,
+      mimeType: file.mimeType,
+      size: Buffer.from(file.content, "base64").length,
+    }));
+    const all = [...fileRefs, ...inline];
+    return body?.files || fileRefs.length > 0 ? all : undefined;
+  }
+
   private async handleUploadFile(
     ctx: RouteContext
   ): Promise<RouteResult<UploadFileResponse>> {
@@ -2123,9 +2176,16 @@ export class AgentServer {
       } as ValidationError;
     }
 
-    // Check file size limits
-    const contentBuffer = Buffer.from(content, "base64");
+    // Check file size limits (before decoding: the base64 text is about a third larger than the file)
     const maxSize = this.config.limits?.maxFileSize || 10 * 1024 * 1024; // 10MB default
+    if (typeof content !== "string" || Math.floor((content.length * 3) / 4) > maxSize + 3) {
+      throw {
+        statusCode: 400,
+        code: "VALIDATION_ERROR",
+        message: `File size exceeds limit of ${maxSize} bytes`,
+      } as ValidationError;
+    }
+    const contentBuffer = Buffer.from(content, "base64");
 
     if (contentBuffer.length > maxSize) {
       throw {

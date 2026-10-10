@@ -284,3 +284,15 @@ import { Chat } from '@cognipeer/chat-ui';
 - [Streaming](/guide/streaming)
 - [Custom Agents](/guide/custom-agents)
 - [Error Handling](/guide/error-handling)
+
+
+## Attaching uploaded files to a message
+
+Upload with `conversationId`, then send the ids with the message. The server resolves each id through `storage.getFile` (a file that does not exist or belongs to another conversation is a 404) and the user message carries the stored records:
+
+```ts
+const { file } = await (await fetch('/api/agents/files', { method: 'POST', headers, body: JSON.stringify({ file: { name, content, mimeType }, conversationId }) })).json();
+await fetch(`/api/agents/conversations/${conversationId}/messages`, { method: 'POST', headers, body: JSON.stringify({ message: 'Read this', fileIds: [file.id] }) });
+```
+
+At most `limits.maxFiles` (default 10) per message. Behind Fastify, `uploadBodyLimit` raises the body limit of `POST /files` only.

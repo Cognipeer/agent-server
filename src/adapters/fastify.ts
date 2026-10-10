@@ -41,6 +41,12 @@ export interface FastifyAdapterOptions extends Omit<NodeHandlerOptions, "basePat
    * 1MiB). Raise it when clients upload base64 files through the chat.
    */
   bodyLimit?: number;
+  /**
+   * Body limit of `POST /files` ALONE. A file travels base64 in JSON, so this is
+   * about a third above the biggest file you accept; every other route keeps
+   * `bodyLimit`. Leave unset to serve uploads under `bodyLimit` like any route.
+   */
+  uploadBodyLimit?: number;
 }
 
 const METHODS = ["GET", "POST", "PATCH", "DELETE", "OPTIONS"];
@@ -62,7 +68,7 @@ export function createFastifyPlugin(
   // must not strip anything itself - we hand it the already-relative path.
   const handle = createNodeHandler(server, { ...options, basePath: "" });
 
-  const handler = async (request: FastifyRequestLike, reply: FastifyReplyLike): Promise<void> => {
+  const handler = async (request: FastifyRequestLike, reply: FastifyReplyLike, fixedPath?: string): Promise<void> => {
     const { "*": rest, ...params } = (request.params ?? {}) as Record<string, unknown>;
     const mountParams: Record<string, string> = {};
     for (const [key, value] of Object.entries(params)) mountParams[key] = String(value);
@@ -76,7 +82,7 @@ export function createFastifyPlugin(
     }
 
     await handle(request.raw, reply.raw, {
-      path: `/${typeof rest === "string" ? rest : ""}`,
+      path: fixedPath ?? `/${typeof rest === "string" ? rest : ""}`,
       body: request.body,
       mountParams,
       raw: request,
@@ -86,6 +92,15 @@ export function createFastifyPlugin(
   return async (scope) => {
     for (const url of ["/", "/*"]) {
       scope.route({ method: METHODS, url, bodyLimit: options.bodyLimit, handler });
+    }
+    // The static route wins over `/*` for exactly this path, so the bigger limit never reaches another route.
+    if (options.uploadBodyLimit !== undefined) {
+      scope.route({
+        method: "POST",
+        url: "/files",
+        bodyLimit: options.uploadBodyLimit,
+        handler: (request, reply) => handler(request, reply, "/files"),
+      });
     }
   };
 }

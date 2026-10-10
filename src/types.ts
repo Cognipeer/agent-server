@@ -647,6 +647,13 @@ export interface SendMessageRequest {
     content: string; // base64
     mimeType: string;
   }>;
+  /**
+   * Files uploaded earlier with `POST /files` (`conversationId` set to this
+   * conversation) that this message attaches. Each id must resolve through
+   * `storage.getFile`; the user message carries the stored records. Capped by
+   * `limits.maxFiles` (default 10).
+   */
+  fileIds?: string[];
   metadata?: Record<string, unknown>;
   /**
    * Enable streaming response via Server-Sent Events (SSE)
