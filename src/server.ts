@@ -2168,12 +2168,16 @@ export class AgentServer {
 
     const { name, content, mimeType } = body.file;
 
-    if (!name || !content || !mimeType) {
+    if (!name || !mimeType || content === undefined || content === null) {
       throw {
         statusCode: 400,
         code: "VALIDATION_ERROR",
         message: "file.name, file.content, and file.mimeType are required",
       } as ValidationError;
+    }
+    // A named but empty file gets its own message: it is the user's file, not a malformed request
+    if (content === "") {
+      throw { statusCode: 400, code: "VALIDATION_ERROR", message: "File is empty" } as ValidationError;
     }
 
     // Check file size limits (before decoding: the base64 text is about a third larger than the file)
@@ -2186,6 +2190,11 @@ export class AgentServer {
       } as ValidationError;
     }
     const contentBuffer = Buffer.from(content, "base64");
+
+    // Base64 that decodes to nothing (whitespace, bare padding) is an empty file too
+    if (contentBuffer.length === 0) {
+      throw { statusCode: 400, code: "VALIDATION_ERROR", message: "File is empty" } as ValidationError;
+    }
 
     if (contentBuffer.length > maxSize) {
       throw {

@@ -219,7 +219,7 @@ function extractToken(headers: Record<string, string>): string | undefined {
 import { createNodeHandler } from '@cognipeer/agent-server'; // or '@cognipeer/agent-server/node'
 
 const handle = createNodeHandler(server, { basePath: '/api', maxBodyBytes: 15_000_000 });
-// (req: IncomingMessage, res: ServerResponse, overrides?: { path, body, mountParams, raw }) => Promise<boolean>
+// (req: IncomingMessage, res: ServerResponse, overrides?: { path, body, mountParams, raw, error }) => Promise<boolean>
 ```
 
 See the [Fastify & Node HTTP guide](../guide/fastify.md).

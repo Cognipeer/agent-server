@@ -24,10 +24,13 @@ Human-in-the-loop: agents can pause for a tool approval or a question, and a cli
 - OpenAPI schemas and path for the new route; docs guide "Approvals & Questions".
 - **Attach uploaded files by id**: `SendMessageRequest.fileIds` (files uploaded with `POST /files` and `conversationId`). Each id is resolved through `storage.getFile` before the turn starts (404 for an unknown file or one of another conversation, 400 for a malformed list or more than `limits.maxFiles`); the user message carries the stored records. Inline `files` keep working.
 - Fastify adapter option `uploadBodyLimit`: the body limit of `POST /files` alone, every other route keeps `bodyLimit`.
+- `NodeHandlerOverrides.error`: answer with a given `{ statusCode, code, message }` instead of routing, through the usual CORS headers and error envelope.
 
 ### Changed
 
 - `POST /files` checks the size from the base64 length before decoding the content.
+- `POST /files` answers an empty file (empty content, or base64 that decodes to nothing) with `400 VALIDATION_ERROR` and the message `File is empty`, instead of the generic "file.name, file.content, and file.mimeType are required".
+- The Fastify adapter answers a body over Fastify's limit with `413 { error: { code: "PAYLOAD_TOO_LARGE", message } }` (the Node handler's envelope, CORS headers included) instead of Fastify's own `FST_ERR_CTP_BODY_TOO_LARGE` shape. Other Fastify errors still reach the app's error handler.
 
 ## [0.2.0] - 2026-10-09
 

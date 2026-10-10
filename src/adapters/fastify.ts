@@ -10,18 +10,25 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AgentServer } from "../server.js";
-import { createNodeHandler, type NodeHandlerOptions } from "./node.js";
+import { createNodeHandler, type NodeHandlerOptions, type NodeHandlerOverrides } from "./node.js";
 
 interface FastifyRequestLike {
   raw: IncomingMessage;
   body?: unknown;
   params?: unknown;
+  /** The route's resolved options (Fastify >= 4.10); `bodyLimit` includes Fastify's own default */
+  routeOptions?: { bodyLimit?: number };
 }
 
 interface FastifyReplyLike {
   hijack(): unknown;
+  send(payload?: unknown): unknown;
   raw: ServerResponse;
   getHeaders(): Record<string, number | string | string[] | undefined>;
+}
+
+interface FastifyErrorLike {
+  code?: string;
 }
 
 interface FastifyScopeLike {
@@ -31,6 +38,9 @@ interface FastifyScopeLike {
     bodyLimit?: number;
     handler: (request: FastifyRequestLike, reply: FastifyReplyLike) => Promise<void>;
   }): unknown;
+  setErrorHandler?(
+    handler: (error: FastifyErrorLike, request: FastifyRequestLike, reply: FastifyReplyLike) => unknown
+  ): unknown;
 }
 
 export type AgentServerFastifyPlugin = (scope: FastifyScopeLike, opts?: unknown) => Promise<void>;
@@ -68,7 +78,12 @@ export function createFastifyPlugin(
   // must not strip anything itself - we hand it the already-relative path.
   const handle = createNodeHandler(server, { ...options, basePath: "" });
 
-  const handler = async (request: FastifyRequestLike, reply: FastifyReplyLike, fixedPath?: string): Promise<void> => {
+  const handler = async (
+    request: FastifyRequestLike,
+    reply: FastifyReplyLike,
+    fixedPath?: string,
+    error?: NodeHandlerOverrides["error"]
+  ): Promise<void> => {
     const { "*": rest, ...params } = (request.params ?? {}) as Record<string, unknown>;
     const mountParams: Record<string, string> = {};
     for (const [key, value] of Object.entries(params)) mountParams[key] = String(value);
@@ -86,10 +101,26 @@ export function createFastifyPlugin(
       body: request.body,
       mountParams,
       raw: request,
+      ...(error ? { error } : {}),
     });
   };
 
   return async (scope) => {
+    // A body over the limit is refused by Fastify before any route runs, in Fastify's own
+    // error shape. Answer it in ours (413 PAYLOAD_TOO_LARGE, same as the Node handler); every
+    // other error goes on to the app's own error handling.
+    scope.setErrorHandler?.((error, request, reply) => {
+      if (error.code !== "FST_ERR_CTP_BODY_TOO_LARGE") {
+        reply.send(error);
+        return;
+      }
+      const limit = request.routeOptions?.bodyLimit ?? options.bodyLimit;
+      return handler(request, reply, undefined, {
+        statusCode: 413,
+        code: "PAYLOAD_TOO_LARGE",
+        message: limit ? `Request body exceeds ${limit} bytes` : "Request body is too large",
+      });
+    });
     for (const url of ["/", "/*"]) {
       scope.route({ method: METHODS, url, bodyLimit: options.bodyLimit, handler });
     }

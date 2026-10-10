@@ -296,3 +296,5 @@ await fetch(`/api/agents/conversations/${conversationId}/messages`, { method: 'P
 ```
 
 At most `limits.maxFiles` (default 10) per message. Behind Fastify, `uploadBodyLimit` raises the body limit of `POST /files` only.
+
+An upload with empty content (or base64 that decodes to nothing) is a 400 `VALIDATION_ERROR` with the message `File is empty`; a body over the limit is a 413 `PAYLOAD_TOO_LARGE`.

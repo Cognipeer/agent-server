@@ -38,6 +38,12 @@ export interface NodeHandlerOverrides {
   mountParams?: Record<string, string>;
   /** Native request object for `ContextRequest.raw` (defaults to the IncomingMessage). */
   raw?: unknown;
+  /**
+   * Answer with this error instead of routing the request, through the usual CORS
+   * headers and `{ error: { code, message } }` envelope. For hosts whose framework
+   * refused the request before the handler ran (Fastify: a body over its limit).
+   */
+  error?: { statusCode?: number; code?: string; message?: string };
 }
 
 /**
@@ -215,6 +221,8 @@ export function createNodeHandler(server: AgentServer, options: NodeHandlerOptio
         res.end();
         return true;
       }
+
+      if (overrides.error) throw overrides.error;
 
       const user = await authenticate(req, routePath);
 

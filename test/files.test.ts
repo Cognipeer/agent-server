@@ -97,6 +97,18 @@ describe("upload size and the Fastify body limit", () => {
     expect((await upload(post, conversation.id, "tiny")).res.status).toBe(201);
   });
 
+  it("answers an empty file with its own message", async () => {
+    const { post, conversation } = await boot();
+    for (const content of ["", "  ", "===="]) {
+      const res = await post("/files", { file: { name: "empty.txt", content, mimeType: "text/plain" }, conversationId: conversation.id });
+      expect(res.status, JSON.stringify(content)).toBe(400);
+      expect(((await res.json()) as any).error).toEqual({ code: "VALIDATION_ERROR", message: "File is empty" });
+    }
+    // a missing field is still the generic request error
+    const missing = await post("/files", { file: { name: "a.txt", mimeType: "text/plain" }, conversationId: conversation.id });
+    expect(((await missing.json()) as any).error.message).toContain("are required");
+  });
+
   it("raises the body limit on POST /files alone", async () => {
     const { post, url, conversation } = await boot(
       { limits: { maxFileSize: 100_000 } },
@@ -108,9 +120,11 @@ describe("upload size and the Fastify body limit", () => {
     // ... and refused (413) on any other route
     const message = await post(`/conversations/${conversation.id}/messages`, { message: "z".repeat(50_000) });
     expect(message.status).toBe(413);
+    expect(((await message.json()) as any).error.code).toBe("PAYLOAD_TOO_LARGE");
     // the upload route has a ceiling too
     const huge = await upload(post, conversation.id, "y".repeat(400_000));
     expect(huge.res.status).toBe(413);
+    expect(huge.body.error.code).toBe("PAYLOAD_TOO_LARGE");
     // other methods and paths under /files keep working through the catch-all
     expect((await fetch(`${url}/files/${ok.body.file.id}`)).status).toBe(200);
   });

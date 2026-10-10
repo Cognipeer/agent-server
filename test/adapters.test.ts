@@ -263,6 +263,68 @@ describe("Fastify adapter", () => {
     const del = await fetch(`${url}/api/portal/k1/conversations/${conversation.id}`, { method: "DELETE" });
     expect(del.status).toBe(204);
   });
+
+  describe("body over Fastify's limit", () => {
+    async function bootLimited(
+      config: Partial<Parameters<typeof createAgentServer>[0]> = {},
+      adapter: { bodyLimit?: number; uploadBodyLimit?: number } = {},
+      fastifyBodyLimit?: number
+    ) {
+      const server = createAgentServer({ basePath: "/x", storage: await memoryStorage(), agents: [sdkAgent()], ...config });
+      const app = Fastify(fastifyBodyLimit ? { bodyLimit: fastifyBodyLimit } : {});
+      mountOnFastify(app, server, { prefix: "/p/:k", ...adapter });
+      return { app, server };
+    }
+    async function listenOn(app: ReturnType<typeof Fastify>) {
+      await app.listen({ port: 0, host: "127.0.0.1" });
+      closers.push(() => app.close());
+      const { port } = app.server.address() as { port: number };
+      return `http://127.0.0.1:${port}/p/k1`;
+    }
+    const post = (url: string, body: unknown, headers: Record<string, string> = {}) =>
+      fetch(url, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+
+    it("answers in the error envelope (413 PAYLOAD_TOO_LARGE), not Fastify's own shape", async () => {
+      const { app } = await bootLimited({}, { bodyLimit: 2_000, uploadBodyLimit: 200_000 });
+      const url = await listenOn(app);
+
+      const res = await post(`${url}/conversations`, { agentId: "bot", pad: "x".repeat(5_000) });
+      expect(res.status).toBe(413);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await json(res)).toEqual({ error: { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds 2000 bytes" } });
+
+      // the upload route reports its own, bigger ceiling
+      const upload = await post(`${url}/files`, { file: { name: "a.txt", content: "y".repeat(210_000), mimeType: "text/plain" } });
+      expect(upload.status).toBe(413);
+      expect(await json(upload)).toEqual({ error: { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds 200000 bytes" } });
+    });
+
+    it("names the app's own limit when the adapter sets none, and keeps CORS and earlier hook headers", async () => {
+      const { app } = await bootLimited({ cors: { enabled: true, origins: ["*"] } }, {}, 1_000);
+      app.addHook("onRequest", async (_req, reply) => {
+        reply.header("x-request-id", "rid-2");
+      });
+      const url = await listenOn(app);
+
+      const res = await post(`${url}/conversations`, { agentId: "bot", pad: "x".repeat(3_000) });
+      expect(res.status).toBe(413);
+      expect((await json(res)).error).toEqual({ code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds 1000 bytes" });
+      expect(res.headers.get("access-control-allow-origin")).toBe("*");
+      expect(res.headers.get("x-request-id")).toBe("rid-2");
+    });
+
+    it("leaves every other Fastify error to the app's own error handler", async () => {
+      const { app } = await bootLimited();
+      app.setErrorHandler((error, _req, reply) => {
+        reply.code((error as { statusCode?: number }).statusCode ?? 500).send({ app: "handled", code: (error as { code?: string }).code });
+      });
+      const url = await listenOn(app);
+
+      const bad = await fetch(`${url}/conversations`, { method: "POST", headers: { "content-type": "application/json" }, body: "{not json" });
+      expect(bad.status).toBe(400);
+      expect((await json(bad)).app).toBe("handled");
+    });
+  });
 });
 
 describe("Express and Next adapters feed resolveContext", () => {
