@@ -144,16 +144,23 @@ export function createNextHandler(
         };
 
         const encoder = new TextEncoder();
+        let cancelled = false;
         const stream = new ReadableStream({
           async start(controller) {
             try {
               for await (const chunk of result.stream!) {
+                if (cancelled) break;
                 controller.enqueue(encoder.encode(chunk));
               }
-              controller.close();
+              if (!cancelled) controller.close();
             } catch (error) {
-              controller.error(error);
+              if (!cancelled) controller.error(error);
             }
+          },
+          cancel() {
+            // The client went away: end the stream now. A run it was watching goes on without it.
+            cancelled = true;
+            result.close?.();
           },
         });
 

@@ -69,14 +69,22 @@ describeProvider("postgres", (harness) => {
         await provider.disconnect();
 
         expect(await sql(`SELECT COUNT(*)::int AS n FROM "${schema}"."agent_server_task_results"`)).toEqual([{ n: 1 }]);
-        expect((await sql(`SELECT value FROM "${schema}"."agent_server_meta" WHERE key = 'schema_version'`))[0].value).toBe("2");
+        expect((await sql(`SELECT value FROM "${schema}"."agent_server_meta" WHERE key = 'schema_version'`))[0].value).toBe("3");
         const columns = (await sql(
-          `SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = $1 AND column_name IN ('seq', 'comments')`,
+          `SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = $1 AND column_name IN ('seq', 'comments', 'conversation_id')`,
           [schema]
         )).map((r) => `${r.table_name}.${r.column_name}`);
         expect(columns).toEqual(
-          expect.arrayContaining(["agent_server_conversations.seq", "agent_server_messages.seq", "agent_server_tasks.seq", "agent_server_tasks.comments"])
+          expect.arrayContaining([
+            "agent_server_conversations.seq",
+            "agent_server_messages.seq",
+            "agent_server_tasks.seq",
+            "agent_server_tasks.comments",
+            "agent_server_tasks.conversation_id",
+          ])
         );
+        const tables = (await sql(`SELECT tablename FROM pg_tables WHERE schemaname = $1`, [schema])).map((r) => r.tablename);
+        expect(tables).toEqual(expect.arrayContaining(["agent_server_events", "agent_server_event_streams", "agent_server_leases"]));
         const indexes = (await sql(`SELECT indexname FROM pg_indexes WHERE schemaname = $1`, [schema])).map((r) => r.indexname);
         expect(indexes).toContain("idx_agent_server_taskres_task_uq");
         expect(indexes).toContain("idx_agent_server_msg_conv_t");
@@ -90,6 +98,42 @@ describeProvider("postgres", (harness) => {
         expect((await again.getTaskResult("task_old"))?.content).toBe("newer");
         await again.disconnect();
       });
+    });
+
+    it("upgrades the previous schema (version 2): adds the event log, the leases and the task link", async () => {
+      const opened = await harness.open();
+      const { url, schema } = opened.where as { url: string; schema: string };
+      const { default: pg } = await import("pg");
+      const client = new pg.Client({ connectionString: url });
+      await client.connect();
+      try {
+        const conv = await opened.storage.createConversation({ agentId: "a", title: "kept" });
+        const task = await opened.storage.createTask({ agentId: "a", input: "old task" });
+        await opened.storage.disconnect();
+
+        // take it back to what version 2 had
+        await client.query(`
+          DROP TABLE "${schema}"."agent_server_events"; DROP TABLE "${schema}"."agent_server_event_streams"; DROP TABLE "${schema}"."agent_server_leases";
+          ALTER TABLE "${schema}"."agent_server_tasks" DROP COLUMN conversation_id;
+          UPDATE "${schema}"."agent_server_meta" SET value = '2' WHERE key = 'schema_version';
+        `);
+
+        const upgraded = createPostgresProvider({ connectionString: url, schema });
+        await upgraded.connect();
+        expect((await upgraded.getConversation(conv.id))?.title).toBe("kept");
+        expect((await upgraded.getTask(task.id))?.input).toBe("old task");
+        expect((await upgraded.events!.append(conv.id, [{ type: "x" }]))[0]!.seq).toBe(1);
+        expect(await upgraded.acquireLease!({ key: "k", owner: "o", ttlMs: 1000 })).toMatchObject({ acquired: true });
+        expect((await upgraded.updateTask(task.id, { conversationId: conv.id })).conversationId).toBe(conv.id);
+        await upgraded.disconnect();
+        expect((await client.query(`SELECT value FROM "${schema}"."agent_server_meta" WHERE key = 'schema_version'`)).rows[0].value).toBe("3");
+        // the provider that `open()` gave us is closed; the harness closes the schema
+        opened.storage = createPostgresProvider({ connectionString: url, schema });
+        await opened.storage.connect();
+      } finally {
+        await client.end();
+        await opened.close();
+      }
     });
 
     it("leaves alone a legacy index name that belongs to another prefix's tables", async () => {

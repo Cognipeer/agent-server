@@ -56,8 +56,36 @@ interface AgentServerConfig {
     methods?: string[];
     headers?: string[];
   };
+
+  // Request limits (file size, page sizes, the largest state a pause may store)
+  limits?: RequestLimits;
+
+  // What a message does while the conversation waits on an approval: 'reject' (409, default) or 'cancel'
+  pendingActionPolicy?: 'reject' | 'cancel';
+
+  // Leases, cancellation, the event stream and recovery - see guide/runs
+  runs?: RunsConfig;
 }
 ```
+
+`RunsConfig` (every field optional):
+
+| Field | Default | |
+| --- | --- | --- |
+| `nodeId` | random per process | Names this instance in leases |
+| `leaseTtlMs` | 60 000 | A crashed server frees its conversations after this long |
+| `cancelGraceMs` | 5 000 | How long a cancelled run may take to wind down before it is abandoned |
+| `cancelWaitMs` | 5 000 | How long `POST .../cancel` waits before answering 202 |
+| `pingIntervalMs` | 15 000 | `: ping` on the event stream |
+| `followPollMs` | 1 000 | How often a follower looks for events written by another node |
+| `maxStreamMs` | 3 600 000 | Longest an event stream stays open |
+| `eventPageSize` / `maxEventPageSize` | 100 / 1 000 | `GET .../events` default and largest `limit` |
+| `maxEventDataBytes` | 16 384 | Larger event data is cut (`_truncated: true`) |
+| `memoryEventLimit` | 2 000 | Events kept per conversation when the provider has no event log |
+| `eventRetentionDays` | 30 | Older events are pruned by the sweep; 0 keeps them |
+| `sweepIntervalMs` | 60 000 | Period of the recovery sweep; 0 turns it off |
+| `recoverOnStart` | `true` | Recover once at the first request |
+| `assumeSingleNode` | `true` | Fail tasks left `running` by an earlier process when the provider has no leases |
 
 ### Returns
 
@@ -166,6 +194,23 @@ const result = await agentServer.handleRequest(method, path, context);
 
 Returns `Promise<RouteResult>`.
 
+#### recoverStaleRuns
+
+```typescript
+const { conversations, tasks } = await server.recoverStaleRuns();
+```
+
+Closes the runs whose server died (`session.error` + `session.status_idle` with `stop_reason: "error"`) and fails the tasks that were left `running`.
+It runs by itself at the first request and every `runs.sweepIntervalMs`; call it to run it on demand. See [Runs](../guide/runs#recovery).
+
+#### close
+
+```typescript
+await server.close({ abort: true });
+```
+
+Stops the periodic sweep. With `abort: true` it also cancels the running turns and waits for them.
+
 #### getOpenAPISpec
 
 Get the OpenAPI specification.
@@ -245,6 +290,12 @@ interface ProcessMessageParams {
 
   // Request metadata
   metadata?: Record<string, unknown>;
+
+  // Per-request context (user + data from resolveContext)
+  context?: RequestContext;
+
+  // Aborted when the run is cancelled (POST /conversations/:id/cancel): stop and return what you have
+  signal?: AbortSignal;
 }
 ```
 
@@ -270,6 +321,13 @@ interface ProcessMessageResult {
     outputTokens?: number;
     totalTokens?: number;
   };
+
+  // 'requires_action' + pendingActions to pause the turn (see guide/human-in-the-loop)
+  status?: MessageStatus;
+  pendingActions?: PendingAction[];
+
+  // Why the turn stopped when it was not simply 'end_turn': 'max_turns' | 'limit' | 'budget_reached'
+  stopReason?: StopReason;
 }
 ```
 
@@ -313,6 +371,10 @@ interface RouteResult<T = unknown> {
 
   // SSE stream generator
   stream?: AsyncGenerator<string, void, unknown>;
+
+  // Adapters call it when the client of `stream` goes away, so the stream ends at once.
+  // A run the stream was watching is not affected.
+  close?: () => void;
 }
 ```
 

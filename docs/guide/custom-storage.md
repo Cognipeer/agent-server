@@ -64,6 +64,8 @@ Hook signatures (all end with `ctx?: RequestContext`):
 | Files | `_saveFile(id, params, ctx)`, `_getFile(id, ctx)`, `_getFileContent(id, ctx)`, `_deleteFile(id, ctx)` |
 | Tasks | `_createTask(id, params, ctx)`, `_getTask(id, ctx)`, `_getTasks(params, ctx)`, `_updateTask(id, params, ctx)`, `_deleteTask(id, ctx)` |
 | Task results | `_createTaskResult(id, params, ctx)`, `_getTaskResult(taskId, ctx)` |
+| Events *(optional)* | `_appendEvents(conversationId, events, ctx)`, `_listEvents(conversationId, query, ctx)`, `_eventSummaries(conversationIds, ctx)`, `_pruneEvents(before, ctx)` |
+| Leases *(optional)* | `_acquireLease(params, ctx)`, `_renewLease(params, ctx)`, `_releaseLease(params, ctx)`, `_getLeases(keys, now, ctx)`, `_markLeaseCancel(key, now, ctx)`, `_listExpiredLeases(params, ctx)` |
 
 ## What a provider has to do
 
@@ -81,7 +83,9 @@ these rules behaves like them to the server and to every client:
 | Copies | Do not hand out objects you keep (a provider that holds records in memory must copy them). |
 | Messages | `createMessage` for a conversation that does not exist throws `NotFoundError` and stores nothing. A new message sets the conversation's `updatedAt`. `deleteMessage` keeps the message's files. |
 | Files | `getFileContent` returns a `Buffer`. `saveFile` for an unknown conversation or message throws `NotFoundError` and stores no content; content and record are written together (or the content is taken back out). A file with a `messageId` belongs to that message's conversation. `deleteConversation` deletes the conversation's files and their content. |
-| Tasks | `createTaskResult` replaces the task's existing result (one per task). `updateTask` / `createTaskResult` for an unknown task throw `NotFoundError`; an update that changes nothing is not an error. |
+| Tasks | `createTaskResult` replaces the task's existing result (one per task). `updateTask` / `createTaskResult` for an unknown task throw `NotFoundError`; an update that changes nothing is not an error. `conversationId` is stored, updatable and a `getTasks` filter. |
+| Events | `append` is atomic and ordered: `seq` is 1, 2, 3 ... per conversation with no gaps or repeats, also for appenders running at the same time, and keeps counting after a restart or a `prune`. An unknown conversation is a `NotFoundError`. `list({ after, before, types, limit, order })` returns `{ events, hasMore, lastSeq }` (`lastSeq` = the last event returned, or `after` for an empty page). `summary` gives `lastSeq` and `stopReason` per conversation. The log is deleted with the conversation. |
+| Leases | `acquireLease` is atomic: free, expired or already yours is acquired (an expired one is returned as `takenOver`), otherwise `{ acquired: false, lease }` with the holder. `renewLease` / `releaseLease` only work for the owner, `renewLease` not once expired. `markLeaseCancel` flags a live lease, and the owner sees `cancelRequested` when it renews. `getLeases` returns the live ones, `listExpiredLeases` the expired, oldest first, by key prefix. |
 | Limits | Throw `StorageLimitError` (413) for a file or a state you cannot hold, `ValidationError` (400) for a value a column cannot hold, `NotFoundError` (404) for a missing parent. Not a driver error. |
 | Capabilities | Implement `capabilities()` so the server can refuse a bad configuration at startup and skip a pause that would not fit. |
 
@@ -98,8 +102,8 @@ class MyStorage extends BaseStorageProvider {
       maxFileBytes: 5 * 1024 * 1024 * 1024, // largest single file you store
       maxStateBytes: 4 * 1024 * 1024,       // largest conversation state (UTF-8 bytes of its JSON)
       atomicUpdate: false,                   // compare-and-set conversation updates
-      events: false,                         // a durable per-conversation event log
-      leases: false,                         // per-conversation leases
+      events: false,                         // a durable per-conversation event log (implement `_appendEvents` / `_listEvents`)
+      leases: false,                         // per-conversation leases (implement the `_...Lease` hooks)
     };
   }
 }
@@ -107,6 +111,33 @@ class MyStorage extends BaseStorageProvider {
 
 `createAgentServer` throws when `limits.maxFileSize` or `limits.maxStateBytes` is above these, and does not pause a turn whose state
 would be bigger than `maxStateBytes` (see [Storage Providers](./storage.md)). A provider without `capabilities()` is treated as unbounded.
+
+### Events and leases (optional)
+
+Both are optional. Without `events` the server keeps the last 2 000 events per conversation in memory (one node, lost on restart); without leases it
+serialises runs in-process only (one node). Implementing them makes [Runs, Cancel & Reattach](./runs.md) durable and multi-node:
+
+```typescript
+class MyStorage extends BaseStorageProvider {
+  capabilities() { return { ...super.capabilities(), events: true, leases: true }; }
+
+  // hand out seq 1, 2, 3 ... atomically (a counter row per conversation is the usual way)
+  protected async _appendEvents(conversationId: string, events: StoredEventInput[], ctx?: RequestContext): Promise<ConversationEvent[]> { /* ... */ }
+  protected async _listEvents(conversationId: string, q: EventQuery, ctx?: RequestContext): Promise<ConversationEvent[]> { /* q.limit already includes one extra row for `hasMore` */ }
+  protected async _eventSummaries(ids: string[], ctx?: RequestContext): Promise<Record<string, EventSummary>> { /* ... */ }
+  protected async _pruneEvents(before: Date, ctx?: RequestContext): Promise<number> { /* ... */ }
+
+  protected async _acquireLease(p: AcquireLeaseParams & { now: Date; expiresAt: Date }, ctx?: RequestContext): Promise<AcquireLeaseResult> { /* compare-and-set */ }
+  // _renewLease, _releaseLease, _getLeases, _markLeaseCancel, _listExpiredLeases
+}
+```
+
+`BaseStorageProvider` validates and normalises what flows through (event types and sizes, lease keys and lifetimes, the clock `now` / `expiresAt`), so the hooks
+only store. `summary().stopReason` is the `stop_reason` of the newest `session.status_idle` event, cleared by a later `session.status_running`:
+use `nextStopReason(previous, events)` (exported) so you agree with the built-in providers. If you implement `StorageProvider` directly, expose
+`events` (an `EventStore`) and the lease methods, and report `capabilities()`.
+
+The contract suite (`runStorageContract`) checks events and leases too.
 
 ## Implementing the interface directly
 

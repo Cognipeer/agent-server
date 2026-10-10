@@ -96,6 +96,11 @@ getMessages(conversationId: string, params?: GetMessagesParams, ctx?: RequestCon
 
 See [Custom Storage](./custom-storage.md) for implementing a scoped store.
 
+A turn runs [detached](./runs.md) from the request that started it, but with that request's context: it reaches the agent, the handler, the storage calls the turn makes and
+`getRequestContext()` just as before, even after the client has gone away. Work that belongs to no request - the recovery sweep that closes the runs of a dead process
+and fails stale tasks, and the pruning of old events - runs with the context `{ data: { system: true } }` and no user. A store scoped by `ctx.user` should let those calls through (or set
+`runs.recoverOnStart: false` and `runs.sweepIntervalMs: 0`, and call `server.recoverStaleRuns()` from a context of your own).
+
 ## Streaming note
 
 If an SDK agent returns its final answer without streaming any text (for example a

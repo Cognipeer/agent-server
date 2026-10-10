@@ -157,7 +157,8 @@ function extractContent(output: ResponsesApiResponse["output"]): string {
 export async function invokeResponsesApi(
   config: ResponsesApiConfig,
   messages: Array<{ role: string; content: string }>,
-  previousResponseId?: string
+  previousResponseId?: string,
+  options: { signal?: AbortSignal } = {}
 ): Promise<ResponsesApiResult> {
   const url = buildUrl(config);
   const input = buildInput(messages);
@@ -183,6 +184,7 @@ export async function invokeResponsesApi(
     method: "POST",
     headers: buildHeaders(config),
     body: JSON.stringify(requestBody),
+    signal: options.signal,
   });
 
   if (!response.ok) {
@@ -218,7 +220,8 @@ export async function invokeResponsesApi(
 export async function* streamResponsesApi(
   config: ResponsesApiConfig,
   messages: Array<{ role: string; content: string }>,
-  previousResponseId?: string
+  previousResponseId?: string,
+  options: { signal?: AbortSignal } = {}
 ): AsyncGenerator<ResponsesApiStreamEvent, void, unknown> {
   const url = buildUrl(config);
   const input = buildInput(messages);
@@ -245,6 +248,7 @@ export async function* streamResponsesApi(
     method: "POST",
     headers: buildHeaders(config),
     body: JSON.stringify(requestBody),
+    signal: options.signal,
   });
 
   if (!response.ok) {

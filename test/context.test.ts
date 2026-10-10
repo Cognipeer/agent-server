@@ -243,7 +243,10 @@ describe("storage receives the request context", () => {
     await server.handleRoute("GET", "/conversations", { query: {} });
     await server.handleRoute("DELETE", `/conversations/${conversationId}`, { query: {} });
 
-    const dataCalls = calls.filter((c) => !["connect", "disconnect", "isConnected"].includes(c.method));
+    // Work that belongs to no request (the recovery sweep) runs with a system context of its own
+    const dataCalls = calls.filter(
+      (c) => !["connect", "disconnect", "isConnected"].includes(c.method) && !(c.ctx as RequestContext | undefined)?.data?.system
+    );
     expect(dataCalls.length).toBeGreaterThan(6);
     for (const call of dataCalls) {
       expect(call.ctx, call.method).toMatchObject({ user: { id: "u1" }, data: { tenant: "t1" } });

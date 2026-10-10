@@ -14,6 +14,7 @@ Documentation: <https://docs.cognipeer.com/agent-server/guide/getting-started>
 - 🌐 **Framework Agnostic**: Works with Express, Next.js, Fastify, and raw Node HTTP
 - 🧩 **Request Context & Dynamic Agents**: Resolve user/tenant per request, serve a different agent list and storage scope per request
 - 📁 **File Management**: File uploads and viewing files sent by AI
+- ⏯️ **Runs that outlive the connection**: a turn keeps running when the client disconnects; cancel it, follow it from another client (event log + SSE), one turn at a time per conversation across server instances
 
 ## Installation
 
@@ -145,6 +146,9 @@ export const { GET, POST, PATCH, DELETE, OPTIONS } =
 | GET    | /conversations/:id/messages | List messages                     |
 | POST   | /conversations/:id/messages | Send message                      |
 | POST   | /conversations/:id/actions/:actionId | Resolve a pending tool approval / question |
+| POST   | /conversations/:id/cancel   | Cancel the running turn (or the open approvals) |
+| GET    | /conversations/:id/events   | The conversation's event log  |
+| GET    | /conversations/:id/events/stream | Replay and follow the event log (SSE) |
 | POST   | /files                      | Upload file                       |
 | GET    | /files/:fileId              | File metadata                     |
 | GET    | /files/:fileId/content      | Download file                     |

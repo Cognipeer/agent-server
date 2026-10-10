@@ -71,7 +71,8 @@ GET /tasks?agentId=your-agent-id&status=completed&limit=20&offset=0
 
 **Query Parameters**:
 - `agentId` (optional): Filter by agent ID
-- `status` (optional): Filter by status (`pending`, `running`, `completed`, `failed`)
+- `status` (optional): Filter by status (`pending`, `running`, `completed`, `failed`, `waiting_for_input`, `cancelled`)
+- `conversationId` (optional): Filter by the conversation the task runs in
 - `limit` (optional): Number of tasks to return (default: 20)
 - `offset` (optional): Number of tasks to skip (default: 0)
 
@@ -115,6 +116,9 @@ GET /tasks/:taskId
 }
 ```
 
+A task that is `waiting_for_input` on an approval or a question adds `pendingActions` (answer them on the task's conversation, see below); the partial
+`result` is what the agent said so far.
+
 ### Get Task Status
 ```http
 GET /tasks/:taskId/status
@@ -154,6 +158,32 @@ GET /tasks/:taskId/result
   }
 }
 ```
+
+### Cancel a Task
+```http
+POST /tasks/:taskId/cancel
+```
+
+Stops the turn the task is running (the agent sees the abort signal, see [Runs](/guide/runs#cancel)) or cancels the actions it waits on, and sets the
+status to `cancelled`. `200` with `{ task }`; `202` while the run is still winding down or runs on another node; `409 task_finished` for a task that has
+completed or failed; cancelling a cancelled task is a no-op.
+
+## Tasks run in a conversation
+
+Each task gets a conversation of its own (`task.conversationId`, created when it starts) and runs through the same machinery as a message: the same
+[event log](/guide/runs#the-event-log), cancellation, and approvals.
+
+- The task's `input` (and `files`) is the first user message; a **comment** on a finished or waiting task is the next one, in the same conversation, so the agent sees the whole exchange.
+- When the agent pauses for a tool approval or a question, the task becomes `waiting_for_input` and `GET /tasks/:id` lists the `pendingActions`. Answer them with
+  `POST /conversations/:conversationId/actions/:actionId`; when the turn finishes, the task is `completed` with the result (or `waiting_for_input` again if it pauses again).
+  A comment on a task that waits on an action is a `409 action_pending`; a comment on a task that is `running` is a `409 task_busy`.
+- A custom handler that asks for clarification the old way (`metadata.waitingForInput: true` in its result) still works: the question is added as an agent comment,
+  and the next user comment is the answer. Handlers now receive the task's real conversation id (it used to be `task_<id>`), and `metadata.comments` as before.
+- Follow a task live with `GET /conversations/:conversationId/events/stream`; list a conversation's tasks with `GET /tasks?conversationId=`.
+- The task's conversation is an ordinary conversation of the task's user (`metadata: { source: 'task', taskId }`), so it also shows up in `GET /conversations`; a UI that lists chats can filter on `metadata.source`. It gets no generated title.
+
+Statuses: `pending` -> `running` -> `completed` | `failed` | `cancelled`, or `waiting_for_input` (then `running` again). A task that was `running` when its
+server died is set to `failed` ("The server stopped while the task was running") at the next start, see [Recovery](/guide/runs#recovery).
 
 ## Callback Notifications
 
@@ -243,6 +273,7 @@ CREATE TABLE agent_server_tasks (
   id VARCHAR(64) PRIMARY KEY,
   agent_id VARCHAR(255) NOT NULL,
   user_id VARCHAR(255),
+  conversation_id VARCHAR(64),   -- the conversation the task runs in
   status VARCHAR(50) NOT NULL DEFAULT 'pending',
   callback_url VARCHAR(2000),
   input TEXT NOT NULL,
@@ -272,10 +303,10 @@ Collections: `tasks` and `task_results` with appropriate indexes.
 ### Background Processing Flow
 
 1. Task created → status: `pending`
-2. Background processor starts → status: `running`, `startedAt` set
-3. Agent processes the task
-4. Result saved → status: `completed`, `completedAt` set
-5. Callback notification sent (if URL provided)
+2. Background processor starts → status: `running`, `startedAt` set; a conversation is created for the task (`conversationId`)
+3. The agent processes the input as a turn of that conversation
+4. Result saved → status: `completed`, `completedAt` set (or `waiting_for_input` with the partial result and `pendingActions`, or `cancelled`)
+5. Callback notification sent (if URL provided; `status` is `completed`, `failed`, `waiting_for_input` or `cancelled`)
 6. On error → status: `failed`, `error` message saved
 
 ## Best Practices

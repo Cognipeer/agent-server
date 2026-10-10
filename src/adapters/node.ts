@@ -181,7 +181,14 @@ export function createNodeHandler(server: AgentServer, options: NodeHandlerOptio
     let closed = false;
     res.once("close", () => {
       closed = true;
+      // End the stream now: a follower may have nothing to say for a long time. The run it watched goes on.
+      result.close?.();
     });
+    // Gone before the stream could start: there will be no "close" event to tell us
+    if (res.destroyed) {
+      closed = true;
+      result.close?.();
+    }
 
     try {
       for await (const chunk of result.stream!) {

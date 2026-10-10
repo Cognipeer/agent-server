@@ -8,10 +8,19 @@
  * changes what is stored.
  */
 
-import { BaseStorageProvider } from "./base.js";
+import { BaseStorageProvider, type EventQuery, type StoredEventInput } from "./base.js";
 import { NotFoundError, StorageLimitError } from "../../types.js";
+import { MemoryEventLog } from "../../events.js";
 import { MAX_BUFFER_BYTES, pageResult } from "./shared.js";
 import type {
+  AcquireLeaseParams,
+  AcquireLeaseResult,
+  ConversationEvent,
+  EventSummary,
+  Lease,
+  ReleaseLeaseParams,
+  RenewLeaseParams,
+  RequestContext,
   Conversation,
   Message,
   FileRecord,
@@ -66,6 +75,8 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
   private totalFileSize = 0;
   private tasks: Map<string, Task> = new Map();
   private taskResults: Map<string, TaskResult> = new Map(); // taskId -> result
+  private eventLog = new MemoryEventLog();
+  private leases: Map<string, Lease> = new Map();
 
   constructor(config: InMemoryConfig = {}) {
     super();
@@ -76,6 +87,8 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
     return {
       ...super.capabilities(),
       maxFileBytes: Math.min(this.config.maxFileStorage || DEFAULT_MAX_FILE_STORAGE, MAX_BUFFER_BYTES),
+      events: true,
+      leases: true,
     };
   }
 
@@ -105,6 +118,8 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
     this.fileContents.clear();
     this.tasks.clear();
     this.taskResults.clear();
+    this.eventLog.clear();
+    this.leases.clear();
     this.totalFileSize = 0;
   }
 
@@ -231,6 +246,7 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
     }
     this.messages.delete(id);
     this.conversations.delete(id);
+    this.eventLog.deleteConversation(id);
     this.seqs.delete(id);
   }
 
@@ -426,6 +442,7 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
       id,
       agentId: params.agentId,
       userId: params.userId,
+      conversationId: params.conversationId,
       status: "pending",
       callbackUrl: params.callbackUrl,
       input: params.input,
@@ -460,6 +477,9 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
     if (params.userId) {
       tasks = tasks.filter((t) => t.userId === params.userId);
     }
+    if (params.conversationId) {
+      tasks = tasks.filter((t) => t.conversationId === params.conversationId);
+    }
     if (params.status) {
       tasks = tasks.filter((t) => t.status === params.status);
     }
@@ -488,6 +508,7 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
     const updated: Task = {
       ...task,
       status: params.status !== undefined ? params.status : task.status,
+      conversationId: params.conversationId !== undefined ? params.conversationId : task.conversationId,
       startedAt: params.startedAt !== undefined ? params.startedAt : task.startedAt,
       completedAt: params.completedAt !== undefined ? params.completedAt : task.completedAt,
       error: params.error !== undefined ? params.error : task.error,
@@ -537,6 +558,105 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
   protected async _getTaskResult(taskId: string): Promise<TaskResult | null> {
     const result = this.taskResults.get(taskId);
     return result ? copy(result) : null;
+  }
+
+  // ============================================================================
+  // Events
+  // ============================================================================
+
+  protected async _appendEvents(
+    conversationId: string,
+    events: StoredEventInput[],
+    ctx?: RequestContext
+  ): Promise<ConversationEvent[]> {
+    if (!this.conversations.has(conversationId)) throw new NotFoundError("Conversation", conversationId);
+    return this.eventLog.append(conversationId, events, ctx);
+  }
+
+  protected async _listEvents(
+    conversationId: string,
+    query: EventQuery,
+    ctx?: RequestContext
+  ): Promise<ConversationEvent[]> {
+    return (await this.eventLog.list(conversationId, query, ctx)).events;
+  }
+
+  protected async _eventSummaries(
+    conversationIds: string[],
+    ctx?: RequestContext
+  ): Promise<Record<string, EventSummary>> {
+    return this.eventLog.summary(conversationIds, ctx);
+  }
+
+  protected async _pruneEvents(before: Date, ctx?: RequestContext): Promise<number> {
+    return this.eventLog.prune(before, ctx);
+  }
+
+  // ============================================================================
+  // Leases
+  // ============================================================================
+
+  private copyLease(lease: Lease): Lease {
+    return structuredClone(lease);
+  }
+
+  protected async _acquireLease(
+    params: AcquireLeaseParams & { now: Date; expiresAt: Date }
+  ): Promise<AcquireLeaseResult> {
+    const current = this.leases.get(params.key);
+    const live = current && current.expiresAt.getTime() > params.now.getTime();
+    if (current && live && current.owner !== params.owner) {
+      return { acquired: false, lease: this.copyLease(current) };
+    }
+    const lease: Lease = {
+      key: params.key,
+      owner: params.owner,
+      expiresAt: params.expiresAt,
+      data: params.data ?? {},
+      cancelRequested: false,
+    };
+    this.leases.set(params.key, lease);
+    // An expired lease is the residue of a holder that died
+    const takenOver = current && !live ? this.copyLease(current) : undefined;
+    return { acquired: true, lease: this.copyLease(lease), ...(takenOver ? { takenOver } : {}) };
+  }
+
+  protected async _renewLease(params: RenewLeaseParams & { now: Date; expiresAt: Date }): Promise<Lease | null> {
+    const current = this.leases.get(params.key);
+    if (!current || current.owner !== params.owner || current.expiresAt.getTime() <= params.now.getTime()) {
+      return null;
+    }
+    current.expiresAt = params.expiresAt;
+    return this.copyLease(current);
+  }
+
+  protected async _releaseLease(params: ReleaseLeaseParams): Promise<boolean> {
+    const current = this.leases.get(params.key);
+    if (!current || current.owner !== params.owner) return false;
+    this.leases.delete(params.key);
+    return true;
+  }
+
+  protected async _getLeases(keys: string[], now: Date): Promise<Lease[]> {
+    return keys
+      .map((key) => this.leases.get(key))
+      .filter((lease): lease is Lease => !!lease && lease.expiresAt.getTime() > now.getTime())
+      .map((lease) => this.copyLease(lease));
+  }
+
+  protected async _markLeaseCancel(key: string, now: Date): Promise<boolean> {
+    const current = this.leases.get(key);
+    if (!current || current.expiresAt.getTime() <= now.getTime()) return false;
+    current.cancelRequested = true;
+    return true;
+  }
+
+  protected async _listExpiredLeases(params: { prefix?: string; limit: number; now: Date }): Promise<Lease[]> {
+    return [...this.leases.values()]
+      .filter((l) => l.expiresAt.getTime() <= params.now.getTime() && (!params.prefix || l.key.startsWith(params.prefix)))
+      .sort((a, b) => a.expiresAt.getTime() - b.expiresAt.getTime() || a.key.localeCompare(b.key))
+      .slice(0, params.limit)
+      .map((lease) => this.copyLease(lease));
   }
 
   // ============================================================================

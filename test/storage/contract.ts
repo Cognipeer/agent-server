@@ -860,6 +860,344 @@ export function runStorageContract(
     });
 
     // ------------------------------------------------------------------------
+    describe("events", () => {
+      const events = () => {
+        const store = s().events;
+        if (!store) throw new Error("this provider has no event log");
+        return store;
+      };
+      const event = (type: string, data: Record<string, unknown> = {}, runId?: string) => ({ type, data, runId });
+
+      it("is reported by capabilities and exposed", () => {
+        expect(caps().events).toBe(true);
+        expect(s().events).toBeDefined();
+      });
+
+      it("numbers a conversation's events 1, 2, 3 in the order they were appended, across calls", async () => {
+        const conv = await newConversation();
+        const first = await events().append(conv.id, [event("user.message", { content: "hi" }), event("session.status_running", { trigger: "message" })]);
+        expect(first.map((e) => e.seq)).toEqual([1, 2]);
+        expect(first[0]).toMatchObject({ conversationId: conv.id, type: "user.message", data: { content: "hi" } });
+        expect(first[0]!.createdAt).toBeInstanceOf(Date);
+        const second = await events().append(conv.id, [event("agent.message", { content: "yo" })]);
+        expect(second.map((e) => e.seq)).toEqual([3]);
+
+        const page = await events().list(conv.id);
+        expect(page.events.map((e) => [e.seq, e.type])).toEqual([[1, "user.message"], [2, "session.status_running"], [3, "agent.message"]]);
+        expect(page).toMatchObject({ hasMore: false, lastSeq: 3 });
+      });
+
+      it("keeps the sequences of different conversations apart", async () => {
+        const [a, b] = [await newConversation(), await newConversation()];
+        await events().append(a.id, [event("x"), event("x"), event("x")]);
+        expect((await events().append(b.id, [event("x")]))[0]!.seq).toBe(1);
+        expect((await events().list(a.id)).events).toHaveLength(3);
+        expect((await events().list(b.id)).events).toHaveLength(1);
+      });
+
+      it("reads back what was written: data exactly as JSON, run id, and an empty data as {}", async () => {
+        const conv = await newConversation();
+        const [stored] = await events().append(conv.id, [event("agent.tool_use", awkwardJson(), "run_abc")]);
+        const [bare] = await events().append(conv.id, [{ type: "session.work_done" }]);
+        const read = (await events().list(conv.id)).events;
+        expect(read[0]!.data).toEqual(jsonRoundTrip(awkwardJson()));
+        expect(stored!.data).toEqual(jsonRoundTrip(awkwardJson()));
+        expect(read[0]!.runId).toBe("run_abc");
+        expect(read[1]!.runId).toBeUndefined();
+        expect(read[1]!.data).toEqual({});
+        expect(bare!.data).toEqual({});
+        expect(read[0]!.createdAt).toEqual(stored!.createdAt);
+      });
+
+      it("lists after a cursor, by type, newest first, with hasMore / lastSeq as the paging cursor", async () => {
+        const conv = await newConversation();
+        await events().append(conv.id, Array.from({ length: 10 }, (_, i) => event(i % 2 ? "b" : "a", { i })));
+
+        const first = await events().list(conv.id, { limit: 4 });
+        expect(first.events.map((e) => e.seq)).toEqual([1, 2, 3, 4]);
+        expect(first).toMatchObject({ hasMore: true, lastSeq: 4 });
+        const next = await events().list(conv.id, { after: first.lastSeq, limit: 4 });
+        expect(next.events.map((e) => e.seq)).toEqual([5, 6, 7, 8]);
+        const last = await events().list(conv.id, { after: next.lastSeq, limit: 4 });
+        expect(last.events.map((e) => e.seq)).toEqual([9, 10]);
+        expect(last).toMatchObject({ hasMore: false, lastSeq: 10 });
+
+        // an empty page keeps the cursor
+        expect(await events().list(conv.id, { after: 10 })).toMatchObject({ events: [], hasMore: false, lastSeq: 10 });
+        expect(await events().list(conv.id, { after: 99 })).toMatchObject({ events: [], lastSeq: 99 });
+
+        expect((await events().list(conv.id, { types: ["b"] })).events.map((e) => e.seq)).toEqual([2, 4, 6, 8, 10]);
+        expect((await events().list(conv.id, { types: ["a", "b"], after: 8 })).events.map((e) => e.seq)).toEqual([9, 10]);
+        expect((await events().list(conv.id, { order: "desc", limit: 3 })).events.map((e) => e.seq)).toEqual([10, 9, 8]);
+        expect((await events().list(conv.id, { order: "desc", before: 4, limit: 10 })).events.map((e) => e.seq)).toEqual([3, 2, 1]);
+        expect((await events().list(conv.id, { types: ["a"], order: "desc", limit: 1 })).events.map((e) => e.seq)).toEqual([9]);
+      });
+
+      it("clamps the page size", async () => {
+        const conv = await newConversation();
+        await events().append(conv.id, Array.from({ length: 5 }, () => event("x")));
+        expect((await events().list(conv.id, { limit: 0 })).events).toHaveLength(5);
+        expect((await events().list(conv.id, { limit: -3 })).events).toHaveLength(5);
+        expect((await events().list(conv.id, { limit: 2 })).events).toHaveLength(2);
+        expect((await events().list(conv.id, { limit: 5_000_000 })).events).toHaveLength(5);
+      });
+
+      it("lists nothing for a conversation without events, and refuses to append to one that does not exist", async () => {
+        const conv = await newConversation();
+        expect(await events().list(conv.id)).toMatchObject({ events: [], hasMore: false, lastSeq: 0 });
+        expect(await events().list("conv_never-existed")).toMatchObject({ events: [] });
+        await expect(events().append("conv_never-existed", [event("x")])).rejects.toBeInstanceOf(NotFoundError);
+        expect(await events().append(conv.id, [])).toEqual([]);
+        await expect(events().append(conv.id, [{ type: "" }])).rejects.toBeInstanceOf(ValidationError);
+        await expect(events().append(conv.id, [{ type: "t".repeat(65) }])).rejects.toBeInstanceOf(ValidationError);
+        await expect(events().append(conv.id, [{ type: "x", runId: "r".repeat(65) }])).rejects.toBeInstanceOf(ValidationError);
+        // a refused batch stores nothing
+        await expect(events().append(conv.id, [event("ok"), { type: "" }])).rejects.toBeInstanceOf(ValidationError);
+        expect((await events().list(conv.id)).events).toHaveLength(0);
+      });
+
+      it("hands out unique, gap-free sequence numbers to appenders running at the same time", async () => {
+        const conv = await newConversation();
+        const results = await Promise.all(
+          Array.from({ length: 24 }, (_, i) => events().append(conv.id, i % 3 === 0 ? [event("x", { i }), event("y", { i })] : [event("x", { i })]))
+        );
+        const all = (await events().list(conv.id, { limit: 1000 })).events;
+        const expected = results.reduce((n, r) => n + r.length, 0);
+        expect(all).toHaveLength(expected);
+        expect(all.map((e) => e.seq)).toEqual(Array.from({ length: expected }, (_, i) => i + 1));
+        // one append's events are consecutive
+        for (const result of results) {
+          for (let i = 1; i < result.length; i++) expect(result[i]!.seq).toBe(result[i - 1]!.seq + 1);
+        }
+      });
+
+      it("summarises the last sequence number and the stop reason of the last finished turn", async () => {
+        const [a, b, none] = [await newConversation(), await newConversation(), await newConversation()];
+        await events().append(a.id, [event("user.message"), event("session.status_running"), event("session.status_idle", { stop_reason: "end_turn" })]);
+        await events().append(b.id, [event("session.status_running"), event("session.status_idle", { stop_reason: "requires_action" }), event("action.resolved"), event("session.status_running")]);
+
+        const summary = await events().summary!([a.id, b.id, none.id, "conv_never-existed"]);
+        expect(summary[a.id]).toEqual({ lastSeq: 3, stopReason: "end_turn" });
+        // a new turn clears the reason of the previous one
+        expect(summary[b.id]).toEqual({ lastSeq: 4 });
+        expect(summary[none.id]).toBeUndefined();
+        expect(summary["conv_never-existed"]).toBeUndefined();
+
+        await events().append(b.id, [event("session.status_idle", { stop_reason: "cancelled" })]);
+        expect((await events().summary!([b.id]))[b.id]).toEqual({ lastSeq: 5, stopReason: "cancelled" });
+        expect(await events().summary!([])).toEqual({});
+      });
+
+      it("goes with its conversation", async () => {
+        const conv = await newConversation();
+        await events().append(conv.id, [event("x"), event("session.status_idle", { stop_reason: "end_turn" })]);
+        await s().deleteConversation(conv.id);
+        expect((await events().list(conv.id)).events).toEqual([]);
+        expect((await events().summary!([conv.id]))[conv.id]).toBeUndefined();
+        await expect(events().append(conv.id, [event("x")])).rejects.toBeInstanceOf(NotFoundError);
+      });
+
+      it("survives a restart and keeps counting", async () => {
+        const conv = await newConversation();
+        await events().append(conv.id, [event("x", { n: 1 }), event("session.status_idle", { stop_reason: "end_turn" })]);
+        const reopened = await handle.reopen();
+        expect((await reopened.events!.list(conv.id)).events.map((e) => e.seq)).toEqual([1, 2]);
+        expect((await reopened.events!.append(conv.id, [event("x", { n: 3 })]))[0]!.seq).toBe(3);
+        expect((await reopened.events!.summary!([conv.id]))[conv.id]).toEqual({ lastSeq: 3, stopReason: "end_turn" });
+      });
+
+      it("prunes old events, keeps the newer ones, and keeps counting from where it was", async () => {
+        const conv = await newConversation();
+        await withFrozenDate(T0, async (clock) => {
+          await events().append(conv.id, [event("old"), event("old")]);
+          clock.set(T0 + 10_000);
+          await events().append(conv.id, [event("new")]);
+        });
+        expect(await events().prune!(new Date(T0 + 5_000))).toBeGreaterThanOrEqual(2);
+        expect((await events().list(conv.id)).events.map((e) => [e.seq, e.type])).toEqual([[3, "new"]]);
+        expect((await events().append(conv.id, [event("after")]))[0]!.seq).toBe(4);
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    describe("leases", () => {
+      const lease = () => {
+        const provider = s();
+        if (!provider.acquireLease) throw new Error("this provider has no leases");
+        return provider as Required<Pick<StorageProvider, "acquireLease" | "renewLease" | "releaseLease" | "getLeases" | "markLeaseCancel" | "listExpiredLeases">>;
+      };
+      const key = () => uniq("lease");
+
+      it("is reported by capabilities", () => {
+        expect(caps().leases).toBe(true);
+      });
+
+      it("is held by the first asker and refused to the second, who is told who holds it", async () => {
+        const k = key();
+        const first = await lease().acquireLease({ key: k, owner: "node-a", ttlMs: 60_000, data: { runId: "run_1", nested: { a: [1, 2] } } });
+        expect(first).toMatchObject({ acquired: true, lease: { key: k, owner: "node-a", data: { runId: "run_1", nested: { a: [1, 2] } } } });
+        expect((first as { takenOver?: unknown }).takenOver).toBeUndefined();
+        expect((first as { lease: { expiresAt: Date } }).lease.expiresAt.getTime()).toBeGreaterThan(Date.now() + 30_000);
+
+        const second = await lease().acquireLease({ key: k, owner: "node-b", ttlMs: 60_000 });
+        expect(second).toMatchObject({ acquired: false, lease: { key: k, owner: "node-a", data: { runId: "run_1" } } });
+        // the loser did not change anything
+        expect((await lease().getLeases([k]))[0]).toMatchObject({ owner: "node-a", data: { runId: "run_1" } });
+      });
+
+      it("can be acquired again by its own owner (it renews and replaces the data)", async () => {
+        const k = key();
+        await lease().acquireLease({ key: k, owner: "node-a", ttlMs: 60_000, data: { v: 1 } });
+        const again = await lease().acquireLease({ key: k, owner: "node-a", ttlMs: 60_000, data: { v: 2 } });
+        expect(again).toMatchObject({ acquired: true, lease: { data: { v: 2 } } });
+        expect((again as { takenOver?: unknown }).takenOver).toBeUndefined();
+      });
+
+      it("is taken over once it has expired, and the taker is handed the residue", async () => {
+        const k = key();
+        await withFrozenDate(T0, async (clock) => {
+          await lease().acquireLease({ key: k, owner: "dead-node", ttlMs: 1_000, data: { runId: "run_dead" } });
+          clock.set(T0 + 500);
+          expect(await lease().acquireLease({ key: k, owner: "node-b", ttlMs: 1_000 })).toMatchObject({ acquired: false });
+          clock.set(T0 + 1_500);
+          const taken = await lease().acquireLease({ key: k, owner: "node-b", ttlMs: 1_000, data: { runId: "run_new" } });
+          expect(taken).toMatchObject({
+            acquired: true,
+            lease: { owner: "node-b", data: { runId: "run_new" } },
+            takenOver: { key: k, owner: "dead-node", data: { runId: "run_dead" } },
+          });
+          // the old holder cannot renew or release what is no longer its own
+          expect(await lease().renewLease({ key: k, owner: "dead-node", ttlMs: 1_000 })).toBeNull();
+          expect(await lease().releaseLease({ key: k, owner: "dead-node" })).toBe(false);
+          expect((await lease().getLeases([k]))[0]).toMatchObject({ owner: "node-b" });
+        });
+      });
+
+      it("is renewed only by its owner and only while it is alive", async () => {
+        const k = key();
+        await withFrozenDate(T0, async (clock) => {
+          await lease().acquireLease({ key: k, owner: "node-a", ttlMs: 1_000 });
+          expect(await lease().renewLease({ key: k, owner: "node-b", ttlMs: 5_000 })).toBeNull();
+          clock.set(T0 + 800);
+          const renewed = await lease().renewLease({ key: k, owner: "node-a", ttlMs: 1_000 });
+          expect(renewed!.expiresAt.getTime()).toBe(T0 + 1_800);
+          clock.set(T0 + 1_500); // past the first expiry, inside the renewed one
+          expect(await lease().renewLease({ key: k, owner: "node-a", ttlMs: 1_000 })).not.toBeNull();
+          clock.set(T0 + 10_000);
+          expect(await lease().renewLease({ key: k, owner: "node-a", ttlMs: 1_000 })).toBeNull();
+        });
+        expect(await lease().renewLease({ key: key(), owner: "node-a", ttlMs: 1_000 })).toBeNull();
+      });
+
+      it("is released by its owner, not by anybody else", async () => {
+        const k = key();
+        await lease().acquireLease({ key: k, owner: "node-a", ttlMs: 60_000 });
+        expect(await lease().releaseLease({ key: k, owner: "node-b" })).toBe(false);
+        expect(await lease().getLeases([k])).toHaveLength(1);
+        expect(await lease().releaseLease({ key: k, owner: "node-a" })).toBe(true);
+        expect(await lease().getLeases([k])).toEqual([]);
+        expect(await lease().releaseLease({ key: k, owner: "node-a" })).toBe(false);
+        expect(await lease().acquireLease({ key: k, owner: "node-b", ttlMs: 60_000 })).toMatchObject({ acquired: true });
+      });
+
+      it("reports the live ones among the keys asked for, not the expired or unknown ones", async () => {
+        const [live, dead, never] = [key(), key(), key()];
+        await withFrozenDate(T0, async (clock) => {
+          await lease().acquireLease({ key: live, owner: "a", ttlMs: 60_000 });
+          await lease().acquireLease({ key: dead, owner: "a", ttlMs: 1_000 });
+          clock.set(T0 + 5_000);
+          const found = await lease().getLeases([live, dead, never, live]);
+          expect(found.map((l) => l.key)).toEqual([live]);
+        });
+        expect(await lease().getLeases([])).toEqual([]);
+      });
+
+      it("carries a cancel request to the holder's next renewal", async () => {
+        const k = key();
+        await withFrozenDate(T0, async (clock) => {
+          await lease().acquireLease({ key: k, owner: "node-a", ttlMs: 10_000 });
+          expect((await lease().renewLease({ key: k, owner: "node-a", ttlMs: 10_000 }))!.cancelRequested).toBeFalsy();
+          expect(await lease().markLeaseCancel(k)).toBe(true);
+          expect((await lease().getLeases([k]))[0]!.cancelRequested).toBe(true);
+          expect((await lease().renewLease({ key: k, owner: "node-a", ttlMs: 10_000 }))!.cancelRequested).toBe(true);
+          expect(await lease().markLeaseCancel(key())).toBe(false);
+          clock.set(T0 + 60_000);
+          expect(await lease().markLeaseCancel(k)).toBe(false);
+          // a new holder starts without the old request
+          await lease().acquireLease({ key: k, owner: "node-b", ttlMs: 10_000 });
+          expect((await lease().renewLease({ key: k, owner: "node-b", ttlMs: 10_000 }))!.cancelRequested).toBeFalsy();
+        });
+      });
+
+      it("lists the expired ones, oldest first, by prefix, and leaves the live ones out", async () => {
+        const prefix = uniq("sweep") + ":";
+        await withFrozenDate(T0, async (clock) => {
+          await lease().acquireLease({ key: `${prefix}b`, owner: "a", ttlMs: 2_000, data: { n: 2 } });
+          await lease().acquireLease({ key: `${prefix}a`, owner: "a", ttlMs: 1_000, data: { n: 1 } });
+          await lease().acquireLease({ key: `${prefix}live`, owner: "a", ttlMs: 600_000 });
+          await lease().acquireLease({ key: uniq("other:x"), owner: "a", ttlMs: 1_000 });
+          clock.set(T0 + 10_000);
+          const expired = await lease().listExpiredLeases({ prefix });
+          expect(expired.map((l) => l.key)).toEqual([`${prefix}a`, `${prefix}b`]);
+          expect(expired[0]).toMatchObject({ owner: "a", data: { n: 1 } });
+          expect(await lease().listExpiredLeases({ prefix, limit: 1 })).toHaveLength(1);
+          expect(await lease().listExpiredLeases({ prefix: `${prefix}live` })).toEqual([]);
+          // a prefix is a prefix, not a pattern
+          expect(await lease().listExpiredLeases({ prefix: "%" })).toEqual([]);
+          expect(await lease().listExpiredLeases({ prefix: ".*" })).toEqual([]);
+        });
+      });
+
+      it("goes to exactly one of several askers that ask at the same time", async () => {
+        const k = key();
+        const results = await Promise.all(
+          Array.from({ length: 12 }, (_, i) => lease().acquireLease({ key: k, owner: `node-${i}`, ttlMs: 60_000 }))
+        );
+        expect(results.filter((r) => r.acquired)).toHaveLength(1);
+        const winner = results.find((r) => r.acquired)!.lease.owner;
+        for (const r of results.filter((r) => !r.acquired)) expect(r.lease.owner).toBe(winner);
+      });
+
+      it("keeps a lease across a restart", async () => {
+        const k = key();
+        await lease().acquireLease({ key: k, owner: "node-a", ttlMs: 60_000, data: { runId: "run_x" } });
+        const reopened = await handle.reopen();
+        expect((await reopened.getLeases!([k]))[0]).toMatchObject({ owner: "node-a", data: { runId: "run_x" } });
+      });
+
+      it("refuses a malformed key, owner or lifetime", async () => {
+        await expect(lease().acquireLease({ key: "", owner: "a", ttlMs: 1000 })).rejects.toBeInstanceOf(ValidationError);
+        await expect(lease().acquireLease({ key: "k".repeat(129), owner: "a", ttlMs: 1000 })).rejects.toBeInstanceOf(ValidationError);
+        await expect(lease().acquireLease({ key: key(), owner: "", ttlMs: 1000 })).rejects.toBeInstanceOf(ValidationError);
+        await expect(lease().acquireLease({ key: key(), owner: "a", ttlMs: 0 })).rejects.toBeInstanceOf(ValidationError);
+        await expect(lease().acquireLease({ key: key(), owner: "a", ttlMs: Number.NaN })).rejects.toBeInstanceOf(ValidationError);
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    describe("tasks that run in a conversation", () => {
+      it("links a task to a conversation, filters by it, and updates the link", async () => {
+        const conv = await newConversation();
+        const agentId = uniq("agent");
+        const linked = await s().createTask({ agentId, input: "linked", conversationId: conv.id });
+        const plain = await s().createTask({ agentId, input: "plain" });
+        expect(linked.conversationId).toBe(conv.id);
+        expect(plain.conversationId).toBeUndefined();
+        expect((await s().getTask(linked.id))!.conversationId).toBe(conv.id);
+
+        const later = await s().updateTask(plain.id, { conversationId: conv.id });
+        expect(later.conversationId).toBe(conv.id);
+        const found = await s().getTasks({ conversationId: conv.id, limit: 100 });
+        expect(found.data.map((t) => t.id).sort()).toEqual([linked.id, plain.id].sort());
+        expect((await s().getTasks({ conversationId: uniq("conv") })).data).toEqual([]);
+
+        // it also takes the new "cancelled" status
+        expect((await s().updateTask(plain.id, { status: "cancelled" })).status).toBe("cancelled");
+        expect((await s().getTasks({ conversationId: conv.id, status: "cancelled" })).data.map((t) => t.id)).toEqual([plain.id]);
+      });
+    });
+
+    // ------------------------------------------------------------------------
     describe("persistence", () => {
       it("everything written is still there after a restart", async () => {
         const conv = await newConversation({ userId: "u-restart", title: "kept", state: { a: awkwardJson() } });

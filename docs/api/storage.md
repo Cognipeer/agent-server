@@ -296,6 +296,55 @@ Delete a file.
 await storage.deleteFile('file-123');
 ```
 
+### Tasks
+
+`createTask`, `getTask`, `getTasks`, `updateTask`, `deleteTask`, `createTaskResult`, `getTaskResult`. A task records the conversation it runs in
+(`conversationId`, settable on create and update, filterable in `getTasks`) and can be `cancelled`.
+
+### Events
+
+`storage.events` is the conversation's durable event log (`undefined` when the provider has none; check `capabilities().events`).
+
+```typescript
+const events = storage.events!;
+
+// append: atomic, ordered; seq is 1, 2, 3 ... per conversation, with no gaps or repeats
+const stored = await events.append('conv_1', [
+  { type: 'user.message', data: { content: 'hi' }, runId: 'run_1' },
+  { type: 'session.status_running', data: { trigger: 'message' }, runId: 'run_1' },
+]);
+
+// list: oldest first (order: 'desc' for newest first)
+const page = await events.list('conv_1', { after: 40, types: ['agent.message'], limit: 100 });
+// { events: ConversationEvent[], hasMore: boolean, lastSeq: number }
+
+const summary = await events.summary!(['conv_1', 'conv_2']);
+// { conv_1: { lastSeq: 41, stopReason: 'end_turn' } }   (conversations without events are left out)
+
+await events.prune!(new Date(Date.now() - 30 * 86_400_000));   // delete older events; seq keeps counting
+```
+
+An unknown conversation is a `NotFoundError` on `append`. The log is deleted with its conversation.
+
+### Leases
+
+A time-limited claim on a key, held by one owner. The server holds `conv:<conversationId>` for the length of a run.
+
+```typescript
+const result = await storage.acquireLease!({ key: 'conv:conv_1', owner: 'node-a', ttlMs: 60_000, data: { runId: 'run_1' } });
+if (result.acquired) {
+  // result.lease; result.takenOver is the expired lease that was replaced, if any
+} else {
+  // result.lease is the holder's
+}
+
+await storage.renewLease!({ key, owner, ttlMs });        // Lease | null (null: lost)
+await storage.releaseLease!({ key, owner });             // boolean
+await storage.getLeases!([key1, key2]);                  // the live ones
+await storage.markLeaseCancel!(key);                     // ask the holder to stop; it sees `cancelRequested` when it renews
+await storage.listExpiredLeases!({ prefix: 'conv:' });   // the residue of holders that died, oldest first
+```
+
 ## Error Handling
 
 Storage operations may throw:

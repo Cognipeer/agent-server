@@ -98,7 +98,7 @@ async function startPostgres(): Promise<{ backend: Backend; stop?: () => Promise
 export default async function setup({ config, provide }: GlobalSetupContext) {
   // A run filtered to unrelated files does not pay for databases it will not use
   const filters = config.filters ?? [];
-  const wanted = filters.length === 0 || filters.some((f) => /storage|provider|hitl|contract|mongo|postgres|sqlite/i.test(f));
+  const wanted = filters.length === 0 || filters.some((f) => /storage|provider|hitl|runs|contract|mongo|postgres|sqlite/i.test(f));
 
   const stops: Array<() => Promise<void>> = [];
   let mongodb: Backend = { skip: "not needed by the selected tests" };

@@ -231,12 +231,14 @@ export async function runSdkTurn(
   config: unknown,
   allowedTools: ReadonlySet<string>
 ): Promise<{ result: Awaited<ReturnType<HitlSdkAgent["invoke"]>>; pending: PendingAction[] }> {
+  const cancelled = () => (config as { cancellationToken?: { aborted?: boolean } } | undefined)?.cancellationToken?.aborted === true;
   let result = await agent.invoke(input, config);
   let pending = detectPendingActions(result);
   for (
     let i = 0;
     i < MAX_AUTO_APPROVALS &&
     pending.length > 0 &&
+    !cancelled() &&
     supportsSdkPause(agent) &&
     pending.every((a) => a.type === "tool_approval" && allowedTools.has(a.toolName));
     i++

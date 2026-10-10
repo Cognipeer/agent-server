@@ -43,11 +43,30 @@ Content-Type: application/json
 - `rememberForSession` (SDK agents): later pauses on the same tool in this conversation are approved automatically.
 - Answers are matched to options by value or label; anything else counts as free text (only valid when the question allows it).
 
-Errors: `400` malformed or invalid resolution (nothing is consumed - answer again), `404` conversation not found or the agent cannot resolve actions, `409 action_not_pending` for an unknown, already resolved or currently-resolving action.
+Errors: `400` malformed or invalid resolution (nothing is consumed - answer again), `404` conversation not found or the agent cannot resolve actions, `409 action_not_pending` for an unknown or already resolved action, `409 conversation_busy` while the conversation is running a turn - which includes a second answer to the same pause that arrives while the first is being carried out.
+
+Answering is a [run](./runs.md) like a message is: it runs detached from the request (a client that disconnects does not stop it), it can be [cancelled](./runs.md#cancel), and it leaves `action.resolved`, `session.status_running`, ... `session.status_idle` in the conversation's [event log](./runs.md#the-event-log).
+
+## Events
+
+A pause and its resolution are in the event log, so a client that was not connected can follow them (`GET /conversations/:id/events/stream`):
+
+```
+action.required   { action_id, kind: 'tool_approval' | 'user_question', tool_name?, args?, questions?, allow_free_text?, expires_at? }
+session.status_idle { stop_reason: 'requires_action', pending_action_ids: [...] }
+action.resolved   { action_id, kind, decision?, cancelled?, status: 'approved' | 'rejected' | 'answered' | 'cancelled', resolved_by, channel }
+```
+
+`GET /conversations/:id` has `runtime.status: "requires_action"` and `runtime.pendingActionIds` while a pause is open.
+
+## Cancelling a pause
+
+`POST /conversations/:id/cancel` on a conversation that waits on a human cancels what it waits on: an `action.resolved` event (`cancelled: true`) for
+each open action, then `session.status_idle` with `stop_reason: "cancelled"`. The conversation is free for a new message; resolving the old actions is a `409 action_not_pending`.
 
 ## A message while an action is pending
 
-By default the server answers `409 action_pending` (with `error.details.pendingActionIds`) and does nothing. Set `pendingActionPolicy: 'cancel'` to cancel the pending actions instead and process the message normally:
+By default the server answers `409 action_pending` (with `error.details.pendingActionIds`) and does nothing. Set `pendingActionPolicy: 'cancel'` to cancel the pending actions instead (each one gets a `action.resolved` event with `cancelled: true`, `resolved_by: "system"`) and process the message normally:
 
 ```typescript
 createAgentServer({ basePath: '/api', storage, pendingActionPolicy: 'cancel' });
@@ -98,3 +117,5 @@ agentServer.registerCustomAgent('payments', {
 ## Not covered
 
 Expiry/timeouts are not enforced by the server; `expiresAt` is passed through for the UI. Chat Completions and Responses API agents never pause.
+
+A handler that does not honour `signal` is abandoned `runs.cancelGraceMs` after a cancel - see [Runs, Cancel & Reattach](./runs.md#cancel).

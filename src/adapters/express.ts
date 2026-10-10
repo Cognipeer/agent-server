@@ -26,6 +26,9 @@ interface Response {
   set(headers: Record<string, string>): Response;
   write(chunk: string | Buffer): boolean;
   end(): void;
+  /** Node's `ServerResponse` events (`close` when the client goes away). */
+  once(event: "close", listener: () => void): unknown;
+  destroyed?: boolean;
 }
 
 type NextFunction = (error?: unknown) => void;
@@ -127,9 +130,21 @@ export function createExpressMiddleware(
           "X-Accel-Buffering": "no",
         });
 
+        // The client going away ends the stream at once; a run it was watching goes on without it
+        let closed = false;
+        res.once("close", () => {
+          closed = true;
+          result.close?.();
+        });
+        if (res.destroyed) {
+          closed = true;
+          result.close?.();
+        }
+
         // Stream the data
         try {
           for await (const chunk of result.stream) {
+            if (closed) break;
             res.write(chunk);
             // Flush if possible (for nginx buffering)
             if (typeof (res as unknown as { flush?: () => void }).flush === "function") {

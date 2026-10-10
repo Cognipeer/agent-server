@@ -8,10 +8,19 @@
  * 12 MiB by default).
  */
 
-import { BaseStorageProvider } from "./base.js";
+import { BaseStorageProvider, type EventQuery, type StoredEventInput } from "./base.js";
 import { NotFoundError, StorageLimitError } from "../../types.js";
+import { nextStopReason } from "../../events.js";
 import { MAX_BUFFER_BYTES, jsonBytes, nextSeq, pageResult, toBuffer } from "./shared.js";
 import type {
+  AcquireLeaseParams,
+  AcquireLeaseResult,
+  ConversationEvent,
+  EventSummary,
+  Lease,
+  ReleaseLeaseParams,
+  RenewLeaseParams,
+  RequestContext,
   Conversation,
   Message,
   FileRecord,
@@ -44,7 +53,9 @@ interface Db {
 
 interface Collection<T = Document> {
   insertOne(doc: T): Promise<{ insertedId: unknown }>;
+  insertMany(docs: T[], options?: object): Promise<{ insertedCount: number }>;
   findOne(filter: object, options?: object): Promise<T | null>;
+  findOneAndUpdate(filter: object, update: object, options?: object): Promise<T | null>;
   find(filter: object, options?: object): FindCursor<T>;
   updateOne(
     filter: object,
@@ -140,6 +151,8 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       // GridFS: bounded only by what one Buffer can hold
       maxFileBytes: MAX_BUFFER_BYTES,
       maxStateBytes: this.maxStateBytes,
+      events: true,
+      leases: true,
     };
   }
 
@@ -156,6 +169,9 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       fileContents: `${this.collectionPrefix}file_contents`,
       tasks: `${this.collectionPrefix}tasks`,
       taskResults: `${this.collectionPrefix}task_results`,
+      events: `${this.collectionPrefix}events`,
+      eventStreams: `${this.collectionPrefix}event_streams`,
+      leases: `${this.collectionPrefix}leases`,
     };
   }
 
@@ -247,8 +263,17 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
     await tasks.createIndex({ status: 1, createdAt: -1, seq: -1 });
     await tasks.createIndex({ createdAt: -1, seq: -1 });
 
+    await tasks.createIndex({ conversationId: 1 });
+
     const taskResults = this.db.collection(this.collections.taskResults);
     await taskResults.createIndex({ taskId: 1 }, { unique: true });
+
+    // The event log: (conversationId, seq) is the identity; createdAt serves pruning
+    const events = this.db.collection(this.collections.events);
+    await events.createIndex({ conversationId: 1, seq: 1 }, { unique: true });
+    await events.createIndex({ createdAt: 1 });
+    const leases = this.db.collection(this.collections.leases);
+    await leases.createIndex({ expiresAt: 1 });
 
     // The indexes above cover these older, shorter ones; keeping both only slows writes.
     for (const [collection, names] of Object.entries(SUPERSEDED_INDEXES) as Array<
@@ -417,6 +442,9 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
     await this.db
       .collection<MongoMessage>(this.collections.messages)
       .deleteMany({ conversationId: id });
+
+    await this.db.collection(this.collections.events).deleteMany({ conversationId: id });
+    await this.db.collection(this.collections.eventStreams).deleteOne({ _id: id });
 
     await this.db
       .collection<MongoConversation>(this.collections.conversations)
@@ -659,6 +687,7 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       _id: id,
       agentId: params.agentId,
       userId: params.userId || null,
+      conversationId: params.conversationId || null,
       status: "pending",
       callbackUrl: params.callbackUrl || null,
       input: params.input,
@@ -699,6 +728,7 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
     if (params.agentId) filter.agentId = params.agentId;
     if (params.userId) filter.userId = params.userId;
     if (params.status) filter.status = params.status;
+    if (params.conversationId) filter.conversationId = params.conversationId;
 
     // Get total count
     const total = await this.db
@@ -736,6 +766,7 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
     };
 
     if (params.status !== undefined) update.status = params.status;
+    if (params.conversationId !== undefined) update.conversationId = params.conversationId;
     if (params.startedAt !== undefined) update.startedAt = params.startedAt;
     if (params.completedAt !== undefined) update.completedAt = params.completedAt;
     if (params.error !== undefined) update.error = params.error;
@@ -828,6 +859,204 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
   }
 
   // ============================================================================
+  // Events
+  // ============================================================================
+
+  protected async _appendEvents(
+    conversationId: string,
+    events: StoredEventInput[]
+  ): Promise<ConversationEvent[]> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    const exists = await this.db
+      .collection<MongoConversation>(this.collections.conversations)
+      .findOne({ _id: conversationId }, { projection: { _id: 1 } });
+    if (!exists) throw new NotFoundError("Conversation", conversationId);
+
+    // The counter document hands out the sequence numbers atomically: a run of numbers is reserved
+    // with one $inc, so two appenders never get the same one, and the unique index backs that up.
+    const streams = this.db.collection<MongoEventStream>(this.collections.eventStreams);
+    const reserved = await streams.findOneAndUpdate(
+      { _id: conversationId },
+      { $inc: { lastSeq: events.length }, $set: { updatedAt: events[events.length - 1]!.createdAt } },
+      { upsert: true, returnDocument: "after" }
+    );
+    if (!reserved) throw new Error("The event counter could not be reserved");
+    const first = reserved.lastSeq - events.length + 1;
+
+    const docs: MongoEvent[] = events.map((event, i) => ({
+      conversationId,
+      seq: first + i,
+      type: event.type,
+      data: event.data,
+      runId: event.runId ?? null,
+      createdAt: event.createdAt,
+    }));
+    await this.guarded(() => this.db!.collection<MongoEvent>(this.collections.events).insertMany(docs));
+
+    // What the last finished turn stopped for; the appender of a conversation is its run, so no race here
+    const stopReason = nextStopReason(reserved.stopReason, events) ?? null;
+    if (stopReason !== (reserved.stopReason ?? null)) {
+      await streams.updateOne({ _id: conversationId }, { $set: { stopReason } });
+    }
+
+    return docs.map((doc) => this.mapEvent(doc));
+  }
+
+  protected async _listEvents(conversationId: string, query: EventQuery): Promise<ConversationEvent[]> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    const seq: Record<string, number> = { $gt: query.after };
+    if (query.before !== undefined) seq.$lt = query.before;
+    const filter: Record<string, unknown> = { conversationId, seq };
+    if (query.types?.length) filter.type = { $in: query.types };
+
+    const docs = await this.db
+      .collection<MongoEvent>(this.collections.events)
+      .find(filter)
+      .sort({ seq: query.order === "desc" ? -1 : 1 })
+      .limit(query.limit)
+      .toArray();
+    return docs.map((doc) => this.mapEvent(doc));
+  }
+
+  protected async _eventSummaries(conversationIds: string[]): Promise<Record<string, EventSummary>> {
+    if (!this.db) throw new Error("Database not initialized");
+    const docs = await this.db
+      .collection<MongoEventStream>(this.collections.eventStreams)
+      .find({ _id: { $in: conversationIds } })
+      .toArray();
+    const out: Record<string, EventSummary> = {};
+    for (const doc of docs) {
+      out[doc._id] = { lastSeq: doc.lastSeq, ...(doc.stopReason ? { stopReason: doc.stopReason } : {}) };
+    }
+    return out;
+  }
+
+  protected async _pruneEvents(before: Date): Promise<number> {
+    if (!this.db) throw new Error("Database not initialized");
+    const result = await this.db.collection<MongoEvent>(this.collections.events).deleteMany({ createdAt: { $lt: before } });
+    return result.deletedCount;
+  }
+
+  private mapEvent(doc: MongoEvent): ConversationEvent {
+    return {
+      conversationId: doc.conversationId,
+      seq: doc.seq,
+      type: doc.type,
+      data: doc.data,
+      runId: doc.runId || undefined,
+      createdAt: doc.createdAt,
+    };
+  }
+
+  // ============================================================================
+  // Leases
+  // ============================================================================
+
+  private mapLease(doc: MongoLease): Lease {
+    return {
+      key: doc._id,
+      owner: doc.owner,
+      expiresAt: doc.expiresAt,
+      data: doc.data ?? {},
+      cancelRequested: doc.cancelRequested === true,
+    };
+  }
+
+  protected async _acquireLease(
+    params: AcquireLeaseParams & { now: Date; expiresAt: Date },
+    _ctx?: RequestContext
+  ): Promise<AcquireLeaseResult> {
+    if (!this.db) throw new Error("Database not initialized");
+    const leases = this.db.collection<MongoLease>(this.collections.leases);
+
+    // Takes the lease when it is free, expired, or already ours. The upsert of a key somebody else
+    // holds would insert a second document with the same _id: the duplicate-key error is the "held" answer.
+    let previous: MongoLease | null;
+    try {
+      previous = await leases.findOneAndUpdate(
+        { _id: params.key, $or: [{ expiresAt: { $lte: params.now } }, { owner: params.owner }] },
+        {
+          $set: {
+            owner: params.owner,
+            expiresAt: params.expiresAt,
+            data: params.data ?? {},
+            cancelRequested: false,
+          },
+        },
+        { upsert: true, returnDocument: "before" }
+      );
+    } catch (error) {
+      if ((error as { code?: number }).code !== 11000) throw error;
+      const held = await leases.findOne({ _id: params.key });
+      // Released between the two calls: ask again
+      if (!held) return this._acquireLease(params);
+      return { acquired: false, lease: this.mapLease(held) };
+    }
+
+    const lease: Lease = {
+      key: params.key,
+      owner: params.owner,
+      expiresAt: params.expiresAt,
+      data: params.data ?? {},
+      cancelRequested: false,
+    };
+    // An expired lease is the residue of a holder that died
+    return previous && previous.expiresAt.getTime() <= params.now.getTime()
+      ? { acquired: true, lease, takenOver: this.mapLease(previous) }
+      : { acquired: true, lease };
+  }
+
+  protected async _renewLease(params: RenewLeaseParams & { now: Date; expiresAt: Date }): Promise<Lease | null> {
+    if (!this.db) throw new Error("Database not initialized");
+    const doc = await this.db.collection<MongoLease>(this.collections.leases).findOneAndUpdate(
+      { _id: params.key, owner: params.owner, expiresAt: { $gt: params.now } },
+      { $set: { expiresAt: params.expiresAt } },
+      { returnDocument: "after" }
+    );
+    return doc ? this.mapLease(doc) : null;
+  }
+
+  protected async _releaseLease(params: ReleaseLeaseParams): Promise<boolean> {
+    if (!this.db) throw new Error("Database not initialized");
+    const result = await this.db
+      .collection<MongoLease>(this.collections.leases)
+      .deleteOne({ _id: params.key, owner: params.owner });
+    return result.deletedCount > 0;
+  }
+
+  protected async _getLeases(keys: string[], now: Date): Promise<Lease[]> {
+    if (!this.db) throw new Error("Database not initialized");
+    const docs = await this.db
+      .collection<MongoLease>(this.collections.leases)
+      .find({ _id: { $in: keys }, expiresAt: { $gt: now } })
+      .toArray();
+    return docs.map((doc) => this.mapLease(doc));
+  }
+
+  protected async _markLeaseCancel(key: string, now: Date): Promise<boolean> {
+    if (!this.db) throw new Error("Database not initialized");
+    const result = await this.db
+      .collection<MongoLease>(this.collections.leases)
+      .updateOne({ _id: key, expiresAt: { $gt: now } }, { $set: { cancelRequested: true } });
+    return result.matchedCount > 0;
+  }
+
+  protected async _listExpiredLeases(params: { prefix?: string; limit: number; now: Date }): Promise<Lease[]> {
+    if (!this.db) throw new Error("Database not initialized");
+    const filter: Record<string, unknown> = { expiresAt: { $lte: params.now } };
+    if (params.prefix) filter._id = { $regex: `^${params.prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}` };
+    const docs = await this.db
+      .collection<MongoLease>(this.collections.leases)
+      .find(filter)
+      .sort({ expiresAt: 1, _id: 1 })
+      .limit(params.limit)
+      .toArray();
+    return docs.map((doc) => this.mapLease(doc));
+  }
+
+  // ============================================================================
   // Mappers
   // ============================================================================
 
@@ -879,6 +1108,7 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       id: doc._id as string,
       agentId: doc.agentId,
       userId: doc.userId || undefined,
+      conversationId: doc.conversationId || undefined,
       status: doc.status,
       callbackUrl: doc.callbackUrl || undefined,
       input: doc.input,
@@ -959,6 +1189,7 @@ interface MongoTask {
   _id: string;
   agentId: string;
   userId: string | null;
+  conversationId?: string | null;
   status: Task["status"];
   callbackUrl: string | null;
   input: string;
@@ -971,6 +1202,30 @@ interface MongoTask {
   completedAt: Date | null;
   error: string | null;
   seq?: number;
+}
+
+interface MongoEvent {
+  conversationId: string;
+  seq: number;
+  type: string;
+  data: Record<string, unknown>;
+  runId: string | null;
+  createdAt: Date;
+}
+
+interface MongoEventStream {
+  _id: string;
+  lastSeq: number;
+  stopReason?: string | null;
+  updatedAt: Date;
+}
+
+interface MongoLease {
+  _id: string;
+  owner: string;
+  expiresAt: Date;
+  data?: Record<string, unknown>;
+  cancelRequested?: boolean;
 }
 
 interface MongoTaskResult {

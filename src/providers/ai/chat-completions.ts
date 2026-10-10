@@ -153,7 +153,8 @@ function buildMessages(
  */
 export async function invokeChatCompletions(
   config: ChatCompletionsConfig,
-  messages: ChatCompletionsMessage[]
+  messages: ChatCompletionsMessage[],
+  options: { signal?: AbortSignal } = {}
 ): Promise<ChatCompletionsResult> {
   const url = buildUrl(config);
   const allMessages = buildMessages(config, messages);
@@ -170,6 +171,7 @@ export async function invokeChatCompletions(
     method: "POST",
     headers: buildHeaders(config),
     body: JSON.stringify(requestBody),
+    signal: options.signal,
   });
 
   if (!response.ok) {
@@ -199,7 +201,8 @@ export async function invokeChatCompletions(
  */
 export async function* streamChatCompletions(
   config: ChatCompletionsConfig,
-  messages: ChatCompletionsMessage[]
+  messages: ChatCompletionsMessage[],
+  options: { signal?: AbortSignal } = {}
 ): AsyncGenerator<ChatCompletionsStreamEvent, void, unknown> {
   const url = buildUrl(config);
   const allMessages = buildMessages(config, messages);
@@ -217,6 +220,7 @@ export async function* streamChatCompletions(
     method: "POST",
     headers: buildHeaders(config),
     body: JSON.stringify(requestBody),
+    signal: options.signal,
   });
 
   if (!response.ok) {

@@ -46,6 +46,18 @@ export type {
   // Storage provider types
   StorageProvider,
   StorageCapabilities,
+  EventStore,
+  ConversationEvent,
+  NewConversationEvent,
+  ListEventsParams,
+  EventPage,
+  EventSummary,
+  Lease,
+  AcquireLeaseParams,
+  AcquireLeaseResult,
+  RenewLeaseParams,
+  ReleaseLeaseParams,
+  ListExpiredLeasesParams,
   CreateConversationParams,
   GetConversationsParams,
   UpdateConversationParams,
@@ -89,6 +101,13 @@ export type {
   TurnWarning,
   ResolveActionParams,
   AgentCapabilities,
+  StopReason,
+  RuntimeStatus,
+  ConversationRuntime,
+  RunsConfig,
+  ListEventsResponse,
+  WireEvent,
+  CancelConversationResponse,
   ListAgentsResponse,
   ListConversationsResponse,
   GetConversationResponse,
@@ -131,8 +150,13 @@ export {
   StorageLimitError,
 } from "./types.js";
 
+// Run lifecycle and the event log
+export { EVENT_TYPES, MemoryEventLog, nextStopReason } from "./events.js";
+export type { MemoryEventLogOptions } from "./events.js";
+
 // Storage provider exports
 export { BaseStorageProvider } from "./providers/storage/base.js";
+export type { EventQuery, StoredEventInput } from "./providers/storage/base.js";
 export {
   PostgresStorageProvider,
   createPostgresProvider,

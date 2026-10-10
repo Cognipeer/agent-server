@@ -21,7 +21,13 @@ export interface Message {
   toolCalls?: ToolCall[];
   toolCallId?: string;
   files?: FileAttachment[];
+  /**
+   * Assistant messages: `metadata.status` and `metadata.stopReason` say how the turn ended.
+   * The API also reports the status as `status` (derived, never stored).
+   */
   metadata?: Record<string, unknown>;
+  /** How the turn that produced this assistant message ended (API only; see `metadata.stopReason` for why). */
+  status?: MessageStatus;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -54,6 +60,36 @@ export interface Conversation {
   state?: Record<string, unknown>;
   createdAt: Date;
   updatedAt: Date;
+  /**
+   * Where the conversation is in its run lifecycle. Computed by the server for
+   * the API (`GET /conversations`, `GET /conversations/:id`); never stored.
+   */
+  runtime?: ConversationRuntime;
+}
+
+/** Why a turn stopped. Stored on the assistant message (`metadata.stopReason`) and in `session.status_idle` events. */
+export type StopReason =
+  | "end_turn"
+  | "requires_action"
+  | "cancelled"
+  | "max_turns"
+  | "limit"
+  | "budget_reached"
+  | "error";
+
+export type RuntimeStatus = "idle" | "running" | "requires_action" | "budget_paused";
+
+/** The run lifecycle of a conversation, as `GET /conversations` and `GET /conversations/:id` report it. */
+export interface ConversationRuntime {
+  status: RuntimeStatus;
+  /** Why the last turn stopped. Absent while a turn is running. */
+  stopReason?: StopReason;
+  /** Sequence number of the newest event in the conversation's event log (0 when there is none). */
+  lastEventSeq: number;
+  /** Actions the conversation is waiting on. */
+  pendingActionIds: string[];
+  /** The run that is executing now (on this or another node). */
+  activeRunId?: string;
 }
 
 export interface ConversationWithMessages extends Conversation {
@@ -192,6 +228,11 @@ export interface ResolveActionParams {
   metadata?: Record<string, unknown>;
   /** Per-request context resolved by `config.resolveContext` (user + custom data). */
   context?: RequestContext;
+  /**
+   * Aborted when the run is cancelled (`POST /conversations/:id/cancel`). Stop work and return
+   * what you have; a handler that ignores it is abandoned after `runs.cancelGraceMs`.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -218,6 +259,11 @@ export interface ProcessMessageParams {
   metadata?: Record<string, unknown>;
   /** Per-request context resolved by `config.resolveContext` (user + custom data). */
   context?: RequestContext;
+  /**
+   * Aborted when the run is cancelled (`POST /conversations/:id/cancel`). Stop work and return
+   * what you have; a handler that ignores it is abandoned after `runs.cancelGraceMs`.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ProcessMessageResult {
@@ -234,6 +280,11 @@ export interface ProcessMessageResult {
   status?: MessageStatus;
   /** Everything the turn is waiting on. Replaces the conversation's pending set. */
   pendingActions?: PendingAction[];
+  /**
+   * Why the turn stopped, when it was not simply `end_turn` (`max_turns`, `limit`, `budget_reached`).
+   * Derived when omitted: `requires_action` for a pause, `end_turn` otherwise.
+   */
+  stopReason?: StopReason;
 }
 
 /**
@@ -303,6 +354,154 @@ export interface StorageProvider {
   // Task Results
   createTaskResult(params: CreateTaskResultParams, ctx?: RequestContext): Promise<TaskResult>;
   getTaskResult(taskId: string, ctx?: RequestContext): Promise<TaskResult | null>;
+
+  /**
+   * Optional: the durable per-conversation event log (`capabilities().events`). Without it
+   * the server keeps the last `runs.memoryEventLimit` events per conversation in memory:
+   * reattach and replay then work on one node and are lost on restart.
+   */
+  events?: EventStore;
+
+  /**
+   * Optional leases (`capabilities().leases`): at most one run per conversation (and one task
+   * worker per task) across nodes. Without them the server serialises runs in-process only, which is
+   * right for one node and not for several.
+   */
+  acquireLease?(params: AcquireLeaseParams, ctx?: RequestContext): Promise<AcquireLeaseResult>;
+  /** Extends a lease you hold. `null` when it is gone (expired and taken by someone else, or released). */
+  renewLease?(params: RenewLeaseParams, ctx?: RequestContext): Promise<Lease | null>;
+  /** Releases a lease you hold (no-op for anyone else's). Resolves `true` when it was released. */
+  releaseLease?(params: ReleaseLeaseParams, ctx?: RequestContext): Promise<boolean>;
+  /** The leases among `keys` that have not expired. */
+  getLeases?(keys: string[], ctx?: RequestContext): Promise<Lease[]>;
+  /** Asks the holder of a live lease to stop (it sees `cancelRequested` on its next renewal). `false` when there is no live lease. */
+  markLeaseCancel?(key: string, ctx?: RequestContext): Promise<boolean>;
+  /** Leases past their expiry, oldest first: the residue of a holder that died. */
+  listExpiredLeases?(params?: ListExpiredLeasesParams, ctx?: RequestContext): Promise<Lease[]>;
+}
+
+// ============================================================================
+// Event log and leases
+// ============================================================================
+
+/**
+ * One entry of a conversation's event log. `type` and `data` follow the Console client wire
+ * (snake_case): `user.message`, `session.status_running`, `agent.tool_use`, `agent.tool_result`,
+ * `agent.message`, `action.required`, `action.resolved`, `session.usage`, `session.status_idle`,
+ * `session.work_done`, `session.error`, `budget.reached`.
+ */
+export interface ConversationEvent {
+  conversationId: string;
+  /** 1, 2, 3, ... within the conversation; unique with `conversationId`. */
+  seq: number;
+  type: string;
+  data: Record<string, unknown>;
+  /** The run that produced the event (`run_...`); absent for events written outside a run. */
+  runId?: string;
+  createdAt: Date;
+}
+
+export interface NewConversationEvent {
+  type: string;
+  data?: Record<string, unknown>;
+  runId?: string;
+}
+
+export interface ListEventsParams {
+  /** Only events with a larger `seq` (exclusive). */
+  after?: number;
+  /** Only events with a smaller `seq` (exclusive). */
+  before?: number;
+  /** Only these event types. */
+  types?: string[];
+  /** At most this many (default 100, at most 1000). */
+  limit?: number;
+  /** `asc` (default): oldest first. `desc`: newest first. */
+  order?: "asc" | "desc";
+}
+
+export interface EventPage {
+  events: ConversationEvent[];
+  /** More events match than were returned. */
+  hasMore: boolean;
+  /** `seq` of the last event returned, or `after` (0 by default) when the page is empty: the cursor for the next page. */
+  lastSeq: number;
+}
+
+/** What the log knows about a conversation without reading it. */
+export interface EventSummary {
+  /** `seq` of the newest event (0 when there is none). */
+  lastSeq: number;
+  /**
+   * `data.stop_reason` of the newest `session.status_idle` event; cleared by a later
+   * `session.status_running`. So it is the reason the last *finished* turn stopped, and absent while one runs.
+   */
+  stopReason?: string;
+}
+
+/**
+ * A durable, append-only event log per conversation. A provider that offers it exposes `events`
+ * (and reports `capabilities().events`). `(conversationId, seq)` is unique, `seq` ascends without
+ * gaps and keeps ascending after a restart or a `prune`.
+ */
+export interface EventStore {
+  /**
+   * Appends events in order and atomically. Resolves the stored events with their `seq`.
+   * An unknown conversation is a `NotFoundError`.
+   */
+  append(conversationId: string, events: NewConversationEvent[], ctx?: RequestContext): Promise<ConversationEvent[]>;
+  list(conversationId: string, params?: ListEventsParams, ctx?: RequestContext): Promise<EventPage>;
+  /** Per-conversation summary; conversations without events are left out. Optional: the server falls back to `list`. */
+  summary?(conversationIds: string[], ctx?: RequestContext): Promise<Record<string, EventSummary>>;
+  /** Deletes events created before `before` (the sequence keeps counting). Resolves how many were deleted. */
+  prune?(before: Date, ctx?: RequestContext): Promise<number>;
+}
+
+/** A time-limited claim on a key, held by one owner. */
+export interface Lease {
+  key: string;
+  owner: string;
+  expiresAt: Date;
+  /** What the holder stored with it (`conversationId`, `runId`, ...). */
+  data?: Record<string, unknown>;
+  /** Someone asked the holder to stop (see `markLeaseCancel`). */
+  cancelRequested?: boolean;
+}
+
+export interface AcquireLeaseParams {
+  /** At most 128 characters. */
+  key: string;
+  /** Identifies the holder (a node / run); at most 128 characters. */
+  owner: string;
+  /** Lifetime in milliseconds; the holder renews it while it is alive. */
+  ttlMs: number;
+  data?: Record<string, unknown>;
+}
+
+/**
+ * Acquired when the key was free, expired, or already held by `owner`. `takenOver` is the expired
+ * lease that was replaced (the residue of a holder that died, whoever it was), if there was one.
+ */
+export type AcquireLeaseResult =
+  | { acquired: true; lease: Lease; takenOver?: Lease }
+  | { acquired: false; lease: Lease };
+
+export interface RenewLeaseParams {
+  key: string;
+  owner: string;
+  ttlMs: number;
+}
+
+export interface ReleaseLeaseParams {
+  key: string;
+  owner: string;
+}
+
+export interface ListExpiredLeasesParams {
+  /** Only keys starting with this. */
+  prefix?: string;
+  /** Default 100. */
+  limit?: number;
 }
 
 /** What a storage provider can hold. Returned by `StorageProvider.capabilities()`. */
@@ -562,6 +761,64 @@ export interface AgentServerConfig {
    * per-call predicate are never remembered. Set false to always ask.
    */
   allowRememberApproval?: boolean;
+
+  /**
+   * How runs are leased, cancelled, followed and recovered. Every value has a default.
+   */
+  runs?: RunsConfig;
+}
+
+/**
+ * A turn (a message or a resolved action) runs detached from the HTTP request that started it: a
+ * client that goes away does not stop it, `POST /conversations/:id/cancel` does. These settings
+ * shape that machinery.
+ */
+export interface RunsConfig {
+  /** Names this server instance in leases. Default: a random id per process. */
+  nodeId?: string;
+  /**
+   * How long a conversation lease lives without being renewed (default 60 000). A run whose node dies
+   * frees its conversation after this long and is then closed as interrupted.
+   */
+  leaseTtlMs?: number;
+  /** How long a cancelled run may take to wind down before it is abandoned (default 5 000). */
+  cancelGraceMs?: number;
+  /** How long `POST /conversations/:id/cancel` waits for the run to wind down before answering 202 (default 5 000). */
+  cancelWaitMs?: number;
+  /** Interval of the `: ping` comment on `GET /conversations/:id/events/stream` (default 15 000). */
+  pingIntervalMs?: number;
+  /** How often a follower reads the event log for events written by another node (default 1 000). */
+  followPollMs?: number;
+  /** Longest an `events/stream` connection stays open (default 3 600 000, one hour). The client reconnects with `Last-Event-ID`. */
+  maxStreamMs?: number;
+  /** Events per page of `GET /conversations/:id/events` when no `limit` is given (default 100). */
+  eventPageSize?: number;
+  /** Largest `limit` of `GET /conversations/:id/events` (default 1 000). */
+  maxEventPageSize?: number;
+  /** Largest `data` of one event in bytes; bigger ones are cut and carry `_truncated: true` (default 16 384). */
+  maxEventDataBytes?: number;
+  /** Events kept per conversation by the in-memory log used when the storage provider has no `events` (default 2 000). */
+  memoryEventLimit?: number;
+  /** Delete events older than this many days with the periodic sweep; 0 keeps them for good (default 30). */
+  eventRetentionDays?: number;
+  /**
+   * Interval of the sweep that closes runs whose node died, fails tasks that were running, and
+   * prunes old events (default 60 000). 0 turns the periodic sweep off (recovery still runs once at the
+   * first request, and `server.recoverStaleRuns()` runs it on demand).
+   */
+  sweepIntervalMs?: number;
+  /**
+   * Run the recovery once at the first request (default true): close the runs and fail the tasks that an
+   * earlier process left behind. Turn it off when the storage provider cannot answer for the whole
+   * store (a provider scoped to the current user), and call `server.recoverStaleRuns()` yourself.
+   */
+  recoverOnStart?: boolean;
+  /**
+   * Without storage leases the server cannot tell a dead run from one on another node. `true`
+   * (default) assumes it is the only node, so a task left `running` by an earlier process is failed
+   * at startup; set `false` on a multi-node deployment whose storage provider has no leases.
+   */
+  assumeSingleNode?: boolean;
 }
 
 export interface AuthConfig {
@@ -732,6 +989,10 @@ export interface SendMessageResponse {
   pendingActions?: PendingAction[];
   /** Things worth knowing about a turn that still completed (see {@link TurnWarning}). */
   warnings?: TurnWarning[];
+  /** Why the turn stopped. */
+  stopReason?: StopReason;
+  /** The run that executed the turn; its events carry it as `run_id`. */
+  runId?: string;
 }
 
 /**
@@ -766,6 +1027,12 @@ export type ResolveActionResponse = Omit<SendMessageResponse, "message">;
 export interface StreamEventBase {
   type: string;
   timestamp: number;
+  /**
+   * The event-log cursor at this frame: the `seq` of the stored event the frame reports, or of the
+   * newest one before it for frames that are not stored (text chunks). A client that loses the
+   * connection resumes with `GET /conversations/:id/events/stream?after=<seq>`.
+   */
+  seq?: number;
 }
 
 /**
@@ -844,6 +1111,8 @@ export interface StreamDoneEvent extends StreamEventBase {
   status?: MessageStatus;
   pendingActions?: PendingAction[];
   warnings?: TurnWarning[];
+  stopReason?: StopReason;
+  runId?: string;
 }
 
 /**
@@ -905,6 +1174,37 @@ export interface MessagesPage {
   hasMoreBefore: boolean;
   /** Newer messages exist than the newest one returned. */
   hasMoreAfter: boolean;
+}
+
+/** `GET /conversations/:id/events`: one page of the event log, oldest first. */
+export interface ListEventsResponse {
+  events: WireEvent[];
+  hasMore: boolean;
+  /** Pass it as `after` to read the next page. */
+  lastSeq: number;
+}
+
+/** A logged event as the API returns it (Console client wire: `run_id`, `created_at`). */
+export interface WireEvent {
+  seq: number;
+  type: string;
+  data: Record<string, unknown>;
+  run_id?: string;
+  created_at: string;
+}
+
+/** `POST /conversations/:id/cancel` */
+export interface CancelConversationResponse {
+  /** A run was running, or actions were open, and they were cancelled. `false`: there was nothing to cancel. */
+  cancelled: boolean;
+  /** The run that was cancelled (also when it is still winding down). */
+  runId?: string;
+  /** The run has finished winding down (`false` with a 202: it is still stopping or runs on another node). */
+  settled: boolean;
+  /** Actions that were open and are now cancelled. */
+  cancelledActionIds?: string[];
+  stopReason?: StopReason;
+  runtime: ConversationRuntime;
 }
 
 export interface GetConversationResponse {
@@ -996,7 +1296,7 @@ export class AuthorizationError extends AgentServerError {
 // Task Types
 // ============================================================================
 
-export type TaskStatus = "pending" | "running" | "completed" | "failed" | "waiting_for_input";
+export type TaskStatus = "pending" | "running" | "completed" | "failed" | "waiting_for_input" | "cancelled";
 
 export interface TaskComment {
   id: string;
@@ -1011,6 +1311,12 @@ export interface Task {
   id: string;
   agentId: string;
   userId?: string;
+  /**
+   * The conversation the task runs in. Its events, approvals and cancellation work like any
+   * conversation's; when the agent pauses, the task is `waiting_for_input` and the actions are
+   * answered on the conversation.
+   */
+  conversationId?: string;
   status: TaskStatus;
   callbackUrl?: string;
   input: string;
@@ -1041,6 +1347,7 @@ export interface TaskResult {
 export interface CreateTaskParams {
   agentId: string;
   userId?: string;
+  conversationId?: string;
   input: string;
   files?: FileAttachment[];
   callbackUrl?: string;
@@ -1050,6 +1357,7 @@ export interface CreateTaskParams {
 export interface GetTasksParams {
   agentId?: string;
   userId?: string;
+  conversationId?: string;
   status?: TaskStatus;
   limit?: number;
   offset?: number;
@@ -1059,6 +1367,7 @@ export interface GetTasksParams {
 
 export interface UpdateTaskParams {
   status?: TaskStatus;
+  conversationId?: string;
   startedAt?: Date;
   completedAt?: Date;
   error?: string;
@@ -1116,11 +1425,14 @@ export interface ListTasksResponse {
 export interface GetTaskResponse {
   task: Task;
   result?: TaskResult;
+  /** Present while the task is `waiting_for_input` on actions of its conversation. */
+  pendingActions?: PendingAction[];
 }
 
 export interface GetTaskStatusResponse {
   taskId: string;
   status: TaskStatus;
+  conversationId?: string;
   createdAt: Date;
   updatedAt: Date;
   startedAt?: Date;

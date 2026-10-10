@@ -16,7 +16,10 @@ interface Message {
   toolCalls?: ToolCall[];
   toolCallId?: string;
   files?: FileAttachment[];
+  /** Assistant messages: `metadata.status` and `metadata.stopReason` say how and why the turn ended. */
   metadata?: Record<string, unknown>;
+  /** API only (derived from `metadata.status`): how the turn that produced an assistant message ended. */
+  status?: 'completed' | 'requires_action' | 'incomplete' | 'cancelled';
   createdAt: Date;
   updatedAt: Date;
 }
@@ -69,7 +72,23 @@ interface Conversation {
   state?: Record<string, unknown>;
   createdAt: Date;
   updatedAt: Date;
+  /** Computed by the API on GET /conversations and GET /conversations/:id; never stored. */
+  runtime?: ConversationRuntime;
 }
+```
+
+### ConversationRuntime
+
+```typescript
+interface ConversationRuntime {
+  status: 'idle' | 'running' | 'requires_action' | 'budget_paused';
+  stopReason?: StopReason;      // why the last turn stopped; absent while one runs
+  lastEventSeq: number;         // seq of the newest event (0: none)
+  pendingActionIds: string[];
+  activeRunId?: string;
+}
+
+type StopReason = 'end_turn' | 'requires_action' | 'cancelled' | 'max_turns' | 'limit' | 'budget_reached' | 'error';
 ```
 
 ### ConversationWithMessages
@@ -97,14 +116,62 @@ interface SendMessageRequest {
 
 ```typescript
 interface SendMessageResponse {
-  message: Message;
+  message: Message;              // the user message
+  response: Message;             // the assistant message (status, metadata.stopReason)
+  conversationTitle?: string;
   usage?: {
     inputTokens?: number;
     outputTokens?: number;
     totalTokens?: number;
   };
+  status?: 'requires_action' | 'incomplete' | 'cancelled';   // only when the turn did not simply complete
+  pendingActions?: PendingAction[];
+  warnings?: TurnWarning[];
+  stopReason?: StopReason;
+  runId?: string;                // the run that executed the turn
 }
 ```
+
+### CancelConversationResponse
+
+```typescript
+interface CancelConversationResponse {
+  cancelled: boolean;            // false: nothing to cancel
+  runId?: string;
+  settled: boolean;              // false (HTTP 202): still winding down, or on another node
+  cancelledActionIds?: string[];
+  stopReason?: StopReason;
+  runtime: ConversationRuntime;
+}
+```
+
+### Event types
+
+```typescript
+/** One entry of a conversation's event log (what a storage provider stores). */
+interface ConversationEvent {
+  conversationId: string;
+  seq: number;                   // 1, 2, 3 ... per conversation; unique
+  type: string;                  // 'user.message', 'agent.tool_use', 'session.status_idle', ...
+  data: Record<string, unknown>; // snake_case
+  runId?: string;
+  createdAt: Date;
+}
+
+/** The same event as GET /conversations/:id/events returns it. */
+interface WireEvent {
+  seq: number;
+  type: string;
+  data: Record<string, unknown>;
+  run_id?: string;
+  created_at: string;
+}
+
+interface ListEventsResponse { events: WireEvent[]; hasMore: boolean; lastSeq: number }
+```
+
+See [Runs, Cancel & Reattach](../guide/runs#the-event-log) for the types and their data. `EventStore`, `Lease`, `AcquireLeaseParams`,
+`AcquireLeaseResult` and the rest are the storage provider's side: [Storage Providers API](./storage).
 
 ### CreateConversationRequest
 

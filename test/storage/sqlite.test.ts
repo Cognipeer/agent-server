@@ -66,7 +66,11 @@ describeProvider("sqlite", (harness) => {
 
         const check = new Database(file, { readonly: true });
         expect((check.prepare("SELECT COUNT(*) AS n FROM agent_server_task_results").get() as any).n).toBe(1);
-        expect((check.prepare("SELECT value FROM agent_server_meta WHERE key = 'schema_version'").get() as any).value).toBe("2");
+        expect((check.prepare("SELECT value FROM agent_server_meta WHERE key = 'schema_version'").get() as any).value).toBe("3");
+        const tables = (check.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as any[]).map((r) => r.name);
+        expect(tables).toEqual(expect.arrayContaining(["agent_server_events", "agent_server_event_streams", "agent_server_leases"]));
+        const taskColumns = (check.prepare("PRAGMA table_info(agent_server_tasks)").all() as any[]).map((r) => r.name);
+        expect(taskColumns).toContain("conversation_id");
         const indexes = (check.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as any[]).map((r) => r.name);
         expect(indexes).toContain("idx_agent_server_taskres_task_uq");
         expect(indexes).toContain("idx_agent_server_msg_conv_t");
@@ -78,6 +82,45 @@ describeProvider("sqlite", (harness) => {
         await again.connect();
         expect((await again.getTaskResult("task_old"))?.content).toBe("newer");
         await again.disconnect();
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("upgrading a database from the previous schema (version 2)", () => {
+    it("adds the event log, the leases and the task link, and keeps what was there", async () => {
+      const { default: Database } = await import("better-sqlite3");
+      const dir = await mkdtemp(path.join(tmpdir(), "agent-server-sqlite-v2-"));
+      const file = path.join(dir, "v2.db");
+      try {
+        const first = createSQLiteProvider({ filename: file });
+        await first.connect();
+        const conv = await first.createConversation({ agentId: "a", title: "kept" });
+        const task = await first.createTask({ agentId: "a", input: "old task" });
+        await first.disconnect();
+
+        // take it back to what version 2 had: no event log, no leases, no tasks.conversation_id
+        const raw = new Database(file);
+        raw.exec(`
+          DROP TABLE agent_server_events; DROP TABLE agent_server_event_streams; DROP TABLE agent_server_leases;
+          DROP INDEX idx_agent_server_tasks_conv; ALTER TABLE agent_server_tasks DROP COLUMN conversation_id;
+          UPDATE agent_server_meta SET value = '2' WHERE key = 'schema_version';
+        `);
+        raw.close();
+
+        const upgraded = createSQLiteProvider({ filename: file });
+        await upgraded.connect();
+        expect((await upgraded.getConversation(conv.id))?.title).toBe("kept");
+        expect((await upgraded.getTask(task.id))?.input).toBe("old task");
+        expect((await upgraded.events!.append(conv.id, [{ type: "x" }]))[0]!.seq).toBe(1);
+        expect(await upgraded.acquireLease!({ key: "k", owner: "o", ttlMs: 1000 })).toMatchObject({ acquired: true });
+        expect((await upgraded.updateTask(task.id, { conversationId: conv.id })).conversationId).toBe(conv.id);
+        await upgraded.disconnect();
+
+        const check = new Database(file, { readonly: true });
+        expect((check.prepare("SELECT value FROM agent_server_meta WHERE key = 'schema_version'").get() as any).value).toBe("3");
+        check.close();
       } finally {
         await rm(dir, { recursive: true, force: true });
       }

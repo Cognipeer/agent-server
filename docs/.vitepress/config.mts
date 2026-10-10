@@ -44,6 +44,7 @@ export default defineConfig({
             { text: 'Authentication', link: '/guide/authentication' },
             { text: 'File Management', link: '/guide/file-management' },
             { text: 'Streaming', link: '/guide/streaming' },
+            { text: 'Runs, Cancel & Reattach', link: '/guide/runs' },
             { text: 'Approvals & Questions', link: '/guide/human-in-the-loop' },
             { text: 'Swagger UI', link: '/guide/swagger' },
           ],

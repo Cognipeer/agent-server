@@ -37,7 +37,15 @@ database each. In short:
   Deleting a conversation deletes its files and their content; deleting a message keeps its files with the conversation.
   A file attached to a message belongs to that message's conversation.
 - **Tasks.** Comments are stored (with real `Date`s). A task has one result: creating another replaces the first
-  (the `waiting_for_input` cycle writes a partial result, then the final one).
+  (the `waiting_for_input` cycle writes a partial result, then the final one). A task records the conversation it runs in
+  (`conversationId`, filterable in `getTasks`).
+- **Event log.** `storage.events` appends and lists a conversation's events (`seq` 1, 2, 3 ... unique, gap-free, still counting after a restart or a prune);
+  `summary()` gives the newest `seq` and the stop reason of the last finished turn for many conversations at once; the log goes with its conversation.
+  See [Runs, Cancel & Reattach](./runs.md).
+- **Leases.** `acquireLease` / `renewLease` / `releaseLease` / `getLeases` / `markLeaseCancel` / `listExpiredLeases`: a time-limited claim on a key,
+  decided atomically (of twelve askers at once exactly one gets it), taken over after it expired - the taker is handed the residue. The server holds one per
+  running conversation, which is what makes `409 conversation_busy` hold across several server instances. Expiry uses the clock of the server instance, so keep the
+  instances' clocks within a few seconds (a lease lives 60 s by default).
 - **Limits are typed.** A write the provider cannot hold is a `StorageLimitError` (HTTP 413, `STORAGE_LIMIT_EXCEEDED`);
   a value a column cannot hold is a `ValidationError` (400); an unknown parent is a `NotFoundError` (404). Never a driver error.
 
@@ -49,6 +57,9 @@ Every built-in provider reports what it can hold:
 storage.capabilities();
 // { maxFileBytes, maxStateBytes, atomicUpdate, events, leases }
 ```
+
+`events` and `leases` are `true` for all four built-in providers. A provider that has no `events` still works - the server keeps a bounded log in
+memory (see [Runs](./runs.md#providers-without-an-event-log)); one without `leases` serialises runs in-process only, which is right for a single server.
 
 The server uses it in three places:
 
@@ -124,8 +135,11 @@ With `autoMigrate: true` the provider creates (and upgrades) these tables, all n
 | `messages` | `id`, `conversation_id` (cascade), `role`, `content` (JSONB), `name`, `tool_calls`, `tool_call_id`, `files`, `metadata`, times, `seq` |
 | `files` | the file record: `name`, `mime_type`, `size`, `storage_key`, `conversation_id`, `message_id`, `metadata` |
 | `file_contents` | `storage_key`, `content` (BYTEA) |
-| `tasks` | `agent_id`, `user_id`, `status`, `callback_url`, `input`, `files`, `comments` (JSONB), `metadata`, times, `error`, `seq` |
+| `tasks` | `agent_id`, `user_id`, `conversation_id`, `status`, `callback_url`, `input`, `files`, `comments` (JSONB), `metadata`, times, `error`, `seq` |
 | `task_results` | `task_id` (unique), `content`, `files`, `metadata`, `usage` |
+| `events` | `(conversation_id, seq)` (primary key, cascade), `type`, `data` (JSONB), `run_id`, `created_at` |
+| `event_streams` | `conversation_id` (primary key, cascade), `last_seq`, `stop_reason`: the counter that hands out `seq` and the summary |
+| `leases` | `key` (primary key), `owner`, `expires_at`, `data` (JSONB), `cancel_requested` |
 | `meta` | `schema_version` |
 
 `seq` is the insertion sequence that orders rows created in the same millisecond.
@@ -136,8 +150,10 @@ Indexes are named `idx_<prefix>...`, so several prefixes can share a schema:
 -- conversations: (agent_id, created_at, seq), (user_id, created_at, seq), (created_at, seq), (updated_at, seq)
 -- messages:      (conversation_id, created_at, seq)
 -- files:         (conversation_id), (message_id)
--- tasks:         (agent_id, created_at, seq), (user_id, created_at, seq), (status, created_at, seq), (created_at, seq)
+-- tasks:         (agent_id, created_at, seq), (user_id, created_at, seq), (status, created_at, seq), (created_at, seq), (conversation_id)
 -- task_results:  UNIQUE (task_id)
+-- events:        PRIMARY KEY (conversation_id, seq), (created_at)
+-- leases:        PRIMARY KEY (key), (expires_at)
 ```
 
 ### Upgrading
@@ -145,7 +161,7 @@ Indexes are named `idx_<prefix>...`, so several prefixes can share a schema:
 The schema carries a version (`meta.schema_version`). Connecting an older database runs the missing steps once, under an advisory lock,
 so a fleet starting together is safe: it adds `tasks.comments` and the `seq` columns, keeps only the newest result of tasks that had
 several, adds the indexes above and drops the old unprefixed ones **if they belong to this prefix's tables**. Nothing is deleted
-besides the duplicate results.
+besides the duplicate results. Schema version 3 adds the `events`, `event_streams` and `leases` tables and `tasks.conversation_id`.
 
 ### Things to know
 
@@ -176,7 +192,7 @@ await storage.connect();
 
 ### Collections
 
-`<prefix>conversations`, `messages`, `files` (the records), `tasks`, `task_results`, and the GridFS bucket `<prefix>files`
+`<prefix>conversations`, `messages`, `files` (the records), `tasks`, `task_results`, `events`, `event_streams` (the `seq` counter and summary of each conversation's log), `leases`, and the GridFS bucket `<prefix>files`
 (collections `<prefix>files.files` and `<prefix>files.chunks`), which holds the **content of every file**, whatever its size.
 Content written by older versions in `<prefix>file_contents` is still read and deleted. GridFS creates its own two indexes the first time a file is written; with `autoIndex: false` and a user that may not create indexes, create them beforehand.
 
@@ -190,9 +206,13 @@ Content written by older versions in `<prefix>file_contents` is still read and d
 // files
 { conversationId: 1 }, { messageId: 1 }, { storageKey: 1 } /* unique */
 // tasks
-{ agentId: 1, createdAt: -1, seq: -1 }, { userId: 1, ... }, { status: 1, ... }, { createdAt: -1, seq: -1 }
+{ agentId: 1, createdAt: -1, seq: -1 }, { userId: 1, ... }, { status: 1, ... }, { createdAt: -1, seq: -1 }, { conversationId: 1 }
 // task_results
 { taskId: 1 } /* unique */
+// events
+{ conversationId: 1, seq: 1 } /* unique */, { createdAt: 1 }
+// leases
+{ expiresAt: 1 }
 ```
 
 On connect the provider also drops the single-field indexes of older versions that these cover.
@@ -231,7 +251,7 @@ const storage = createSQLiteProvider({
 await storage.connect();
 ```
 
-The tables are the same as PostgreSQL's (`TEXT` JSON instead of JSONB, `BLOB` content). Rows created in the same millisecond keep their insertion
+The tables are the same as PostgreSQL's (`TEXT` JSON instead of JSONB, `BLOB` content; `events` is a `WITHOUT ROWID` table keyed by `(conversation_id, seq)`). Rows created in the same millisecond keep their insertion
 order through SQLite's `rowid`. The schema version is kept in `<prefix>meta`, and an older database is upgraded when it is opened.
 One process should own the file; several server instances need PostgreSQL or MongoDB.
 

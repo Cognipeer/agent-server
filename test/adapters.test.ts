@@ -5,7 +5,7 @@ import { createAgentServer, createNodeHandler, type AgentRegistration, type Cont
 import { createNextHandler } from "../src/adapters/next.js";
 import { createExpressMiddleware } from "../src/adapters/express.js";
 import { createFastifyPlugin, mountOnFastify } from "../src/adapters/fastify.js";
-import { fakeSdkAgent, listen, memoryStorage, parseSse } from "./helpers.js";
+import { eventually, fakeSdkAgent, listen, memoryStorage, parseSse } from "./helpers.js";
 
 const closers: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -128,21 +128,22 @@ describe("createNodeHandler", () => {
     expect((await fetch(`${url}/api/agents/agents`, { headers: { authorization: "Bearer tok" } })).status).toBe(200);
   });
 
-  it("stops consuming the agent stream when the client disconnects", async () => {
+  it("lets the turn finish and stores it when the client disconnects mid-stream", async () => {
     const slow: AgentRegistration = {
       info: { id: "bot", name: "Bot" },
       sdkAgent: fakeSdkAgent(async (_p, config) => {
-        for (let i = 0; i < 50; i++) {
+        for (let i = 0; i < 10; i++) {
           config?.onStream?.({ text: `t${i} ` });
-          await new Promise((r) => setTimeout(r, 20));
+          await new Promise((r) => setTimeout(r, 15));
         }
-        return { content: "done" };
+        return { content: "t0 t1 t2 t3 t4 t5 t6 t7 t8 t9 " };
       }),
     };
     const { url } = await boot({ agents: [slow] });
     const created = await json(await fetch(`${url}/api/agents/conversations`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ agentId: "bot" }) }));
+    const id = created.conversation.id;
     const ctrl = new AbortController();
-    const res = await fetch(`${url}/api/agents/conversations/${created.conversation.id}/messages`, {
+    const res = await fetch(`${url}/api/agents/conversations/${id}/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ message: "x", stream: true }),
@@ -151,9 +152,45 @@ describe("createNodeHandler", () => {
     const reader = res.body!.getReader();
     await reader.read();
     ctrl.abort();
-    await new Promise((r) => setTimeout(r, 100));
-    // the server must still be healthy after an aborted stream
+
+    // the server is healthy, and the turn the client walked away from finishes and is stored
     expect((await fetch(`${url}/api/agents/agents`)).status).toBe(200);
+    const stored = await eventually(async () => {
+      const conv = await json(await fetch(`${url}/api/agents/conversations/${id}`));
+      return conv.conversation.runtime.status === "idle" && conv.messages.length === 2 ? conv : undefined;
+    }, 4000, "the turn to finish");
+    expect(stored.messages[1]).toMatchObject({ role: "assistant", content: "t0 t1 t2 t3 t4 t5 t6 t7 t8 t9 ", status: "completed" });
+  });
+
+  it("serves the event stream: ids, Last-Event-ID, and it ends when the client goes away", async () => {
+    const { url, server } = await boot({ runs: { pingIntervalMs: 40 } });
+    const { conversation } = await converse(`${url}/api/agents`);
+    const stream = `${url}/api/agents/conversations/${conversation.id}/events/stream`;
+
+    const ctrl = new AbortController();
+    const res = await fetch(stream, { headers: { "last-event-id": "2" }, signal: ctrl.signal });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    const until = async (check: (t: string) => boolean) => {
+      const deadline = Date.now() + 3000;
+      while (!check(text) && Date.now() < deadline) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+      }
+    };
+    await until((t) => t.includes("event: session.work_done") && t.includes(": ping"));
+    const ids = [...text.matchAll(/^id: (\d+)$/gm)].map((m) => Number(m[1]));
+    expect(ids).toEqual([3, 4, 5]);
+    expect(text).toContain(": ping");
+    expect(text).toMatch(/^event: agent\.message\ndata: \{"seq":3,"type":"agent\.message"/m);
+
+    expect((server as any).bus.hasListeners(conversation.id)).toBe(true);
+    ctrl.abort();
+    await eventually(() => !(server as any).bus.hasListeners(conversation.id), 3000, "the follower to be released");
   });
 });
 
@@ -257,6 +294,22 @@ describe("Fastify adapter", () => {
     expect(res.headers.get("x-request-id")).toBe("rid-1");
   });
 
+  it("follows a conversation through Fastify and lets go when the client does", async () => {
+    const { url, server } = await boot({ runs: { pingIntervalMs: 30 } });
+    const { conversation } = await converse(`${url}/api/portal/k1`);
+    const ctrl = new AbortController();
+    const res = await fetch(`${url}/api/portal/k1/conversations/${conversation.id}/events/stream?after=3`, { signal: ctrl.signal });
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    while (!text.includes("session.work_done") || !text.includes(": ping")) text += decoder.decode((await reader.read()).value, { stream: true });
+    expect(text).toContain("id: 4");
+    expect((server as any).bus.hasListeners(conversation.id)).toBe(true);
+    ctrl.abort();
+    await eventually(() => !(server as any).bus.hasListeners(conversation.id), 3000, "the follower to be released");
+  });
+
   it("tolerates DELETE and bodyless POST", async () => {
     const { url } = await boot();
     const { conversation } = await converse(`${url}/api/portal/k1`);
@@ -346,6 +399,55 @@ describe("Express and Next adapters feed resolveContext", () => {
     expect(ok.status).toBe(200);
     expect(seen?.headers.cookie).toBe("sid=1");
     expect(seen?.raw).toBeInstanceOf(Request);
+  });
+
+  it("Next: lets a client leave an event stream, which releases the follower", async () => {
+    const server = createAgentServer({ basePath: "/api/agents", storage: await memoryStorage(), agents: [sdkAgent()] });
+    const handler = createNextHandler(server);
+    const created = (await (await handler(new Request("http://x/api/agents/conversations", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ agentId: "bot" }) }) as never)).json()) as any;
+    const id = created.conversation.id;
+    await handler(new Request(`http://x/api/agents/conversations/${id}/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: "hi" }) }) as never);
+
+    const res = await handler(new Request(`http://x/api/agents/conversations/${id}/events/stream?after=3`) as never);
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+    const reader = res.body!.getReader();
+    let text = "";
+    const decoder = new TextDecoder();
+    while (!text.includes("session.work_done")) text += decoder.decode((await reader.read()).value, { stream: true });
+    expect(text).toContain("id: 4");
+    expect((server as any).bus.hasListeners(id)).toBe(true);
+    await reader.cancel();
+    await eventually(() => !(server as any).bus.hasListeners(id), 3000, "the follower to be released");
+  });
+
+  it("Express: releases an event stream when the response closes", async () => {
+    const server = createAgentServer({ basePath: "/api/agents", storage: await memoryStorage(), agents: [sdkAgent()] });
+    const mw = createExpressMiddleware(server);
+    const mount = async (method: string, path: string, body?: unknown, onClose?: { fn?: () => void }) => {
+      const written: string[] = [];
+      let status = 0;
+      let payload: any;
+      const res: any = {
+        status(c: number) { status = c; return res; },
+        json(b: unknown) { payload = b; return res; }, send() { return res; }, set() { return res; },
+        write(c: string) { written.push(c); return true; }, end() {},
+        once(_event: string, fn: () => void) { if (onClose) onClose.fn = fn; },
+      };
+      const done = mw({ method, path, originalUrl: path, headers: {}, query: {}, body } as any, res, () => {});
+      return { res, written, done, status: () => status, payload: () => payload };
+    };
+    const created = await mount("POST", "/api/agents/conversations", { agentId: "bot" });
+    await created.done;
+    const id = created.payload().conversation.id;
+    await (await mount("POST", `/api/agents/conversations/${id}/messages`, { message: "hi" })).done;
+
+    const close: { fn?: () => void } = {};
+    const stream = await mount("GET", `/api/agents/conversations/${id}/events/stream`, undefined, close);
+    await eventually(() => stream.written.join("").includes("session.work_done"), 3000, "the replay");
+    expect((server as any).bus.hasListeners(id)).toBe(true);
+    close.fn!(); // the client closes the connection
+    await stream.done; // the middleware returns once the stream ended
+    expect((server as any).bus.hasListeners(id)).toBe(false);
   });
 
   it("Express: forwards headers and mount params", async () => {

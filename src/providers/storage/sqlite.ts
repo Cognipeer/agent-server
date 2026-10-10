@@ -5,10 +5,19 @@
  * Great for development, small deployments, and single-server setups.
  */
 
-import { BaseStorageProvider } from "./base.js";
+import { BaseStorageProvider, type EventQuery, type StoredEventInput } from "./base.js";
 import { NotFoundError } from "../../types.js";
+import { nextStopReason } from "../../events.js";
 import { MAX_BUFFER_BYTES, pageResult, toBuffer } from "./shared.js";
 import type {
+  AcquireLeaseParams,
+  AcquireLeaseResult,
+  ConversationEvent,
+  EventSummary,
+  Lease,
+  ReleaseLeaseParams,
+  RenewLeaseParams,
+  RequestContext,
   StorageCapabilities,
   Conversation,
   Message,
@@ -44,7 +53,7 @@ type Statement = {
 };
 
 /** Bumped when `migrate()` gains a step that must run once on existing databases. */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export interface SQLiteConfig {
   /**
@@ -102,6 +111,9 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       fileContents: `${this.tablePrefix}file_contents`,
       tasks: `${this.tablePrefix}tasks`,
       taskResults: `${this.tablePrefix}task_results`,
+      events: `${this.tablePrefix}events`,
+      eventStreams: `${this.tablePrefix}event_streams`,
+      leases: `${this.tablePrefix}leases`,
       meta: `${this.tablePrefix}meta`,
     };
   }
@@ -112,6 +124,8 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       ...super.capabilities(),
       maxFileBytes: Math.min(1_000_000_000, MAX_BUFFER_BYTES),
       maxStateBytes: 1_000_000_000,
+      events: true,
+      leases: true,
     };
   }
 
@@ -220,6 +234,7 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
         id TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL,
         user_id TEXT,
+        conversation_id TEXT,
         status TEXT NOT NULL DEFAULT 'pending',
         callback_url TEXT,
         input TEXT NOT NULL,
@@ -253,6 +268,37 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       )
     `);
 
+    // The event log: one row per event, and one row per conversation that counts them (the next
+    // sequence number and the stop reason of the last finished turn).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS ${this.tables.events} (
+        conversation_id TEXT NOT NULL REFERENCES ${this.tables.conversations}(id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        data TEXT NOT NULL DEFAULT '{}',
+        run_id TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (conversation_id, seq)
+      ) WITHOUT ROWID
+    `);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS ${this.tables.eventStreams} (
+        conversation_id TEXT PRIMARY KEY REFERENCES ${this.tables.conversations}(id) ON DELETE CASCADE,
+        last_seq INTEGER NOT NULL,
+        stop_reason TEXT,
+        updated_at TEXT NOT NULL
+      )
+    `);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS ${this.tables.leases} (
+        key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        data TEXT NOT NULL DEFAULT '{}',
+        cancel_requested INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+
     // Create indexes. Rows are listed by time with the insertion order (rowid) breaking
     // ties, so the time indexes lead; the rowid is implicit in every index.
     const p = this.tablePrefix;
@@ -268,7 +314,10 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_${p}tasks_status_t ON ${this.tables.tasks}(status, created_at)`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_${p}tasks_created ON ${this.tables.tasks}(created_at)`);
 
-    // Schema version 2: one result per task. Databases from before it may hold several.
+    // Event log lookups: pruning by age, expired-lease sweeps
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_${p}events_created ON ${this.tables.events}(created_at)`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_${p}leases_expires ON ${this.tables.leases}(expires_at)`);
+
     const version = Number(
       (this.db.prepare(`SELECT value FROM ${this.tables.meta} WHERE key = 'schema_version'`).get() as
         | { value: string }
@@ -277,23 +326,32 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
     if (version < SCHEMA_VERSION) {
       this.tx(() => {
         const db = this.db!;
-        db.exec(
-          `DELETE FROM ${this.tables.taskResults}
-           WHERE rowid NOT IN (SELECT MAX(rowid) FROM ${this.tables.taskResults} GROUP BY task_id)`
-        );
-        // Single-column indexes the time-leading ones above replace
-        for (const legacy of ["conv_agent", "conv_user", "msg_conv", "tasks_agent", "tasks_user", "tasks_status", "taskres_task"]) {
-          db.exec(`DROP INDEX IF EXISTS idx_${p}${legacy}`);
+        // Schema version 2: one result per task. Databases from before it may hold several.
+        if (version < 2) {
+          db.exec(
+            `DELETE FROM ${this.tables.taskResults}
+             WHERE rowid NOT IN (SELECT MAX(rowid) FROM ${this.tables.taskResults} GROUP BY task_id)`
+          );
+          // Single-column indexes the time-leading ones above replace
+          for (const legacy of ["conv_agent", "conv_user", "msg_conv", "tasks_agent", "tasks_user", "tasks_status", "taskres_task"]) {
+            db.exec(`DROP INDEX IF EXISTS idx_${p}${legacy}`);
+          }
+          db.exec(
+            `CREATE UNIQUE INDEX IF NOT EXISTS idx_${p}taskres_task_uq ON ${this.tables.taskResults}(task_id)`
+          );
         }
-        db.exec(
-          `CREATE UNIQUE INDEX IF NOT EXISTS idx_${p}taskres_task_uq ON ${this.tables.taskResults}(task_id)`
-        );
+        // Schema version 3: tasks run in a conversation
+        const columns = db.prepare(`PRAGMA table_info(${this.tables.tasks})`).all() as Array<{ name: string }>;
+        if (!columns.some((c) => c.name === "conversation_id")) {
+          db.exec(`ALTER TABLE ${this.tables.tasks} ADD COLUMN conversation_id TEXT`);
+        }
         db.prepare(
           `INSERT INTO ${this.tables.meta} (key, value) VALUES ('schema_version', ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value`
         ).run(String(SCHEMA_VERSION));
       });
     }
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_${p}tasks_conv ON ${this.tables.tasks}(conversation_id)`);
   }
 
   // ============================================================================
@@ -648,12 +706,13 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
 
     this.db.prepare(
       `INSERT INTO ${this.tables.tasks}
-       (id, agent_id, user_id, status, callback_url, input, files, comments, metadata, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (id, agent_id, user_id, conversation_id, status, callback_url, input, files, comments, metadata, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id,
       params.agentId,
       params.userId || null,
+      params.conversationId || null,
       "pending",
       params.callbackUrl || null,
       params.input,
@@ -668,6 +727,7 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       id,
       agentId: params.agentId,
       userId: params.userId,
+      conversationId: params.conversationId,
       status: "pending",
       callbackUrl: params.callbackUrl,
       input: params.input,
@@ -713,6 +773,10 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       conditions.push("status = ?");
       values.push(params.status);
     }
+    if (params.conversationId) {
+      conditions.push("conversation_id = ?");
+      values.push(params.conversationId);
+    }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
@@ -742,6 +806,10 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
     if (params.status !== undefined) {
       updates.push("status = ?");
       values.push(params.status);
+    }
+    if (params.conversationId !== undefined) {
+      updates.push("conversation_id = ?");
+      values.push(params.conversationId);
     }
     if (params.startedAt !== undefined) {
       updates.push("started_at = ?");
@@ -844,6 +912,215 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
   }
 
   // ============================================================================
+  // Events
+  // ============================================================================
+
+  protected async _appendEvents(
+    conversationId: string,
+    events: StoredEventInput[]
+  ): Promise<ConversationEvent[]> {
+    if (!this.db) throw new Error("Database not initialized");
+    const db = this.db;
+
+    // One transaction (the driver is synchronous, so appends never interleave): the counter row
+    // hands out the sequence numbers, so they ascend without gaps or repeats.
+    return this.tx(() => {
+      const exists = db.prepare(`SELECT 1 AS ok FROM ${this.tables.conversations} WHERE id = ?`).get(conversationId);
+      if (!exists) throw new NotFoundError("Conversation", conversationId);
+
+      const stream = db.prepare(
+        `SELECT last_seq, stop_reason FROM ${this.tables.eventStreams} WHERE conversation_id = ?`
+      ).get(conversationId) as { last_seq: number; stop_reason: string | null } | undefined;
+      let seq = stream?.last_seq ?? 0;
+
+      const insert = db.prepare(
+        `INSERT INTO ${this.tables.events} (conversation_id, seq, type, data, run_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      );
+      const stored: ConversationEvent[] = [];
+      for (const event of events) {
+        seq += 1;
+        insert.run(conversationId, seq, event.type, JSON.stringify(event.data), event.runId ?? null, event.createdAt.toISOString());
+        stored.push({
+          conversationId,
+          seq,
+          type: event.type,
+          data: event.data,
+          runId: event.runId,
+          createdAt: event.createdAt,
+        });
+      }
+      const stopReason = nextStopReason(stream?.stop_reason, events) ?? null;
+      db.prepare(
+        `INSERT INTO ${this.tables.eventStreams} (conversation_id, last_seq, stop_reason, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(conversation_id) DO UPDATE SET
+           last_seq = excluded.last_seq, stop_reason = excluded.stop_reason, updated_at = excluded.updated_at`
+      ).run(conversationId, seq, stopReason, events[events.length - 1]!.createdAt.toISOString());
+      return stored;
+    });
+  }
+
+  protected async _listEvents(conversationId: string, query: EventQuery): Promise<ConversationEvent[]> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    const conditions = ["conversation_id = ?", "seq > ?"];
+    const values: unknown[] = [conversationId, query.after];
+    if (query.before !== undefined) {
+      conditions.push("seq < ?");
+      values.push(query.before);
+    }
+    if (query.types?.length) {
+      conditions.push(`type IN (${query.types.map(() => "?").join(", ")})`);
+      values.push(...query.types);
+    }
+    const rows = this.db.prepare(
+      `SELECT * FROM ${this.tables.events} WHERE ${conditions.join(" AND ")}
+       ORDER BY seq ${query.order === "desc" ? "DESC" : "ASC"} LIMIT ?`
+    ).all(...values, query.limit) as DbEvent[];
+    return rows.map((row) => this.mapEvent(row));
+  }
+
+  protected async _eventSummaries(conversationIds: string[]): Promise<Record<string, EventSummary>> {
+    if (!this.db) throw new Error("Database not initialized");
+    const out: Record<string, EventSummary> = {};
+    // SQLite caps bound parameters; chunk the lookup
+    for (let i = 0; i < conversationIds.length; i += 500) {
+      const chunk = conversationIds.slice(i, i + 500);
+      const rows = this.db.prepare(
+        `SELECT conversation_id, last_seq, stop_reason FROM ${this.tables.eventStreams}
+         WHERE conversation_id IN (${chunk.map(() => "?").join(", ")})`
+      ).all(...chunk) as Array<{ conversation_id: string; last_seq: number; stop_reason: string | null }>;
+      for (const row of rows) {
+        out[row.conversation_id] = { lastSeq: row.last_seq, ...(row.stop_reason ? { stopReason: row.stop_reason } : {}) };
+      }
+    }
+    return out;
+  }
+
+  protected async _pruneEvents(before: Date): Promise<number> {
+    if (!this.db) throw new Error("Database not initialized");
+    return this.db.prepare(`DELETE FROM ${this.tables.events} WHERE created_at < ?`).run(before.toISOString()).changes;
+  }
+
+  private mapEvent(row: DbEvent): ConversationEvent {
+    return {
+      conversationId: row.conversation_id,
+      seq: row.seq,
+      type: row.type,
+      data: JSON.parse(row.data),
+      runId: row.run_id || undefined,
+      createdAt: new Date(row.created_at),
+    };
+  }
+
+  // ============================================================================
+  // Leases
+  // ============================================================================
+
+  private mapLease(row: DbLease): Lease {
+    return {
+      key: row.key,
+      owner: row.owner,
+      expiresAt: new Date(row.expires_at),
+      data: JSON.parse(row.data),
+      cancelRequested: row.cancel_requested === 1,
+    };
+  }
+
+  protected async _acquireLease(
+    params: AcquireLeaseParams & { now: Date; expiresAt: Date },
+    _ctx?: RequestContext
+  ): Promise<AcquireLeaseResult> {
+    if (!this.db) throw new Error("Database not initialized");
+    const db = this.db;
+    const now = params.now.toISOString();
+
+    return this.tx((): AcquireLeaseResult => {
+      const row = db.prepare(`SELECT * FROM ${this.tables.leases} WHERE key = ?`).get(params.key) as DbLease | undefined;
+      const live = !!row && row.expires_at > now;
+      if (row && live && row.owner !== params.owner) {
+        return { acquired: false, lease: this.mapLease(row) };
+      }
+      db.prepare(
+        `INSERT INTO ${this.tables.leases} (key, owner, expires_at, data, cancel_requested)
+         VALUES (?, ?, ?, ?, 0)
+         ON CONFLICT(key) DO UPDATE SET
+           owner = excluded.owner, expires_at = excluded.expires_at, data = excluded.data, cancel_requested = 0`
+      ).run(params.key, params.owner, params.expiresAt.toISOString(), JSON.stringify(params.data ?? {}));
+      const lease: Lease = {
+        key: params.key,
+        owner: params.owner,
+        expiresAt: params.expiresAt,
+        data: params.data ?? {},
+        cancelRequested: false,
+      };
+      // An expired lease is the residue of a holder that died
+      return row && !live
+        ? { acquired: true, lease, takenOver: this.mapLease(row) }
+        : { acquired: true, lease };
+    });
+  }
+
+  protected async _renewLease(params: RenewLeaseParams & { now: Date; expiresAt: Date }): Promise<Lease | null> {
+    if (!this.db) throw new Error("Database not initialized");
+    const db = this.db;
+    return this.tx(() => {
+      const changed = db.prepare(
+        `UPDATE ${this.tables.leases} SET expires_at = ? WHERE key = ? AND owner = ? AND expires_at > ?`
+      ).run(params.expiresAt.toISOString(), params.key, params.owner, params.now.toISOString()).changes;
+      if (changed === 0) return null;
+      return this.mapLease(db.prepare(`SELECT * FROM ${this.tables.leases} WHERE key = ?`).get(params.key) as DbLease);
+    });
+  }
+
+  protected async _releaseLease(params: ReleaseLeaseParams): Promise<boolean> {
+    if (!this.db) throw new Error("Database not initialized");
+    return (
+      this.db.prepare(`DELETE FROM ${this.tables.leases} WHERE key = ? AND owner = ?`).run(params.key, params.owner)
+        .changes > 0
+    );
+  }
+
+  protected async _getLeases(keys: string[], now: Date): Promise<Lease[]> {
+    if (!this.db) throw new Error("Database not initialized");
+    const out: Lease[] = [];
+    for (let i = 0; i < keys.length; i += 500) {
+      const chunk = keys.slice(i, i + 500);
+      const rows = this.db.prepare(
+        `SELECT * FROM ${this.tables.leases} WHERE key IN (${chunk.map(() => "?").join(", ")}) AND expires_at > ?`
+      ).all(...chunk, now.toISOString()) as DbLease[];
+      out.push(...rows.map((row) => this.mapLease(row)));
+    }
+    return out;
+  }
+
+  protected async _markLeaseCancel(key: string, now: Date): Promise<boolean> {
+    if (!this.db) throw new Error("Database not initialized");
+    return (
+      this.db.prepare(`UPDATE ${this.tables.leases} SET cancel_requested = 1 WHERE key = ? AND expires_at > ?`).run(
+        key,
+        now.toISOString()
+      ).changes > 0
+    );
+  }
+
+  protected async _listExpiredLeases(params: { prefix?: string; limit: number; now: Date }): Promise<Lease[]> {
+    if (!this.db) throw new Error("Database not initialized");
+    const conditions = ["expires_at <= ?"];
+    const values: unknown[] = [params.now.toISOString()];
+    if (params.prefix) {
+      // substr compare: the prefix is data, not a LIKE pattern
+      conditions.push("substr(key, 1, ?) = ?");
+      values.push(params.prefix.length, params.prefix);
+    }
+    const rows = this.db.prepare(
+      `SELECT * FROM ${this.tables.leases} WHERE ${conditions.join(" AND ")} ORDER BY expires_at, key LIMIT ?`
+    ).all(...values, params.limit) as DbLease[];
+    return rows.map((row) => this.mapLease(row));
+  }
+
+  // ============================================================================
   // Mappers
   // ============================================================================
 
@@ -913,6 +1190,7 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       id: row.id,
       agentId: row.agent_id,
       userId: row.user_id || undefined,
+      conversationId: row.conversation_id || undefined,
       status: row.status as Task["status"],
       callbackUrl: row.callback_url || undefined,
       input: row.input,
@@ -985,6 +1263,7 @@ interface DbTask {
   id: string;
   agent_id: string;
   user_id: string | null;
+  conversation_id: string | null;
   status: string;
   callback_url: string | null;
   input: string;
@@ -996,6 +1275,23 @@ interface DbTask {
   started_at: string | null;
   completed_at: string | null;
   error: string | null;
+}
+
+interface DbEvent {
+  conversation_id: string;
+  seq: number;
+  type: string;
+  data: string;
+  run_id: string | null;
+  created_at: string;
+}
+
+interface DbLease {
+  key: string;
+  owner: string;
+  expires_at: string;
+  data: string;
+  cancel_requested: number;
 }
 
 interface DbTaskResult {

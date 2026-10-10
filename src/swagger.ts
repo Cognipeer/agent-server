@@ -82,10 +82,74 @@ function generateSchemas(): Record<string, unknown> {
         title: { type: "string" },
         metadata: { type: "object", additionalProperties: true },
         state: { type: "object", additionalProperties: true },
+        runtime: { $ref: "#/components/schemas/ConversationRuntime" },
         createdAt: { type: "string", format: "date-time" },
         updatedAt: { type: "string", format: "date-time" },
       },
       required: ["id", "agentId", "createdAt", "updatedAt"],
+    },
+    ConversationRuntime: {
+      type: "object",
+      description:
+        "Where the conversation is in its run lifecycle. Returned by GET /conversations and GET /conversations/{id}; computed, never stored.",
+      properties: {
+        status: {
+          type: "string",
+          enum: ["idle", "running", "requires_action", "budget_paused"],
+          description: "running: a turn is executing (on this or another node). requires_action: it waits on pendingActionIds.",
+        },
+        stopReason: {
+          $ref: "#/components/schemas/StopReason",
+        },
+        lastEventSeq: {
+          type: "integer",
+          description: "seq of the newest event in the conversation's log (0 when there is none). Follow from here with ?after=.",
+        },
+        pendingActionIds: { type: "array", items: { type: "string" } },
+        activeRunId: { type: "string", description: "The run that is executing now." },
+      },
+      required: ["status", "lastEventSeq", "pendingActionIds"],
+    },
+    StopReason: {
+      type: "string",
+      enum: ["end_turn", "requires_action", "cancelled", "max_turns", "limit", "budget_reached", "error"],
+      description: "Why the last turn stopped. Absent while a turn is running.",
+    },
+    WireEvent: {
+      type: "object",
+      description:
+        "One entry of a conversation's event log, in the Console client wire: dotted event types and snake_case data. " +
+        "Types: user.message, session.status_running, agent.tool_use, agent.tool_result, agent.message, action.required, " +
+        "action.resolved, session.usage, session.status_idle, session.work_done, session.error. A client ignores the types it does not know.",
+      properties: {
+        seq: { type: "integer", description: "1, 2, 3 ... within the conversation; unique." },
+        type: { type: "string", example: "agent.tool_use" },
+        data: { type: "object", additionalProperties: true, description: "Larger than 16 KB is cut and carries _truncated: true." },
+        run_id: { type: "string", description: "The run that produced the event." },
+        created_at: { type: "string", format: "date-time" },
+      },
+      required: ["seq", "type", "data", "created_at"],
+    },
+    ListEventsResponse: {
+      type: "object",
+      properties: {
+        events: { type: "array", items: { $ref: "#/components/schemas/WireEvent" } },
+        hasMore: { type: "boolean" },
+        lastSeq: { type: "integer", description: "seq of the last event returned (or the after you sent): pass it as after for the next page." },
+      },
+      required: ["events", "hasMore", "lastSeq"],
+    },
+    CancelConversationResponse: {
+      type: "object",
+      properties: {
+        cancelled: { type: "boolean", description: "A run was running, or actions were open, and they were cancelled. false: there was nothing to cancel." },
+        runId: { type: "string" },
+        settled: { type: "boolean", description: "The run has finished winding down. false (202): it is still stopping, or it runs on another node." },
+        cancelledActionIds: { type: "array", items: { type: "string" } },
+        stopReason: { $ref: "#/components/schemas/StopReason" },
+        runtime: { $ref: "#/components/schemas/ConversationRuntime" },
+      },
+      required: ["cancelled", "settled", "runtime"],
     },
     Message: {
       type: "object",
@@ -127,7 +191,16 @@ function generateSchemas(): Record<string, unknown> {
           type: "array",
           items: { $ref: "#/components/schemas/FileAttachment" },
         },
-        metadata: { type: "object", additionalProperties: true },
+        metadata: {
+          type: "object",
+          additionalProperties: true,
+          description: "Assistant messages carry metadata.status and metadata.stopReason: how, and why, the turn ended.",
+        },
+        status: {
+          type: "string",
+          enum: ["completed", "requires_action", "incomplete", "cancelled"],
+          description: "Assistant messages: how the turn that produced it ended (derived from metadata.status).",
+        },
         createdAt: { type: "string", format: "date-time" },
         updatedAt: { type: "string", format: "date-time" },
       },
@@ -217,6 +290,8 @@ function generateSchemas(): Record<string, unknown> {
           items: { $ref: "#/components/schemas/PendingAction" },
         },
         warnings: { type: "array", items: { $ref: "#/components/schemas/TurnWarning" } },
+        stopReason: { $ref: "#/components/schemas/StopReason" },
+        runId: { type: "string", description: "The run that executed the turn; its events carry it as run_id." },
       },
       required: ["message", "response"],
     },
@@ -337,6 +412,8 @@ function generateSchemas(): Record<string, unknown> {
         status: { type: "string", enum: ["completed", "requires_action", "incomplete", "cancelled"] },
         pendingActions: { type: "array", items: { $ref: "#/components/schemas/PendingAction" } },
         warnings: { type: "array", items: { $ref: "#/components/schemas/TurnWarning" } },
+        stopReason: { $ref: "#/components/schemas/StopReason" },
+        runId: { type: "string" },
       },
       required: ["response"],
     },
@@ -407,6 +484,7 @@ function generateSchemas(): Record<string, unknown> {
       properties: {
         type: { type: "string", enum: ["stream.start"] },
         timestamp: { type: "integer" },
+        seq: { type: "integer", description: "Event-log cursor at this frame; resume with GET /conversations/{id}/events/stream?after=<seq>." },
         conversationId: { type: "string" },
         messageId: { type: "string" },
       },
@@ -417,6 +495,7 @@ function generateSchemas(): Record<string, unknown> {
       properties: {
         type: { type: "string", enum: ["stream.text"] },
         timestamp: { type: "integer" },
+        seq: { type: "integer", description: "Event-log cursor at this frame; resume with GET /conversations/{id}/events/stream?after=<seq>." },
         text: { type: "string" },
         isFinal: { type: "boolean" },
       },
@@ -427,6 +506,7 @@ function generateSchemas(): Record<string, unknown> {
       properties: {
         type: { type: "string", enum: ["stream.tool_call"] },
         timestamp: { type: "integer" },
+        seq: { type: "integer", description: "Event-log cursor at this frame; resume with GET /conversations/{id}/events/stream?after=<seq>." },
         toolName: { type: "string" },
         toolCallId: { type: "string" },
         args: { type: "object" },
@@ -438,6 +518,7 @@ function generateSchemas(): Record<string, unknown> {
       properties: {
         type: { type: "string", enum: ["stream.tool_result"] },
         timestamp: { type: "integer" },
+        seq: { type: "integer", description: "Event-log cursor at this frame; resume with GET /conversations/{id}/events/stream?after=<seq>." },
         toolName: { type: "string" },
         toolCallId: { type: "string" },
         result: {},
@@ -449,6 +530,7 @@ function generateSchemas(): Record<string, unknown> {
       properties: {
         type: { type: "string", enum: ["stream.progress"] },
         timestamp: { type: "integer" },
+        seq: { type: "integer", description: "Event-log cursor at this frame; resume with GET /conversations/{id}/events/stream?after=<seq>." },
         stage: { type: "string" },
         message: { type: "string" },
         percent: { type: "number" },
@@ -460,6 +542,7 @@ function generateSchemas(): Record<string, unknown> {
       properties: {
         type: { type: "string", enum: ["stream.error"] },
         timestamp: { type: "integer" },
+        seq: { type: "integer", description: "Event-log cursor at this frame; resume with GET /conversations/{id}/events/stream?after=<seq>." },
         error: { type: "string" },
         code: { type: "string" },
       },
@@ -470,6 +553,7 @@ function generateSchemas(): Record<string, unknown> {
       properties: {
         type: { type: "string", enum: ["stream.done"] },
         timestamp: { type: "integer" },
+        seq: { type: "integer", description: "Event-log cursor at this frame; resume with GET /conversations/{id}/events/stream?after=<seq>." },
         conversationId: { type: "string" },
         messageId: { type: "string" },
         content: { type: "string" },
@@ -484,6 +568,8 @@ function generateSchemas(): Record<string, unknown> {
         status: { type: "string", enum: ["completed", "requires_action", "incomplete", "cancelled"] },
         pendingActions: { type: "array", items: { $ref: "#/components/schemas/PendingAction" } },
         warnings: { type: "array", items: { $ref: "#/components/schemas/TurnWarning" } },
+        stopReason: { $ref: "#/components/schemas/StopReason" },
+        runId: { type: "string" },
       },
     },
     StreamActionRequiredEvent: {
@@ -492,6 +578,7 @@ function generateSchemas(): Record<string, unknown> {
       properties: {
         type: { type: "string", enum: ["stream.action_required"] },
         timestamp: { type: "integer" },
+        seq: { type: "integer", description: "Event-log cursor at this frame; resume with GET /conversations/{id}/events/stream?after=<seq>." },
         conversationId: { type: "string" },
         messageId: { type: "string" },
         actions: { type: "array", items: { $ref: "#/components/schemas/PendingAction" } },
@@ -503,6 +590,7 @@ function generateSchemas(): Record<string, unknown> {
       properties: {
         type: { type: "string", enum: ["stream.action_resolved"] },
         timestamp: { type: "integer" },
+        seq: { type: "integer", description: "Event-log cursor at this frame; resume with GET /conversations/{id}/events/stream?after=<seq>." },
         conversationId: { type: "string" },
         actionId: { type: "string" },
         resolution: {
@@ -521,9 +609,15 @@ function generateSchemas(): Record<string, unknown> {
         id: { type: "string" },
         agentId: { type: "string" },
         userId: { type: "string" },
+        conversationId: {
+          type: "string",
+          description:
+            "The conversation the task runs in. Its events, approvals and cancellation work like any conversation's.",
+        },
         status: {
           type: "string",
-          enum: ["pending", "running", "completed", "failed", "waiting_for_input"],
+          enum: ["pending", "running", "completed", "failed", "waiting_for_input", "cancelled"],
+          description: "waiting_for_input: the agent paused on actions of the task's conversation (see pendingActions of GET /tasks/{id}), or asked through a comment.",
         },
         callbackUrl: { type: "string" },
         input: { type: "string" },
@@ -632,6 +726,11 @@ function generateSchemas(): Record<string, unknown> {
       properties: {
         task: { $ref: "#/components/schemas/Task" },
         result: { $ref: "#/components/schemas/TaskResult" },
+        pendingActions: {
+          type: "array",
+          items: { $ref: "#/components/schemas/PendingAction" },
+          description: "While the task is waiting_for_input on actions: answer them on the task's conversation.",
+        },
       },
       required: ["task"],
     },
@@ -641,8 +740,9 @@ function generateSchemas(): Record<string, unknown> {
         taskId: { type: "string" },
         status: {
           type: "string",
-          enum: ["pending", "running", "completed", "failed", "waiting_for_input"],
+          enum: ["pending", "running", "completed", "failed", "waiting_for_input", "cancelled"],
         },
+        conversationId: { type: "string" },
         createdAt: { type: "string", format: "date-time" },
         updatedAt: { type: "string", format: "date-time" },
         startedAt: { type: "string", format: "date-time" },
@@ -1078,7 +1178,9 @@ function generatePaths(
             },
           },
           409: {
-            description: "action_pending: the conversation is waiting for a pending action to be resolved",
+            description:
+              "action_pending: the conversation is waiting for a pending action to be resolved. " +
+              "conversation_busy: a turn is already running in the conversation (details.activeRunId); wait for it or cancel it.",
             content: {
               "application/json": {
                 schema: { $ref: "#/components/schemas/Error" },
@@ -1123,9 +1225,83 @@ function generatePaths(
             content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
           409: {
-            description: "action_not_pending: unknown or already resolved action",
+            description:
+              "action_not_pending: unknown or already resolved action. conversation_busy: a turn is already running in the conversation.",
             content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
+        },
+      },
+    },
+    "/conversations/{conversationId}/cancel": {
+      post: {
+        tags: ["Runs"],
+        summary: "Stop what the conversation is doing",
+        description:
+          "Aborts the turn that is running (the agent-sdk sees the cancellation token; a custom handler its signal; a streamed or " +
+          "plain request that started it ends with status cancelled / stopReason cancelled). A turn running on another node is asked to " +
+          "stop through its lease (202). A conversation that is only waiting on a human has its open actions cancelled (action.resolved " +
+          "with cancelled: true). Nothing to cancel is not an error: cancelled is false.",
+        operationId: "cancelConversation",
+        parameters: [{ name: "conversationId", in: "path", required: true, schema: { type: "string" } }],
+        responses: {
+          200: {
+            description: "Cancelled, or nothing to cancel",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/CancelConversationResponse" } } },
+          },
+          202: {
+            description: "Cancellation requested; the run is still winding down or runs on another node (settled: false)",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/CancelConversationResponse" } } },
+          },
+          403: { description: "Not your conversation", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+          404: { description: "Conversation not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+        },
+      },
+    },
+    "/conversations/{conversationId}/events": {
+      get: {
+        tags: ["Runs"],
+        summary: "Read the event log of a conversation",
+        description:
+          "Everything that happened in the conversation, oldest first: messages, tool calls and results, the actions it paused on, usage, " +
+          "the start and end of each turn. Page with lastSeq as after.",
+        operationId: "listEvents",
+        parameters: [
+          { name: "conversationId", in: "path", required: true, schema: { type: "string" } },
+          { name: "after", in: "query", schema: { type: "integer", minimum: 0, default: 0 }, description: "Only events with a larger seq." },
+          { name: "types", in: "query", schema: { type: "string" }, description: "Comma-separated event types to keep." },
+          { name: "limit", in: "query", schema: { type: "integer", default: 100, maximum: 1000 } },
+        ],
+        responses: {
+          200: {
+            description: "A page of events",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/ListEventsResponse" } } },
+          },
+          400: { description: "after is not a non-negative integer", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+          404: { description: "Conversation not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+        },
+      },
+    },
+    "/conversations/{conversationId}/events/stream": {
+      get: {
+        tags: ["Runs"],
+        summary: "Follow a conversation live (Server-Sent Events)",
+        description:
+          "Replays the stored events after `after` (or after the Last-Event-ID header a browser EventSource sends when it reconnects), " +
+          "then follows the conversation. Each stored event is a frame `id: <seq>`, `event: <type>`, `data: <the event as in GET .../events>`. " +
+          "agent.message.delta frames (`data: {\"text\": ...}`, no id) carry the model's text as it is written for a turn that was started with " +
+          "stream: true; they are not stored. `: ping` every 15 s. Nothing is missed or repeated between the replay and the live part. " +
+          "Closing the stream never affects a run; reconnect with the last id.",
+        operationId: "streamEvents",
+        parameters: [
+          { name: "conversationId", in: "path", required: true, schema: { type: "string" } },
+          { name: "after", in: "query", schema: { type: "integer", minimum: 0, default: 0 } },
+          { name: "types", in: "query", schema: { type: "string" }, description: "Comma-separated event types to keep." },
+          { name: "Last-Event-ID", in: "header", schema: { type: "integer" }, description: "Wins over after." },
+        ],
+        responses: {
+          200: { description: "text/event-stream", content: { "text/event-stream": { schema: { type: "string" } } } },
+          400: { description: "after is not a non-negative integer", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+          404: { description: "Conversation not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
         },
       },
     },
@@ -1315,9 +1491,15 @@ function generatePaths(
             in: "query",
             schema: {
               type: "string",
-              enum: ["pending", "running", "completed", "failed"],
+              enum: ["pending", "running", "completed", "failed", "waiting_for_input", "cancelled"],
             },
             description: "Filter by task status",
+          },
+          {
+            name: "conversationId",
+            in: "query",
+            schema: { type: "string" },
+            description: "Filter by the conversation the task runs in",
           },
           {
             name: "limit",
@@ -1407,6 +1589,23 @@ function generatePaths(
               },
             },
           },
+        },
+      },
+    },
+    "/tasks/{taskId}/cancel": {
+      post: {
+        tags: ["Tasks"],
+        summary: "Cancel a task",
+        description:
+          "Stops the turn the task is running (or cancels the actions it waits on) and marks the task cancelled. " +
+          "A task that has completed or failed cannot be cancelled (409 task_finished); cancelling a cancelled task is a no-op.",
+        operationId: "cancelTask",
+        parameters: [{ name: "taskId", in: "path", required: true, schema: { type: "string" } }],
+        responses: {
+          200: { description: "The cancelled task", content: { "application/json": { schema: { type: "object", properties: { task: { $ref: "#/components/schemas/Task" } } } } } },
+          202: { description: "Cancellation requested; the run is still winding down or runs on another node" },
+          404: { description: "Task not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+          409: { description: "task_finished", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
         },
       },
     },

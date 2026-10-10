@@ -2,10 +2,19 @@
  * PostgreSQL Storage Provider
  */
 
-import { BaseStorageProvider } from "./base.js";
+import { BaseStorageProvider, type EventQuery, type StoredEventInput } from "./base.js";
 import { NotFoundError, ValidationError } from "../../types.js";
+import { nextStopReason } from "../../events.js";
 import { MAX_BUFFER_BYTES, pageResult } from "./shared.js";
 import type {
+  AcquireLeaseParams,
+  AcquireLeaseResult,
+  ConversationEvent,
+  EventSummary,
+  Lease,
+  ReleaseLeaseParams,
+  RenewLeaseParams,
+  RequestContext,
   Conversation,
   Message,
   FileRecord,
@@ -41,7 +50,7 @@ type PoolClient = {
 };
 
 /** Bumped when `migrate()` gains a step that must run once on existing databases. */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 /** `bytea` holds 1 GB; `jsonb` a little over 255 MiB. */
 const MAX_FILE_BYTES = 1_000_000_000;
@@ -59,6 +68,11 @@ const LIMITS = {
   mimeType: 255,
   callbackUrl: 2000,
   taskStatus: 50,
+  conversationId: 64,
+  eventType: 64,
+  runId: 64,
+  leaseKey: 128,
+  leaseOwner: 128,
 } as const;
 
 export interface PostgresConfig {
@@ -189,6 +203,8 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       ...super.capabilities(),
       maxFileBytes: Math.min(MAX_FILE_BYTES, MAX_BUFFER_BYTES),
       maxStateBytes: MAX_STATE_BYTES,
+      events: true,
+      leases: true,
     };
   }
 
@@ -204,6 +220,9 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       fileContents: `"${this.schema}"."${this.tablePrefix}file_contents"`,
       tasks: `"${this.schema}"."${this.tablePrefix}tasks"`,
       taskResults: `"${this.schema}"."${this.tablePrefix}task_results"`,
+      events: `"${this.schema}"."${this.tablePrefix}events"`,
+      eventStreams: `"${this.schema}"."${this.tablePrefix}event_streams"`,
+      leases: `"${this.schema}"."${this.tablePrefix}leases"`,
       meta: `"${this.schema}"."${this.tablePrefix}meta"`,
     };
   }
@@ -371,6 +390,7 @@ export class PostgresStorageProvider extends BaseStorageProvider {
         id VARCHAR(64) PRIMARY KEY,
         agent_id VARCHAR(255) NOT NULL,
         user_id VARCHAR(255),
+        conversation_id VARCHAR(64),
         status VARCHAR(50) NOT NULL DEFAULT 'pending',
         callback_url VARCHAR(2000),
         input TEXT NOT NULL,
@@ -407,67 +427,50 @@ export class PostgresStorageProvider extends BaseStorageProvider {
     const versionRow = await db.query<{ value: string }>(
       `SELECT value FROM ${this.tables.meta} WHERE key = 'schema_version'`
     );
-    if (Number(versionRow.rows[0]?.value ?? 1) >= SCHEMA_VERSION) return;
+    const version = Number(versionRow.rows[0]?.value ?? 1);
+    if (version >= SCHEMA_VERSION) return;
 
     // Schema version 2 (also what a fresh database gets after the tables above):
     // task comments, an insertion sequence for ordering, one result per task, and the
-    // indexes of the time-ordered lists. Every step is additive and repeatable.
+    // indexes of the time-ordered lists. Version 3: the event log, leases, and the
+    // conversation a task runs in. Every step is additive and repeatable.
     await db.query("BEGIN");
     try {
       const t = this.tables;
-      await db.query(`ALTER TABLE ${t.tasks} ADD COLUMN IF NOT EXISTS comments JSONB DEFAULT '[]'`);
-      for (const table of [t.conversations, t.messages, t.tasks]) {
-        // Rows created in the same millisecond keep their insertion order
-        await db.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS seq BIGINT GENERATED ALWAYS AS IDENTITY`);
-      }
+      if (version < 2) await this.migrateToV2(db);
 
-      // Databases from before this version may hold several results for one task: keep the newest
-      await db.query(
-        `DELETE FROM ${t.taskResults} a USING ${t.taskResults} b
-         WHERE a.task_id = b.task_id AND (a.created_at, a.id) < (b.created_at, b.id)`
-      );
-
-      const p = this.tablePrefix;
-      const indexes: Array<[string, string, string]> = [
-        ["conv_agent_t", t.conversations, "agent_id, created_at, seq"],
-        ["conv_user_t", t.conversations, "user_id, created_at, seq"],
-        ["conv_created", t.conversations, "created_at, seq"],
-        ["conv_updated", t.conversations, "updated_at, seq"],
-        ["msg_conv_t", t.messages, "conversation_id, created_at, seq"],
-        ["files_conv", t.files, "conversation_id"],
-        ["files_msg", t.files, "message_id"],
-        ["tasks_agent_t", t.tasks, "agent_id, created_at, seq"],
-        ["tasks_user_t", t.tasks, "user_id, created_at, seq"],
-        ["tasks_status_t", t.tasks, "status, created_at, seq"],
-        ["tasks_created", t.tasks, "created_at, seq"],
-      ];
-      for (const [name, table, columns] of indexes) {
-        await db.query(`CREATE INDEX IF NOT EXISTS "idx_${p}${name}" ON ${table} (${columns})`);
-      }
-      await db.query(
-        `CREATE UNIQUE INDEX IF NOT EXISTS "idx_${p}taskres_task_uq" ON ${t.taskResults} (task_id)`
-      );
-
-      // Index names are schema-wide in PostgreSQL, so the old unprefixed ones could belong to another
-      // prefix's tables. Drop a legacy index only when it is on one of ours.
-      const legacy: Array<[string, string]> = [
-        [t.conversations, "idx_conversations_agent_id"],
-        [t.conversations, "idx_conversations_user_id"],
-        [t.messages, "idx_messages_conversation_id"],
-        [t.files, "idx_files_conversation_id"],
-        [t.tasks, "idx_tasks_agent_id"],
-        [t.tasks, "idx_tasks_user_id"],
-        [t.tasks, "idx_tasks_status"],
-        [t.taskResults, "idx_task_results_task_id"],
-      ];
-      for (const [table, name] of legacy) {
-        const bare = table.split(".")[1]!.replaceAll('"', "");
-        const owned = await db.query(
-          "SELECT 1 FROM pg_indexes WHERE schemaname = $1 AND tablename = $2 AND indexname = $3",
-          [this.schema, bare, name]
-        );
-        if (owned.rows.length > 0) await db.query(`DROP INDEX IF EXISTS "${this.schema}"."${name}"`);
-      }
+      await db.query(`ALTER TABLE ${t.tasks} ADD COLUMN IF NOT EXISTS conversation_id VARCHAR(64)`);
+      await db.query(`CREATE INDEX IF NOT EXISTS "idx_${this.tablePrefix}tasks_conv" ON ${t.tasks} (conversation_id)`);
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS ${t.events} (
+          conversation_id VARCHAR(64) NOT NULL REFERENCES ${t.conversations}(id) ON DELETE CASCADE,
+          seq BIGINT NOT NULL,
+          type VARCHAR(64) NOT NULL,
+          data JSONB NOT NULL DEFAULT '{}',
+          run_id VARCHAR(64),
+          created_at TIMESTAMPTZ NOT NULL,
+          PRIMARY KEY (conversation_id, seq)
+        )
+      `);
+      await db.query(`CREATE INDEX IF NOT EXISTS "idx_${this.tablePrefix}events_created" ON ${t.events} (created_at)`);
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS ${t.eventStreams} (
+          conversation_id VARCHAR(64) PRIMARY KEY REFERENCES ${t.conversations}(id) ON DELETE CASCADE,
+          last_seq BIGINT NOT NULL,
+          stop_reason VARCHAR(64),
+          updated_at TIMESTAMPTZ NOT NULL
+        )
+      `);
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS ${t.leases} (
+          key VARCHAR(128) PRIMARY KEY,
+          owner VARCHAR(128) NOT NULL,
+          expires_at TIMESTAMPTZ NOT NULL,
+          data JSONB NOT NULL DEFAULT '{}',
+          cancel_requested BOOLEAN NOT NULL DEFAULT FALSE
+        )
+      `);
+      await db.query(`CREATE INDEX IF NOT EXISTS "idx_${this.tablePrefix}leases_expires" ON ${t.leases} (expires_at)`);
 
       await db.query(
         `INSERT INTO ${t.meta} (key, value) VALUES ('schema_version', $1)
@@ -478,6 +481,64 @@ export class PostgresStorageProvider extends BaseStorageProvider {
     } catch (error) {
       await db.query("ROLLBACK").catch(() => undefined);
       throw error;
+    }
+  }
+
+  /** Schema version 2 (runs inside the migration transaction). */
+  private async migrateToV2(db: PoolClient): Promise<void> {
+    const t = this.tables;
+    await db.query(`ALTER TABLE ${t.tasks} ADD COLUMN IF NOT EXISTS comments JSONB DEFAULT '[]'`);
+    for (const table of [t.conversations, t.messages, t.tasks]) {
+      // Rows created in the same millisecond keep their insertion order
+      await db.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS seq BIGINT GENERATED ALWAYS AS IDENTITY`);
+    }
+
+    // Databases from before this version may hold several results for one task: keep the newest
+    await db.query(
+      `DELETE FROM ${t.taskResults} a USING ${t.taskResults} b
+       WHERE a.task_id = b.task_id AND (a.created_at, a.id) < (b.created_at, b.id)`
+    );
+
+    const p = this.tablePrefix;
+    const indexes: Array<[string, string, string]> = [
+      ["conv_agent_t", t.conversations, "agent_id, created_at, seq"],
+      ["conv_user_t", t.conversations, "user_id, created_at, seq"],
+      ["conv_created", t.conversations, "created_at, seq"],
+      ["conv_updated", t.conversations, "updated_at, seq"],
+      ["msg_conv_t", t.messages, "conversation_id, created_at, seq"],
+      ["files_conv", t.files, "conversation_id"],
+      ["files_msg", t.files, "message_id"],
+      ["tasks_agent_t", t.tasks, "agent_id, created_at, seq"],
+      ["tasks_user_t", t.tasks, "user_id, created_at, seq"],
+      ["tasks_status_t", t.tasks, "status, created_at, seq"],
+      ["tasks_created", t.tasks, "created_at, seq"],
+    ];
+    for (const [name, table, columns] of indexes) {
+      await db.query(`CREATE INDEX IF NOT EXISTS "idx_${p}${name}" ON ${table} (${columns})`);
+    }
+    await db.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS "idx_${p}taskres_task_uq" ON ${t.taskResults} (task_id)`
+    );
+
+    // Index names are schema-wide in PostgreSQL, so the old unprefixed ones could belong to another
+    // prefix's tables. Drop a legacy index only when it is on one of ours.
+    const legacy: Array<[string, string]> = [
+      [t.conversations, "idx_conversations_agent_id"],
+      [t.conversations, "idx_conversations_user_id"],
+      [t.messages, "idx_messages_conversation_id"],
+      [t.files, "idx_files_conversation_id"],
+      [t.tasks, "idx_tasks_agent_id"],
+      [t.tasks, "idx_tasks_user_id"],
+      [t.tasks, "idx_tasks_status"],
+      [t.taskResults, "idx_task_results_task_id"],
+    ];
+    for (const [table, name] of legacy) {
+      const bare = table.split(".")[1]!.replaceAll('"', "");
+      const owned = await db.query(
+        "SELECT 1 FROM pg_indexes WHERE schemaname = $1 AND tablename = $2 AND indexname = $3",
+        [this.schema, bare, name]
+      );
+      if (owned.rows.length > 0) await db.query(`DROP INDEX IF EXISTS "${this.schema}"."${name}"`);
     }
   }
 
@@ -824,13 +885,14 @@ export class PostgresStorageProvider extends BaseStorageProvider {
     const now = new Date();
     const result = await this.pool.query<DbTask>(
       `INSERT INTO ${this.tables.tasks}
-       (id, agent_id, user_id, status, callback_url, input, files, comments, metadata, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, '[]', $8, $9, $9)
+       (id, agent_id, user_id, conversation_id, status, callback_url, input, files, comments, metadata, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '[]', $9, $10, $10)
        RETURNING *`,
       [
         id,
         fits("agentId", params.agentId, LIMITS.agentId),
         fits("userId", params.userId || null, LIMITS.userId),
+        fits("conversationId", params.conversationId || null, LIMITS.conversationId),
         "pending",
         fits("callbackUrl", params.callbackUrl || null, LIMITS.callbackUrl),
         encodeText(params.input),
@@ -877,6 +939,10 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       conditions.push(`status = $${paramIndex++}`);
       values.push(params.status);
     }
+    if (params.conversationId) {
+      conditions.push(`conversation_id = $${paramIndex++}`);
+      values.push(params.conversationId);
+    }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
@@ -919,6 +985,10 @@ export class PostgresStorageProvider extends BaseStorageProvider {
     if (params.status !== undefined) {
       updates.push(`status = $${paramIndex++}`);
       values.push(fits("status", params.status, LIMITS.taskStatus));
+    }
+    if (params.conversationId !== undefined) {
+      updates.push(`conversation_id = $${paramIndex++}`);
+      values.push(fits("conversationId", params.conversationId, LIMITS.conversationId));
     }
     if (params.startedAt !== undefined) {
       updates.push(`started_at = $${paramIndex++}`);
@@ -1017,6 +1087,224 @@ export class PostgresStorageProvider extends BaseStorageProvider {
   }
 
   // ============================================================================
+  // Events
+  // ============================================================================
+
+  protected async _appendEvents(
+    conversationId: string,
+    events: StoredEventInput[]
+  ): Promise<ConversationEvent[]> {
+    return this.withTransaction(async (db) => {
+      // The counter row is the lock: appends to one conversation queue up behind each other, so
+      // the sequence ascends without gaps or repeats. Creating it also checks the conversation exists.
+      try {
+        await db.query(
+          `INSERT INTO ${this.tables.eventStreams} (conversation_id, last_seq, updated_at)
+           VALUES ($1, 0, $2) ON CONFLICT (conversation_id) DO NOTHING`,
+          [conversationId, events[0]!.createdAt]
+        );
+      } catch (error) {
+        if ((error as { code?: string }).code === "23503") throw new NotFoundError("Conversation", conversationId);
+        throw error;
+      }
+      const stream = await db.query<{ last_seq: string; stop_reason: string | null }>(
+        `SELECT last_seq, stop_reason FROM ${this.tables.eventStreams} WHERE conversation_id = $1 FOR UPDATE`,
+        [conversationId]
+      );
+      let seq = Number(stream.rows[0]!.last_seq);
+
+      const stored: ConversationEvent[] = [];
+      for (const event of events) {
+        seq += 1;
+        await db.query(
+          `INSERT INTO ${this.tables.events} (conversation_id, seq, type, data, run_id, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            conversationId,
+            seq,
+            fits("event type", event.type, LIMITS.eventType),
+            toJsonb(event.data),
+            fits("event runId", event.runId ?? null, LIMITS.runId),
+            event.createdAt,
+          ]
+        );
+        stored.push({
+          conversationId,
+          seq,
+          type: event.type,
+          data: event.data,
+          runId: event.runId,
+          createdAt: event.createdAt,
+        });
+      }
+      await db.query(
+        `UPDATE ${this.tables.eventStreams} SET last_seq = $2, stop_reason = $3, updated_at = $4 WHERE conversation_id = $1`,
+        [conversationId, seq, nextStopReason(stream.rows[0]!.stop_reason, events) ?? null, events[events.length - 1]!.createdAt]
+      );
+      return stored;
+    });
+  }
+
+  protected async _listEvents(conversationId: string, query: EventQuery): Promise<ConversationEvent[]> {
+    if (!this.pool) throw new Error("Pool not initialized");
+
+    const conditions = ["conversation_id = $1", "seq > $2"];
+    const values: unknown[] = [conversationId, query.after];
+    if (query.before !== undefined) {
+      values.push(query.before);
+      conditions.push(`seq < $${values.length}`);
+    }
+    if (query.types?.length) {
+      values.push(query.types);
+      conditions.push(`type = ANY($${values.length}::varchar[])`);
+    }
+    values.push(query.limit);
+    const result = await this.pool.query<DbEvent>(
+      `SELECT * FROM ${this.tables.events} WHERE ${conditions.join(" AND ")}
+       ORDER BY seq ${query.order === "desc" ? "DESC" : "ASC"} LIMIT $${values.length}`,
+      values
+    );
+    return result.rows.map((row) => this.mapEvent(row));
+  }
+
+  protected async _eventSummaries(conversationIds: string[]): Promise<Record<string, EventSummary>> {
+    if (!this.pool) throw new Error("Pool not initialized");
+    const result = await this.pool.query<{ conversation_id: string; last_seq: string; stop_reason: string | null }>(
+      `SELECT conversation_id, last_seq, stop_reason FROM ${this.tables.eventStreams}
+       WHERE conversation_id = ANY($1::varchar[])`,
+      [conversationIds]
+    );
+    const out: Record<string, EventSummary> = {};
+    for (const row of result.rows) {
+      out[row.conversation_id] = { lastSeq: Number(row.last_seq), ...(row.stop_reason ? { stopReason: row.stop_reason } : {}) };
+    }
+    return out;
+  }
+
+  protected async _pruneEvents(before: Date): Promise<number> {
+    if (!this.pool) throw new Error("Pool not initialized");
+    const result = await this.pool.query(`DELETE FROM ${this.tables.events} WHERE created_at < $1`, [before]);
+    return result.rowCount ?? 0;
+  }
+
+  private mapEvent(row: DbEvent): ConversationEvent {
+    return {
+      conversationId: row.conversation_id,
+      seq: Number(row.seq),
+      type: row.type,
+      data: row.data,
+      runId: row.run_id || undefined,
+      createdAt: new Date(row.created_at),
+    };
+  }
+
+  // ============================================================================
+  // Leases
+  // ============================================================================
+
+  private mapLease(row: DbLease): Lease {
+    return {
+      key: row.key,
+      owner: row.owner,
+      expiresAt: new Date(row.expires_at),
+      data: row.data,
+      cancelRequested: row.cancel_requested === true,
+    };
+  }
+
+  protected async _acquireLease(
+    params: AcquireLeaseParams & { now: Date; expiresAt: Date },
+    _ctx?: RequestContext
+  ): Promise<AcquireLeaseResult> {
+    const key = fits("lease key", params.key, LIMITS.leaseKey)!;
+    const owner = fits("lease owner", params.owner, LIMITS.leaseOwner)!;
+
+    return this.withTransaction(async (db): Promise<AcquireLeaseResult> => {
+      // The row lock decides between two nodes that ask at once. A key nobody has used yet has no row
+      // to lock, so the first insert races: the loser's insert is a no-op and it looks again.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const found = await db.query<DbLease>(`SELECT * FROM ${this.tables.leases} WHERE key = $1 FOR UPDATE`, [key]);
+        const row = found.rows[0];
+        if (!row) {
+          const inserted = await db.query<DbLease>(
+            `INSERT INTO ${this.tables.leases} (key, owner, expires_at, data, cancel_requested)
+             VALUES ($1, $2, $3, $4, FALSE) ON CONFLICT (key) DO NOTHING RETURNING *`,
+            [key, owner, params.expiresAt, toJsonb(params.data ?? {})]
+          );
+          if (inserted.rows[0]) return { acquired: true, lease: this.mapLease(inserted.rows[0]) };
+          continue;
+        }
+        const live = new Date(row.expires_at).getTime() > params.now.getTime();
+        if (live && row.owner !== owner) return { acquired: false, lease: this.mapLease(row) };
+        const updated = await db.query<DbLease>(
+          `UPDATE ${this.tables.leases}
+           SET owner = $2, expires_at = $3, data = $4, cancel_requested = FALSE WHERE key = $1 RETURNING *`,
+          [key, owner, params.expiresAt, toJsonb(params.data ?? {})]
+        );
+        // An expired lease is the residue of a holder that died
+        return !live
+          ? { acquired: true, lease: this.mapLease(updated.rows[0]!), takenOver: this.mapLease(row) }
+          : { acquired: true, lease: this.mapLease(updated.rows[0]!) };
+      }
+      throw new Error(`Could not acquire the lease ${key}: it keeps changing hands`);
+    });
+  }
+
+  protected async _renewLease(params: RenewLeaseParams & { now: Date; expiresAt: Date }): Promise<Lease | null> {
+    if (!this.pool) throw new Error("Pool not initialized");
+    const result = await this.pool.query<DbLease>(
+      `UPDATE ${this.tables.leases} SET expires_at = $3
+       WHERE key = $1 AND owner = $2 AND expires_at > $4 RETURNING *`,
+      [params.key, params.owner, params.expiresAt, params.now]
+    );
+    return result.rows[0] ? this.mapLease(result.rows[0]) : null;
+  }
+
+  protected async _releaseLease(params: ReleaseLeaseParams): Promise<boolean> {
+    if (!this.pool) throw new Error("Pool not initialized");
+    const result = await this.pool.query(`DELETE FROM ${this.tables.leases} WHERE key = $1 AND owner = $2`, [
+      params.key,
+      params.owner,
+    ]);
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  protected async _getLeases(keys: string[], now: Date): Promise<Lease[]> {
+    if (!this.pool) throw new Error("Pool not initialized");
+    const result = await this.pool.query<DbLease>(
+      `SELECT * FROM ${this.tables.leases} WHERE key = ANY($1::varchar[]) AND expires_at > $2`,
+      [keys, now]
+    );
+    return result.rows.map((row) => this.mapLease(row));
+  }
+
+  protected async _markLeaseCancel(key: string, now: Date): Promise<boolean> {
+    if (!this.pool) throw new Error("Pool not initialized");
+    const result = await this.pool.query(
+      `UPDATE ${this.tables.leases} SET cancel_requested = TRUE WHERE key = $1 AND expires_at > $2`,
+      [key, now]
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  protected async _listExpiredLeases(params: { prefix?: string; limit: number; now: Date }): Promise<Lease[]> {
+    if (!this.pool) throw new Error("Pool not initialized");
+    const values: unknown[] = [params.now];
+    let prefix = "";
+    if (params.prefix) {
+      values.push(params.prefix.length, params.prefix);
+      prefix = `AND left(key, $2) = $3`;
+    }
+    values.push(params.limit);
+    const result = await this.pool.query<DbLease>(
+      `SELECT * FROM ${this.tables.leases} WHERE expires_at <= $1 ${prefix}
+       ORDER BY expires_at, key LIMIT $${values.length}`,
+      values
+    );
+    return result.rows.map((row) => this.mapLease(row));
+  }
+
+  // ============================================================================
   // Mappers
   // ============================================================================
 
@@ -1072,6 +1360,7 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       id: row.id,
       agentId: row.agent_id,
       userId: row.user_id || undefined,
+      conversationId: row.conversation_id || undefined,
       status: row.status as Task["status"],
       callbackUrl: row.callback_url || undefined,
       input: decodeText(row.input),
@@ -1151,6 +1440,7 @@ interface DbTask {
   id: string;
   agent_id: string;
   user_id: string | null;
+  conversation_id: string | null;
   status: string;
   callback_url: string | null;
   input: string;
@@ -1162,6 +1452,23 @@ interface DbTask {
   started_at: string | null;
   completed_at: string | null;
   error: string | null;
+}
+
+interface DbEvent {
+  conversation_id: string;
+  seq: string | number;
+  type: string;
+  data: Record<string, unknown>;
+  run_id: string | null;
+  created_at: string;
+}
+
+interface DbLease {
+  key: string;
+  owner: string;
+  expires_at: string;
+  data: Record<string, unknown>;
+  cancel_requested: boolean;
 }
 
 interface DbTaskResult {
