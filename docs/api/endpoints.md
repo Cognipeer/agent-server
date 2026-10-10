@@ -75,6 +75,8 @@ GET /conversations
 | userId | string | Filter by user ID |
 | limit | number | Max results (default: 20) |
 | offset | number | Pagination offset (default: 0) |
+| orderBy | string | `createdAt` (default) or `updatedAt` (last activity) |
+| order | string | `desc` (default, newest first) or `asc` |
 
 **Response:**
 
@@ -132,7 +134,18 @@ POST /conversations
 GET /conversations/:id
 ```
 
-Returns conversation with messages.
+Returns the conversation and one page of its messages: the **newest** `limit` messages, oldest first within the page.
+
+**Query Parameters:**
+
+| Name | Description |
+| --- | --- |
+| `limit` | Messages per page (default 100, at most 200; `limits.messagePageSize` / `limits.maxPageSize`) |
+| `before` | Only messages older than this message id (use the id of the first message you have to page back) |
+| `after` | Only messages newer than this message id |
+| `order` | `asc` (default) or `desc`, the order of the returned page |
+
+`before` and `after` together are a 400; an id that is not a message of this conversation is a 404.
 
 **Response:**
 
@@ -142,23 +155,24 @@ Returns conversation with messages.
     "id": "conv_123",
     "agentId": "assistant",
     "title": "My Chat",
-    "messages": [
-      {
-        "id": "msg_1",
-        "role": "user",
-        "content": "Hello!",
-        "createdAt": "2025-01-01T00:00:00.000Z"
-      },
-      {
-        "id": "msg_2",
-        "role": "assistant",
-        "content": "Hi there! How can I help?",
-        "createdAt": "2025-01-01T00:00:01.000Z"
-      }
-    ],
     "createdAt": "2025-01-01T00:00:00.000Z",
     "updatedAt": "2025-01-01T00:00:01.000Z"
-  }
+  },
+  "messages": [
+    {
+      "id": "msg_1",
+      "role": "user",
+      "content": "Hello!",
+      "createdAt": "2025-01-01T00:00:00.000Z"
+    },
+    {
+      "id": "msg_2",
+      "role": "assistant",
+      "content": "Hi there! How can I help?",
+      "createdAt": "2025-01-01T00:00:01.000Z"
+    }
+  ],
+  "messagesPage": { "limit": 100, "order": "asc", "hasMoreBefore": false, "hasMoreAfter": false }
 }
 ```
 

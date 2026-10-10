@@ -65,7 +65,7 @@ export function createNextHandler(
   return async (request, _context) => {
     try {
       const url = new URL(request.url);
-      let path = url.pathname;
+      const path = url.pathname;
 
       // Remove basePath prefix if present
       if (path.startsWith(basePath)) {

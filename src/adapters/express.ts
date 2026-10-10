@@ -188,7 +188,6 @@ export function createExpressRouter(
  * Mount AgentServer on an Express app
  */
 export function mountOnExpress(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   app: { use: (path: string, handler: RequestHandler) => void } | any,
   server: AgentServer,
   options: ExpressAdapterOptions = {}

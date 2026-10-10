@@ -216,8 +216,32 @@ function generateSchemas(): Record<string, unknown> {
           type: "array",
           items: { $ref: "#/components/schemas/PendingAction" },
         },
+        warnings: { type: "array", items: { $ref: "#/components/schemas/TurnWarning" } },
       },
       required: ["message", "response"],
+    },
+    TurnWarning: {
+      type: "object",
+      description:
+        "Something worth knowing about a turn that completed anyway; also stored on the assistant message as metadata.warnings. " +
+        "Code pause_state_too_large: the turn needed a human but its state did not fit the store (limits.maxStateBytes or the provider's limit), so it was not paused.",
+      properties: {
+        code: { type: "string", example: "pause_state_too_large" },
+        message: { type: "string" },
+        stateBytes: { type: "integer" },
+        maxStateBytes: { type: "integer" },
+      },
+      required: ["code", "message"],
+    },
+    MessagesPage: {
+      type: "object",
+      description: "Where a page of GET /conversations/{id} messages sits in the conversation.",
+      properties: {
+        limit: { type: "integer" },
+        order: { type: "string", enum: ["asc", "desc"] },
+        hasMoreBefore: { type: "boolean", description: "Older messages exist than the oldest one returned." },
+        hasMoreAfter: { type: "boolean", description: "Newer messages exist than the newest one returned." },
+      },
     },
     PendingAction: {
       type: "object",
@@ -312,6 +336,7 @@ function generateSchemas(): Record<string, unknown> {
         },
         status: { type: "string", enum: ["completed", "requires_action", "incomplete", "cancelled"] },
         pendingActions: { type: "array", items: { $ref: "#/components/schemas/PendingAction" } },
+        warnings: { type: "array", items: { $ref: "#/components/schemas/TurnWarning" } },
       },
       required: ["response"],
     },
@@ -458,6 +483,7 @@ function generateSchemas(): Record<string, unknown> {
         },
         status: { type: "string", enum: ["completed", "requires_action", "incomplete", "cancelled"] },
         pendingActions: { type: "array", items: { $ref: "#/components/schemas/PendingAction" } },
+        warnings: { type: "array", items: { $ref: "#/components/schemas/TurnWarning" } },
       },
     },
     StreamActionRequiredEvent: {
@@ -753,6 +779,18 @@ function generatePaths(
             in: "query",
             schema: { type: "integer", default: 0 },
           },
+          {
+            name: "orderBy",
+            in: "query",
+            description: "createdAt (default) or updatedAt (last activity)",
+            schema: { type: "string", enum: ["createdAt", "updatedAt"], default: "createdAt" },
+          },
+          {
+            name: "order",
+            in: "query",
+            description: "desc (default, newest first) or asc",
+            schema: { type: "string", enum: ["asc", "desc"], default: "desc" },
+          },
         ],
         responses: {
           200: {
@@ -805,7 +843,10 @@ function generatePaths(
     "/conversations/{conversationId}": {
       get: {
         tags: ["Conversations"],
-        summary: "Get conversation with messages",
+        summary: "Get conversation with one page of its messages",
+        description:
+          "Returns the newest `limit` messages (oldest first within the page) unless `before` or `after` is given. " +
+          "Page backwards with `before=<id of the first message returned>`; `messagesPage` says whether there is more on either side.",
         operationId: "getConversation",
         parameters: [
           {
@@ -814,10 +855,34 @@ function generatePaths(
             required: true,
             schema: { type: "string" },
           },
+          {
+            name: "limit",
+            in: "query",
+            description: "Messages per page (default limits.messagePageSize = 100, at most limits.maxPageSize = 200)",
+            schema: { type: "integer", minimum: 1 },
+          },
+          {
+            name: "before",
+            in: "query",
+            description: "Only messages older than this message id",
+            schema: { type: "string" },
+          },
+          {
+            name: "after",
+            in: "query",
+            description: "Only messages newer than this message id",
+            schema: { type: "string" },
+          },
+          {
+            name: "order",
+            in: "query",
+            description: "Order of the returned page",
+            schema: { type: "string", enum: ["asc", "desc"], default: "asc" },
+          },
         ],
         responses: {
           200: {
-            description: "Conversation details with messages",
+            description: "Conversation details with a page of messages",
             content: {
               "application/json": {
                 schema: {
@@ -828,8 +893,21 @@ function generatePaths(
                       type: "array",
                       items: { $ref: "#/components/schemas/Message" },
                     },
+                    messagesPage: { $ref: "#/components/schemas/MessagesPage" },
+                    pendingActions: {
+                      type: "array",
+                      items: { $ref: "#/components/schemas/PendingAction" },
+                    },
                   },
                 },
+              },
+            },
+          },
+          400: {
+            description: "Both before and after were given",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/Error" },
               },
             },
           },

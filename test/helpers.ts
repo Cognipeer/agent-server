@@ -16,7 +16,7 @@ export function spyStorage(inner: StorageProvider): { storage: StorageProvider; 
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver);
       if (typeof value !== "function" || typeof prop !== "string") return value;
-      if (["connect", "disconnect", "isConnected"].includes(prop)) return value.bind(target);
+      if (["connect", "disconnect", "isConnected", "capabilities"].includes(prop)) return value.bind(target);
       return (...args: unknown[]) => {
         calls.push({ method: prop, ctx: args[args.length - 1] });
         return value.apply(target, args);

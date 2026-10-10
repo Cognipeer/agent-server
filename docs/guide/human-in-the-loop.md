@@ -62,7 +62,14 @@ createAgentServer({ basePath: '/api', storage, pendingActionPolicy: 'cancel' });
 
 `AgentInfo.capabilities` (`{ toolApproval?, askUser? }`) is derived from the agent instance when possible, or pass `capabilities` in the registration info.
 
-The paused state lives in `Conversation.state`, so use a persistent storage provider if a pause must survive a restart.
+The paused state lives in `Conversation.state`, so use a persistent storage provider if a pause must survive a restart. Every built-in provider
+keeps it across a restart (a new server on the same database resolves a pause started by the old one).
+
+**It has to fit.** A long transcript or big tool results make a big state, and a store holds only so much (MongoDB: 12 MiB by default, see
+[Storage Providers](./storage.md)). When the state would not fit - `limits.maxStateBytes`, or the provider's own limit, whichever is smaller -
+the server does **not** pause the turn. It finishes instead: the assistant message gets `metadata.warnings` with a `pause_state_too_large` entry (also `warnings`
+on the response and on `stream.done`), no action is left pending, and the tool call is not carried out. A turn that gets that far is never stranded
+half-written: if the store refuses the write, the assistant message is taken back out.
 
 ## Custom handlers
 

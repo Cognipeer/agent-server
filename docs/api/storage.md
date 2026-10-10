@@ -81,6 +81,9 @@ interface MongoDBConfig {
 
   // Auto-create indexes (default: true)
   autoIndex?: boolean;
+
+  // Largest conversation state in bytes (default 12 MiB, at most 15 MiB): a document is limited to 16 MiB
+  maxStateBytes?: number;
 }
 ```
 
@@ -96,14 +99,14 @@ const storage = createMongoDBProvider({
 await storage.connect();
 ```
 
-## createMemoryProvider
+## createInMemoryProvider
 
 Creates an in-memory storage provider (for development).
 
 ```typescript
-import { createMemoryProvider } from '@cognipeer/agent-server';
+import { createInMemoryProvider } from '@cognipeer/agent-server';
 
-const storage = createMemoryProvider();
+const storage = createInMemoryProvider();
 await storage.connect();
 ```
 

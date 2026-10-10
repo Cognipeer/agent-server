@@ -56,6 +56,8 @@ import type {
   ResolveActionRequest,
   ResolveActionResponse,
   AgentCapabilities,
+  TurnWarning,
+  MessagesPage,
 } from "./types.js";
 import {
   HITL_STATE_KEY,
@@ -82,6 +84,14 @@ import {
   type ResponsesApiConfig,
 } from "./providers/ai/responses.js";
 import { bindStreamToContext, normalizeHeaders, parseCookies, runWithRequestContext } from "./context.js";
+
+/** Largest file the upload route accepts when `limits.maxFileSize` is not set (capped by the storage provider). */
+const DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024;
+const DEFAULT_MESSAGE_PAGE_SIZE = 100;
+
+/** Shown when a turn could not pause and the model had said nothing yet. */
+const PAUSE_NOT_STORED_NOTICE =
+  "This step needed your approval, but the conversation is too large to pause. It was not carried out.";
 
 /**
  * Helper to safely extract tool event properties with fallbacks
@@ -261,12 +271,16 @@ interface Route {
 }
 
 /** Page size is capped and offset floored, so a hostile query string never reaches the storage layer raw. */
-const MAX_PAGE_SIZE = 200;
-function parsePaging(query: Record<string, unknown>, defaultLimit: number): { limit: number; offset: number } {
+const DEFAULT_MAX_PAGE_SIZE = 200;
+function parsePaging(
+  query: Record<string, unknown>,
+  defaultLimit: number,
+  maxLimit = DEFAULT_MAX_PAGE_SIZE
+): { limit: number; offset: number } {
   const limit = parseInt(String(query.limit ?? ""), 10);
   const offset = parseInt(String(query.offset ?? ""), 10);
   return {
-    limit: Number.isFinite(limit) && limit > 0 ? Math.min(limit, MAX_PAGE_SIZE) : defaultLimit,
+    limit: Number.isFinite(limit) && limit > 0 ? Math.min(limit, maxLimit) : Math.min(defaultLimit, maxLimit),
     offset: Number.isFinite(offset) && offset > 0 ? offset : 0,
   };
 }
@@ -285,7 +299,69 @@ export class AgentServer {
     if (Array.isArray(config.agents)) {
       for (const registration of config.agents) this.agents.set(registration.info.id, registration);
     }
+    this.validateStorageLimits();
     this.setupRoutes();
+  }
+
+  // ============================================================================
+  // Limits that depend on the storage provider
+  // ============================================================================
+
+  private get maxPageSize(): number {
+    const configured = this.config.limits?.maxPageSize;
+    return configured && configured > 0 ? Math.floor(configured) : DEFAULT_MAX_PAGE_SIZE;
+  }
+
+  private get messagePageSize(): number {
+    const configured = this.config.limits?.messagePageSize;
+    return configured && configured > 0 ? Math.floor(configured) : DEFAULT_MESSAGE_PAGE_SIZE;
+  }
+
+  /** Largest accepted upload: `limits.maxFileSize`, else 10 MiB capped by what the storage provider can hold. */
+  private get maxFileSize(): number {
+    const configured = this.config.limits?.maxFileSize;
+    if (configured) return configured;
+    return Math.min(DEFAULT_MAX_FILE_SIZE, this.config.storage.capabilities?.().maxFileBytes ?? DEFAULT_MAX_FILE_SIZE);
+  }
+
+  /** Largest conversation state a pause may store: the tighter of `limits.maxStateBytes` and the provider's own. */
+  private get maxStateBytes(): number {
+    const provider = this.config.storage.capabilities?.().maxStateBytes ?? Number.MAX_SAFE_INTEGER;
+    return Math.min(provider, this.config.limits?.maxStateBytes ?? Number.MAX_SAFE_INTEGER);
+  }
+
+  /** A limit the operator set above what the storage provider can hold is a configuration error, found at startup. */
+  private validateStorageLimits(): void {
+    const capabilities = this.config.storage.capabilities?.();
+    if (!capabilities) return;
+    const { maxFileSize, maxStateBytes } = this.config.limits ?? {};
+    if (maxFileSize && maxFileSize > capabilities.maxFileBytes) {
+      throw new Error(
+        `limits.maxFileSize (${maxFileSize} bytes) is larger than the ${capabilities.maxFileBytes} bytes this storage provider can hold`
+      );
+    }
+    if (maxStateBytes && maxStateBytes > capabilities.maxStateBytes) {
+      throw new Error(
+        `limits.maxStateBytes (${maxStateBytes} bytes) is larger than the ${capabilities.maxStateBytes} bytes this storage provider can hold`
+      );
+    }
+  }
+
+  /**
+   * The whole conversation, oldest first, for the agent. Read in pages: a storage
+   * provider answers at most one page per call (100 by default), and an agent
+   * that only saw the first page would never see the newest messages.
+   */
+  private async loadHistory(conversationId: string, rc?: RequestContext): Promise<Message[]> {
+    const history: Message[] = [];
+    const pageSize = this.maxPageSize;
+    for (let offset = 0; ; ) {
+      const page = await this.config.storage.getMessages(conversationId, { order: "asc", limit: pageSize, offset }, rc);
+      history.push(...page.data);
+      offset += page.data.length;
+      // `total` guards a custom store that ignores `offset` (and would otherwise answer page one forever)
+      if (!page.hasMore || page.data.length === 0 || history.length >= page.total) return history;
+    }
   }
 
   // ============================================================================
@@ -934,17 +1010,23 @@ export class AgentServer {
   ): Promise<RouteResult<ListConversationsResponse>> {
     const agentId = ctx.query.agentId as string | undefined;
     const userId = ctx.query.userId as string | undefined;
-    const { limit, offset } = parsePaging(ctx.query, 20);
+    const { limit, offset } = parsePaging(ctx.query, 20, this.maxPageSize);
 
     // Resolve userId: from query param, ctx.user (token), or resolveUserId callback
     const resolvedUserId = await this.effectiveUserId(ctx, userId);
     const registry = await this.resolveRegistry(ctx.context!);
+
+    // Newest created first by default; `orderBy=updatedAt` lists by last activity, `order=asc` reverses
+    const orderBy = ctx.query.orderBy === "updatedAt" ? "updatedAt" : "createdAt";
+    const order = ctx.query.order === "asc" ? "asc" : "desc";
 
     const result = await this.config.storage.getConversations({
       agentId,
       userId: resolvedUserId,
       limit,
       offset,
+      orderBy,
+      order,
     }, ctx.context);
 
     return {
@@ -1017,16 +1099,66 @@ export class AgentServer {
     // Verify user has access to this conversation
     await this.verifyConversationAccess(conversation, ctx);
 
-    const messagesResult = await this.config.storage.getMessages(conversationId, undefined, ctx.context);
+    const { messages, page } = await this.loadMessagesPage(conversationId, ctx);
     const pendingActions = readHitl(conversation.state)?.pending?.actions;
 
     return {
       status: 200,
       body: {
         conversation: this.publicConversation(conversation),
-        messages: messagesResult.data,
+        messages,
+        messagesPage: page,
         ...(pendingActions?.length && { pendingActions }),
       },
+    };
+  }
+
+  /**
+   * One page of a conversation's history for `GET /conversations/:id`: `limit` messages
+   * (default `limits.messagePageSize`), the NEWEST ones unless `before=<messageId>` (the ones
+   * just older than it) or `after=<messageId>` (just newer) say otherwise, always returned in
+   * `order` (`asc` default). Page backwards with `before=<first message id>`.
+   */
+  private async loadMessagesPage(
+    conversationId: string,
+    ctx: RouteContext
+  ): Promise<{ messages: Message[]; page: MessagesPage }> {
+    const { limit } = parsePaging(ctx.query, this.messagePageSize, this.maxPageSize);
+    const order: MessagesPage["order"] = ctx.query.order === "desc" ? "desc" : "asc";
+    const one = (value: string | string[] | undefined) => (Array.isArray(value) ? value[0] : value) || undefined;
+    const before = one(ctx.query.before);
+    const after = one(ctx.query.after);
+    if (before && after) {
+      throw { statusCode: 400, code: "VALIDATION_ERROR", message: "Use either before or after, not both" } as ValidationError;
+    }
+
+    const cursor = before ?? after;
+    if (cursor) {
+      const anchor = await this.config.storage.getMessage(cursor, ctx.context);
+      if (!anchor || anchor.conversationId !== conversationId) {
+        throw { statusCode: 404, code: "NOT_FOUND", message: `Message not found: ${cursor}` } as NotFoundError;
+      }
+    }
+
+    let chronological: Message[];
+    let hasMoreBefore: boolean;
+    let hasMoreAfter: boolean;
+    if (after) {
+      const result = await this.config.storage.getMessages(conversationId, { after, order: "asc", limit }, ctx.context);
+      chronological = result.data;
+      hasMoreBefore = true; // the anchor itself
+      hasMoreAfter = result.hasMore;
+    } else {
+      // Newest first so that `limit` takes the ones nearest the end (or the cursor), then back to chronological
+      const result = await this.config.storage.getMessages(conversationId, { before, order: "desc", limit }, ctx.context);
+      chronological = [...result.data].reverse();
+      hasMoreBefore = result.hasMore;
+      hasMoreAfter = Boolean(before);
+    }
+
+    return {
+      messages: order === "asc" ? chronological : [...chronological].reverse(),
+      page: { limit, order, hasMoreBefore, hasMoreAfter },
     };
   }
 
@@ -1081,7 +1213,7 @@ export class AgentServer {
 
   private async handleListMessages(ctx: RouteContext): Promise<RouteResult> {
     const { conversationId } = ctx.params;
-    const { limit, offset } = parsePaging(ctx.query, 100);
+    const { limit, offset } = parsePaging(ctx.query, this.messagePageSize, this.maxPageSize);
     const order = (ctx.query.order as string) === "desc" ? "desc" : "asc";
 
     // Check if conversation exists
@@ -1214,9 +1346,7 @@ export class AgentServer {
     }, ctx.context);
 
     // Get previous messages for context
-    const previousMessages = await this.config.storage.getMessages(conversationId, {
-      order: "asc",
-    }, ctx.context);
+    const history = await this.loadHistory(conversationId, ctx.context);
 
     // Process with agent
     let responseContent: string;
@@ -1233,7 +1363,7 @@ export class AgentServer {
       const sdkAgent = agent.sdkAgent as HitlSdkAgent;
 
       // Map messages with tool_calls and tool_call_id preserved
-      const messages = toSdkMessages(previousMessages.data);
+      const messages = toSdkMessages(history);
 
       const run = await runSdkTurn(
         sdkAgent,
@@ -1251,7 +1381,7 @@ export class AgentServer {
       }
     } else if (agent.chatCompletions) {
       // Use Chat Completions API
-      const messages = previousMessages.data.map((m) => ({
+      const messages = history.map((m) => ({
         role: m.role,
         content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
         ...(m.toolCalls && m.toolCalls.length > 0 && {
@@ -1270,7 +1400,7 @@ export class AgentServer {
       usage = result.usage;
     } else if (agent.responsesApi) {
       // Use Responses API
-      const messages = previousMessages.data.map((m) => ({
+      const messages = history.map((m) => ({
         role: m.role,
         content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
       }));
@@ -1314,20 +1444,22 @@ export class AgentServer {
       };
     }
 
-    // Save assistant message
-    const assistantMessage = await this.config.storage.createMessage({
-      conversationId,
-      role: "assistant",
+    // Save assistant message (and what it waits on)
+    const saved = await this.saveAssistantTurn(ctx, conversation, {
       content: responseContent,
       files: responseFiles,
-      ...(pendingActions.length > 0 && { metadata: { requiresAction: true } }),
-    }, ctx.context);
-
-    await this.persistPendingActions(ctx, conversation, handlerState, assistantMessage.id, pendingActions, pausedSdkState);
+      handlerState,
+      actions: pendingActions,
+      sdkState: pausedSdkState,
+      status: turnStatus,
+    });
+    const assistantMessage = saved.message;
+    pendingActions = saved.actions;
+    turnStatus = saved.status;
 
     // Auto-generate title on the first exchange
     let conversationTitle: string | undefined;
-    if (!conversation.title && previousMessages.data.length === 1) {
+    if (!conversation.title && history.length === 1) {
       conversationTitle = await this.generateTitle(body.message);
       if (conversationTitle) {
         await this.config.storage.updateConversation(conversationId, { title: conversationTitle }, ctx.context);
@@ -1343,8 +1475,99 @@ export class AgentServer {
         usage,
         ...(turnStatus && turnStatus !== "completed" && { status: turnStatus }),
         ...(pendingActions.length > 0 && { pendingActions }),
+        ...(saved.warnings && { warnings: saved.warnings }),
       },
     };
+  }
+
+  /**
+   * Saves the assistant message of a turn and what it waits on. A pause whose state the
+   * store cannot hold (`limits.maxStateBytes`, or the provider's own limit) is not taken:
+   * the turn finishes as if it had not paused and the message carries a
+   * `pause_state_too_large` warning, instead of failing after the message was written.
+   */
+  private async saveAssistantTurn(
+    ctx: RouteContext,
+    conversation: Conversation,
+    turn: {
+      content: string;
+      files?: Message["files"];
+      /** State a handler wrote this turn; without it the conversation's own is kept. */
+      handlerState?: Record<string, unknown>;
+      actions: PendingAction[];
+      sdkState?: unknown;
+      status?: MessageStatus;
+      /** Remembered tools to store (a resolve may have added one); default: the ones already stored. */
+      allowedTools?: string[];
+    }
+  ): Promise<{ message: Message; actions: PendingAction[]; status?: MessageStatus; warnings?: TurnWarning[] }> {
+    let { actions, sdkState, status, content } = turn;
+    let warnings: TurnWarning[] | undefined;
+
+    const dropPause = (bytes: number | undefined) => {
+      const max = this.maxStateBytes;
+      warnings = [
+        {
+          code: "pause_state_too_large",
+          message: `The paused state${bytes ? ` (${bytes} bytes)` : ""} does not fit the ${max} byte limit, so the turn was not paused`,
+          ...(bytes && { stateBytes: bytes }),
+          maxStateBytes: max,
+        },
+      ];
+      actions = [];
+      sdkState = undefined;
+      status = undefined;
+      if (!content) content = PAUSE_NOT_STORED_NOTICE;
+    };
+
+    if (actions.length > 0) {
+      const state = this.pausedState(conversation, turn.handlerState, "msg_".padEnd(25, "x"), actions, sdkState, turn.allowedTools);
+      const bytes = Buffer.byteLength(JSON.stringify(state));
+      if (bytes > this.maxStateBytes) dropPause(bytes);
+    }
+
+    for (let attempt = 0; ; attempt++) {
+      const message = await this.config.storage.createMessage({
+        conversationId: conversation.id,
+        role: "assistant",
+        content,
+        files: turn.files,
+        ...((actions.length > 0 || warnings) && {
+          metadata: { ...(actions.length > 0 && { requiresAction: true }), ...(warnings && { warnings }) },
+        }),
+      }, ctx.context);
+      try {
+        await this.persistPendingActions(ctx, conversation, turn.handlerState, message.id, actions, sdkState, turn.allowedTools);
+        return { message, actions, status, warnings };
+      } catch (error) {
+        // Never leave an assistant message that says it waits on an action the store did not keep
+        await this.config.storage.deleteMessage(message.id, ctx.context).catch(() => undefined);
+        const tooLarge = (error as { code?: string } | null)?.code === "STORAGE_LIMIT_EXCEEDED";
+        if (attempt === 0 && actions.length > 0 && tooLarge) {
+          dropPause(undefined);
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  /** The conversation state as it is stored while the turn waits on `actions`. */
+  private pausedState(
+    conversation: Conversation,
+    baseState: Record<string, unknown> | undefined,
+    messageId: string,
+    actions: PendingAction[],
+    sdkState: unknown,
+    allowedTools?: string[]
+  ): Record<string, unknown> {
+    const before = readHitl(conversation.state);
+    const remembered = allowedTools ?? before?.allowedTools;
+    const store: HitlStore = {
+      ...(remembered?.length && { allowedTools: remembered }),
+      ...(actions.length > 0 && { pending: { actions, messageId, ...(sdkState !== undefined && { sdkState }) } }),
+    };
+    return writeHitl(baseState ?? conversation.state, store);
   }
 
   /**
@@ -1359,16 +1582,13 @@ export class AgentServer {
     baseState: Record<string, unknown> | undefined,
     messageId: string,
     actions: PendingAction[],
-    sdkState?: unknown
+    sdkState?: unknown,
+    allowedTools?: string[]
   ): Promise<void> {
     const before = readHitl(conversation.state);
     if (actions.length === 0 && !before?.pending) return;
-    const store: HitlStore = {
-      ...(before?.allowedTools && { allowedTools: before.allowedTools }),
-      ...(actions.length > 0 && { pending: { actions, messageId, ...(sdkState !== undefined && { sdkState }) } }),
-    };
     await this.config.storage.updateConversation(conversation.id, {
-      state: writeHitl(baseState ?? conversation.state, store),
+      state: this.pausedState(conversation, baseState, messageId, actions, sdkState, allowedTools),
     }, ctx.context);
   }
 
@@ -1451,9 +1671,7 @@ export class AgentServer {
         yield `data: ${JSON.stringify(startEvent)}\n\n`;
 
         // Get previous messages for context
-        const previousMessages = await self.config.storage.getMessages(conversationId, {
-          order: "asc",
-        }, ctx.context);
+        const history = await self.loadHistory(conversationId, ctx.context);
 
         // Process with agent
         let responseContent = "";
@@ -1469,7 +1687,7 @@ export class AgentServer {
           const sdkAgent = agent.sdkAgent as HitlSdkAgent;
 
           // Map messages with tool_calls and tool_call_id preserved
-          const messages = toSdkMessages(previousMessages.data);
+          const messages = toSdkMessages(history);
 
           // Use async queue to bridge callback-based streaming with generator-based yielding
           const queue: string[] = [];
@@ -1569,7 +1787,7 @@ export class AgentServer {
           }
         } else if (agent.chatCompletions) {
           // Use Chat Completions API with streaming
-          const messages = previousMessages.data.map((m) => ({
+          const messages = history.map((m) => ({
             role: m.role,
             content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
             ...(m.toolCalls && m.toolCalls.length > 0 && {
@@ -1600,7 +1818,7 @@ export class AgentServer {
           }
         } else if (agent.responsesApi) {
           // Use Responses API with streaming
-          const messages = previousMessages.data.map((m) => ({
+          const messages = history.map((m) => ({
             role: m.role,
             content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
           }));
@@ -1679,16 +1897,24 @@ export class AgentServer {
           return;
         }
 
-        // Save assistant message
-        const assistantMessage = await self.config.storage.createMessage({
-          conversationId,
-          role: "assistant",
+        // Save assistant message (and what it waits on)
+        const saved = await self.saveAssistantTurn(ctx, conversation, {
           content: responseContent,
           files: responseFiles,
-          ...(pendingActions.length > 0 && { metadata: { requiresAction: true } }),
-        }, ctx.context);
-
-        await self.persistPendingActions(ctx, conversation, handlerState, assistantMessage.id, pendingActions, pausedSdkState);
+          handlerState,
+          actions: pendingActions,
+          sdkState: pausedSdkState,
+          status: turnStatus,
+        });
+        const assistantMessage = saved.message;
+        pendingActions = saved.actions;
+        turnStatus = saved.status;
+        if (assistantMessage.content !== responseContent) {
+          // The turn could not pause and had said nothing: the stream gets the notice too
+          responseContent = assistantMessage.content as string;
+          const noticeEvent: StreamTextEvent = { type: "stream.text", timestamp: Date.now(), text: responseContent, isFinal: true };
+          yield `data: ${JSON.stringify(noticeEvent)}\n\n`;
+        }
         if (pendingActions.length > 0) {
           const requiredEvent: StreamActionRequiredEvent = {
             type: "stream.action_required",
@@ -1702,7 +1928,7 @@ export class AgentServer {
 
         // Auto-generate title on the first exchange
         let generatedTitle: string | undefined;
-        if (!conversation.title && previousMessages.data.length === 1) {
+        if (!conversation.title && history.length === 1) {
           generatedTitle = await self.generateTitle(body.message);
           if (generatedTitle) {
             await self.config.storage.updateConversation(conversationId, { title: generatedTitle }, ctx.context);
@@ -1726,6 +1952,7 @@ export class AgentServer {
             : undefined,
           ...(turnStatus && turnStatus !== "completed" && { status: turnStatus }),
           ...(pendingActions.length > 0 && { pendingActions }),
+          ...(saved.warnings && { warnings: saved.warnings }),
         };
         yield `data: ${JSON.stringify(doneEvent)}\n\n`;
       } catch (error) {
@@ -1901,7 +2128,7 @@ export class AgentServer {
           yield self.streamErrorFrame(settled.error);
           return;
         }
-        const { assistant, usage, pendingActions, status } = settled.value;
+        const { assistant, usage, pendingActions, status, warnings } = settled.value;
         if (pendingActions.length > 0) {
           const requiredEvent: StreamActionRequiredEvent = {
             type: "stream.action_required",
@@ -1923,6 +2150,7 @@ export class AgentServer {
             : undefined,
           ...(status && status !== "completed" && { status }),
           ...(pendingActions.length > 0 && { pendingActions }),
+          ...(warnings && { warnings }),
         };
         yield `data: ${JSON.stringify(doneEvent)}\n\n`;
       }
@@ -1939,7 +2167,7 @@ export class AgentServer {
       };
     }
 
-    const { assistant, usage, pendingActions, status } = await this.executeResolve(run, false, () => {});
+    const { assistant, usage, pendingActions, status, warnings } = await this.executeResolve(run, false, () => {});
     return {
       status: 200,
       body: {
@@ -1947,6 +2175,7 @@ export class AgentServer {
         usage,
         ...(status && status !== "completed" && { status }),
         ...(pendingActions.length > 0 && { pendingActions }),
+        ...(warnings && { warnings }),
       },
     };
   }
@@ -1959,7 +2188,7 @@ export class AgentServer {
     run: ResolveRun,
     streaming: boolean,
     push: (frame: string) => void
-  ): Promise<{ assistant: Message; usage?: SendMessageResponse["usage"]; pendingActions: PendingAction[]; status?: MessageStatus }> {
+  ): Promise<{ assistant: Message; usage?: SendMessageResponse["usage"]; pendingActions: PendingAction[]; status?: MessageStatus; warnings?: TurnWarning[] }> {
     const { ctx, conversation, agent, store, action, resolution } = run;
     const conversationId = conversation.id;
     const pending = store.pending!;
@@ -2071,25 +2300,25 @@ export class AgentServer {
         handlerFiles = result.files;
       }
 
-      const assistant = await this.config.storage.createMessage({
-        conversationId,
-        role: "assistant",
+      const saved = await this.saveAssistantTurn(ctx, conversation, {
         content: responseContent,
         files: handlerFiles,
-        ...(newPending.length > 0 && { metadata: { requiresAction: true } }),
-      }, ctx.context);
+        handlerState: baseState,
+        actions: newPending,
+        sdkState: pausedSdkState,
+        status: turnStatus,
+        allowedTools: [...allowedTools],
+      });
+      const assistant = saved.message;
+      newPending = saved.actions;
+      turnStatus = saved.status;
+      if (streaming && assistant.content !== responseContent) {
+        // The continuation could not pause and had said nothing: the stream gets the notice too
+        const noticeEvent: StreamTextEvent = { type: "stream.text", timestamp: Date.now(), text: assistant.content as string, isFinal: true };
+        push(`data: ${JSON.stringify(noticeEvent)}\n\n`);
+      }
 
-      const nextStore: HitlStore = {
-        ...(allowedTools.size > 0 && { allowedTools: [...allowedTools] }),
-        ...(newPending.length > 0 && {
-          pending: { actions: newPending, messageId: assistant.id, ...(pausedSdkState !== undefined && { sdkState: pausedSdkState }) },
-        }),
-      };
-      await this.config.storage.updateConversation(conversationId, {
-        state: writeHitl(baseState, nextStore),
-      }, ctx.context);
-
-      return { assistant, usage, pendingActions: newPending, status: turnStatus };
+      return { assistant, usage, pendingActions: newPending, status: turnStatus, warnings: saved.warnings };
     } finally {
       this.resolvingActions.delete(key);
     }
@@ -2181,7 +2410,7 @@ export class AgentServer {
     }
 
     // Check file size limits (before decoding: the base64 text is about a third larger than the file)
-    const maxSize = this.config.limits?.maxFileSize || 10 * 1024 * 1024; // 10MB default
+    const maxSize = this.maxFileSize;
     if (typeof content !== "string" || Math.floor((content.length * 3) / 4) > maxSize + 3) {
       throw {
         statusCode: 400,
@@ -2361,7 +2590,7 @@ export class AgentServer {
   ): Promise<RouteResult<ListTasksResponse>> {
     const agentId = ctx.query.agentId as string | undefined;
     const status = ctx.query.status as Task["status"] | undefined;
-    const { limit, offset } = parsePaging(ctx.query, 20);
+    const { limit, offset } = parsePaging(ctx.query, 20, this.maxPageSize);
 
     // Resolve userId
     const userId = await this.effectiveUserId(ctx);

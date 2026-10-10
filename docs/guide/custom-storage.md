@@ -65,6 +65,49 @@ Hook signatures (all end with `ctx?: RequestContext`):
 | Tasks | `_createTask(id, params, ctx)`, `_getTask(id, ctx)`, `_getTasks(params, ctx)`, `_updateTask(id, params, ctx)`, `_deleteTask(id, ctx)` |
 | Task results | `_createTaskResult(id, params, ctx)`, `_getTaskResult(taskId, ctx)` |
 
+## What a provider has to do
+
+The built-in providers all pass one contract suite (`test/storage/contract.ts` in the repository; copy it to
+test your own: `runStorageContract(name, open)` takes a function that opens a fresh store). A provider that follows
+these rules behaves like them to the server and to every client:
+
+| Area | Rule |
+| --- | --- |
+| Order | `getConversations` / `getTasks`: newest first unless `order: 'asc'`. `getMessages`: oldest first, `order: 'desc'` reverses it. Rows with the same timestamp keep their insertion order (keep a sequence next to the time). |
+| Paging | `PaginatedResult` has `total`, `limit`, `offset` and `hasMore = offset + data.length < total`. `getMessages` is called with `params` possibly `undefined`; the default `limit` is 100. |
+| Cursors | `getMessages(id, { before })` / `{ after }` (a message id): only messages strictly older / newer than that message, `total` counting that set. An id that is not a message of the conversation is a `NotFoundError`. The server pages `GET /conversations/:id` with them. |
+| JSON fields | `metadata`, `state`, `content`, `toolCalls`, `files`, `comments`, `usage`: store and return what `JSON.parse(JSON.stringify(x))` gives. No `null` for a left-out field, `Date`s as ISO strings, text that looks like JSON stays text. |
+| Absent | `userId`, `title`, `name`, `toolCallId`, `callbackUrl`, `error` read as `undefined` when absent; `files: []` as `undefined`; `metadata` / `state` default to `{}`; `Task.comments` is always an array of comments with `Date`s. |
+| Copies | Do not hand out objects you keep (a provider that holds records in memory must copy them). |
+| Messages | `createMessage` for a conversation that does not exist throws `NotFoundError` and stores nothing. A new message sets the conversation's `updatedAt`. `deleteMessage` keeps the message's files. |
+| Files | `getFileContent` returns a `Buffer`. `saveFile` for an unknown conversation or message throws `NotFoundError` and stores no content; content and record are written together (or the content is taken back out). A file with a `messageId` belongs to that message's conversation. `deleteConversation` deletes the conversation's files and their content. |
+| Tasks | `createTaskResult` replaces the task's existing result (one per task). `updateTask` / `createTaskResult` for an unknown task throw `NotFoundError`; an update that changes nothing is not an error. |
+| Limits | Throw `StorageLimitError` (413) for a file or a state you cannot hold, `ValidationError` (400) for a value a column cannot hold, `NotFoundError` (404) for a missing parent. Not a driver error. |
+| Capabilities | Implement `capabilities()` so the server can refuse a bad configuration at startup and skip a pause that would not fit. |
+
+`BaseStorageProvider` already applies the JSON, absent-value and limit rules to what flows through it: values are cloned through JSON on the
+way in, every record is normalised on the way out, a file or state over `capabilities()` is refused with a 413, and a file with a `messageId`
+is filed under that message's conversation. You implement the storage; the rest of the table is up to the `_`-hooks.
+
+### Capabilities
+
+```typescript
+class MyStorage extends BaseStorageProvider {
+  capabilities() {
+    return {
+      maxFileBytes: 5 * 1024 * 1024 * 1024, // largest single file you store
+      maxStateBytes: 4 * 1024 * 1024,       // largest conversation state (UTF-8 bytes of its JSON)
+      atomicUpdate: false,                   // compare-and-set conversation updates
+      events: false,                         // a durable per-conversation event log
+      leases: false,                         // per-conversation leases
+    };
+  }
+}
+```
+
+`createAgentServer` throws when `limits.maxFileSize` or `limits.maxStateBytes` is above these, and does not pause a turn whose state
+would be bigger than `maxStateBytes` (see [Storage Providers](./storage.md)). A provider without `capabilities()` is treated as unbounded.
+
 ## Implementing the interface directly
 
 When the data already lives elsewhere (another service, an existing conversation
@@ -94,5 +137,6 @@ Notes for scoped stores:
   through `conversation.userId` when `resolveContext` is configured.)
 - Files and tasks have no owner check in the server beyond `task.userId`; scope them
   by `ctx` too if clients must not reach each other's ids.
-- `getMessages` is called with `params` possibly `undefined`.
+- `getMessages` is called with `params` possibly `undefined`, and with `before` / `after` when a client pages `GET /conversations/:id`.
+- The server reads a whole conversation for the agent in pages of `limits.maxPageSize` (200): `offset`, `limit` and `hasMore` / `total` must be right.
 - Methods must be safe to call concurrently; the server issues several per request.

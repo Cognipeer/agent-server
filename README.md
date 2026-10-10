@@ -8,7 +8,7 @@ Documentation: <https://docs.cognipeer.com/agent-server/guide/getting-started>
 
 - 🤖 **Agent SDK Integration**: Directly register agents built with `@cognipeer/agent-sdk`
 - 🔧 **Custom Handler Support**: Integrate agents built with other libraries
-- 💾 **Multiple Storage**: PostgreSQL and MongoDB support
+- 💾 **Multiple Storage**: PostgreSQL, MongoDB (GridFS for files), SQLite and in-memory, all tested against one provider contract
 - 🔐 **Authentication**: Token-based and JWT authentication
 - 📚 **Swagger UI**: Automatic OpenAPI documentation
 - 🌐 **Framework Agnostic**: Works with Express, Next.js, Fastify, and raw Node HTTP

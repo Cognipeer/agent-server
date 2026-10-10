@@ -10,6 +10,35 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    # The storage tests run against real MongoDB and PostgreSQL (see test/storage/global-setup.ts).
+    # REQUIRE_ALL_PROVIDERS makes a provider that cannot run a failure instead of a skip.
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 })'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      MONGODB_URL: mongodb://localhost:27017
+      PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+      REQUIRE_ALL_PROVIDERS: "1"
+      # the service container is used, so mongodb-memory-server need not download a mongod
+      MONGOMS_DISABLE_POSTINSTALL: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,7 +52,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run tests
+      - name: Lint
+        run: npm run lint
+
+      - name: Run tests (all storage providers)
         run: npm test
 
       - name: Typecheck

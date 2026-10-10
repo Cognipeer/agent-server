@@ -45,6 +45,7 @@ export type {
 
   // Storage provider types
   StorageProvider,
+  StorageCapabilities,
   CreateConversationParams,
   GetConversationsParams,
   UpdateConversationParams,
@@ -85,11 +86,13 @@ export type {
   UserQuestion,
   UserQuestionOption,
   MessageStatus,
+  TurnWarning,
   ResolveActionParams,
   AgentCapabilities,
   ListAgentsResponse,
   ListConversationsResponse,
   GetConversationResponse,
+  MessagesPage,
   CreateConversationRequest,
   CreateConversationResponse,
   UploadFileRequest,
@@ -125,6 +128,7 @@ export {
   ValidationError,
   AuthenticationError,
   AuthorizationError,
+  StorageLimitError,
 } from "./types.js";
 
 // Storage provider exports

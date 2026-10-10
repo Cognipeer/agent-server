@@ -140,7 +140,6 @@ export function createFastifyPlugin(
  * Convenience wrapper: `app.register(plugin, { prefix })`.
  */
 export function mountOnFastify(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   app: { register: (plugin: any, opts?: any) => unknown },
   server: AgentServer,
   options: FastifyAdapterOptions & { prefix: string }

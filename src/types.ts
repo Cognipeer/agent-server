@@ -267,6 +267,13 @@ export interface StorageProvider {
   disconnect(): Promise<void>;
   isConnected(): boolean;
 
+  /**
+   * Optional: what this provider can hold, so the server can refuse a bad
+   * configuration at startup and a pause that would not fit, instead of
+   * failing halfway through a write. Providers that omit it are treated as unbounded.
+   */
+  capabilities?(): StorageCapabilities;
+
   // Conversations
   createConversation(params: CreateConversationParams, ctx?: RequestContext): Promise<Conversation>;
   getConversation(id: string, ctx?: RequestContext): Promise<Conversation | null>;
@@ -296,6 +303,24 @@ export interface StorageProvider {
   // Task Results
   createTaskResult(params: CreateTaskResultParams, ctx?: RequestContext): Promise<TaskResult>;
   getTaskResult(taskId: string, ctx?: RequestContext): Promise<TaskResult | null>;
+}
+
+/** What a storage provider can hold. Returned by `StorageProvider.capabilities()`. */
+export interface StorageCapabilities {
+  /** Largest single file the provider stores, in bytes. */
+  maxFileBytes: number;
+  /**
+   * Largest conversation `state` the provider stores, as the UTF-8 byte length
+   * of its JSON. A pause that would not fit is not taken (see `limits.maxStateBytes`).
+   * `Number.MAX_SAFE_INTEGER` when only memory / disk bound it.
+   */
+  maxStateBytes: number;
+  /** Compare-and-set conversation updates (`updateConversationIf`). */
+  atomicUpdate: boolean;
+  /** A durable per-conversation event log (`events`). */
+  events: boolean;
+  /** Per-conversation leases (`acquireLease` / `releaseLease`). */
+  leases: boolean;
 }
 
 export interface CreateConversationParams {
@@ -335,7 +360,15 @@ export interface CreateMessageParams {
 export interface GetMessagesParams {
   limit?: number;
   offset?: number;
+  /** Chronological order of the page: oldest first (`asc`, default) or newest first. */
   order?: "asc" | "desc";
+  /**
+   * Only messages strictly older than this message of the conversation.
+   * `total` / `hasMore` then describe that older set. Unknown id: `NotFoundError`.
+   */
+  before?: string;
+  /** Only messages strictly newer than this message of the conversation. */
+  after?: string;
 }
 
 export interface SaveFileParams {
@@ -634,6 +667,29 @@ export interface RequestLimits {
    * Maximum number of files per request (default: 10)
    */
   maxFiles?: number;
+
+  /**
+   * Largest conversation state, in JSON bytes, that a turn may persist when it
+   * pauses for a human. When the state would not fit (this value, or the
+   * storage provider's own `capabilities().maxStateBytes`, whichever is
+   * smaller) the turn is NOT paused: it finishes and the assistant message
+   * carries a `pause_state_too_large` warning. Default: the provider's limit
+   * (12 MiB on MongoDB, effectively unbounded elsewhere).
+   */
+  maxStateBytes?: number;
+
+  /**
+   * Page size of the message endpoints (`GET /conversations/:id` and
+   * `.../messages`) when the client sends no `limit` (default: 100).
+   */
+  messagePageSize?: number;
+
+  /**
+   * Largest `limit` a client may ask for on any list endpoint (default: 200).
+   * Also the size of the pages the server reads when it loads a whole
+   * conversation for the agent.
+   */
+  maxPageSize?: number;
 }
 
 // ============================================================================
@@ -674,6 +730,19 @@ export interface SendMessageResponse {
   /** Present (as `"requires_action"`) when the turn paused for a human. */
   status?: MessageStatus;
   pendingActions?: PendingAction[];
+  /** Things worth knowing about a turn that still completed (see {@link TurnWarning}). */
+  warnings?: TurnWarning[];
+}
+
+/**
+ * Something the client should know about a turn that completed anyway. Also stored on the
+ * assistant message as `metadata.warnings`. Codes: `pause_state_too_large` - the turn needed a
+ * human but its state did not fit the store (`limits.maxStateBytes`), so it was not paused.
+ */
+export interface TurnWarning {
+  code: string;
+  message: string;
+  [key: string]: unknown;
 }
 
 export interface ResolveActionRequest {
@@ -774,6 +843,7 @@ export interface StreamDoneEvent extends StreamEventBase {
   /** Only set when the turn did not simply complete (e.g. `"requires_action"`). */
   status?: MessageStatus;
   pendingActions?: PendingAction[];
+  warnings?: TurnWarning[];
 }
 
 /**
@@ -827,9 +897,24 @@ export interface ListConversationsResponse {
   hasMore: boolean;
 }
 
+/** Where a page of `GET /conversations/:id` messages sits in the conversation. */
+export interface MessagesPage {
+  limit: number;
+  order: "asc" | "desc";
+  /** Older messages exist than the oldest one returned. */
+  hasMoreBefore: boolean;
+  /** Newer messages exist than the newest one returned. */
+  hasMoreAfter: boolean;
+}
+
 export interface GetConversationResponse {
   conversation: Conversation;
+  /**
+   * One page of the history, always chronological per `messagesPage.order`.
+   * Without `before` / `after` it is the NEWEST `limit` messages.
+   */
   messages: Message[];
+  messagesPage?: MessagesPage;
   /** Actions the conversation is waiting on (omitted when there are none). */
   pendingActions?: PendingAction[];
 }
@@ -884,6 +969,14 @@ export class NotFoundError extends AgentServerError {
 export class ValidationError extends AgentServerError {
   constructor(message: string, details?: Record<string, unknown>) {
     super(message, "VALIDATION_ERROR", 400, details);
+  }
+}
+
+/** A write the storage provider cannot hold (file or conversation state too large). Answers 413. */
+export class StorageLimitError extends AgentServerError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super(message, "STORAGE_LIMIT_EXCEEDED", 413, details);
+    this.name = "StorageLimitError";
   }
 }
 
