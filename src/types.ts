@@ -113,6 +113,85 @@ export interface AgentInfo {
   description?: string;
   version?: string;
   metadata?: Record<string, unknown>;
+  /**
+   * Human-in-the-loop features this agent can use. Set by the host; for SDK
+   * agents it is derived from the agent instance when cheaply knowable.
+   */
+  capabilities?: AgentCapabilities;
+}
+
+export interface AgentCapabilities {
+  /** The agent can pause to ask for approval before running a tool. */
+  toolApproval?: boolean;
+  /** The agent can pause to ask the user a question. */
+  askUser?: boolean;
+}
+
+// ============================================================================
+// Human-in-the-loop (pending actions)
+// ============================================================================
+
+export interface UserQuestionOption {
+  label: string;
+  value?: string;
+  description?: string;
+}
+
+export interface UserQuestion {
+  question: string;
+  header?: string;
+  multiSelect?: boolean;
+  placeholder?: string;
+  required?: boolean;
+  options?: UserQuestionOption[];
+}
+
+/** Something the agent is waiting on before it can continue. */
+export type PendingAction =
+  | {
+      id: string;
+      type: "tool_approval";
+      toolName: string;
+      toolCallId?: string;
+      title?: string;
+      summary?: string;
+      args?: Record<string, unknown>;
+      expiresAt?: string;
+    }
+  | {
+      id: string;
+      type: "user_question";
+      questions: UserQuestion[];
+      allowFreeText?: boolean;
+      expiresAt?: string;
+    };
+
+/** The human's answer to a {@link PendingAction}. */
+export type ActionResolution =
+  | {
+      type: "tool_approval";
+      decision: "allow" | "deny";
+      comment?: string;
+      approvedArgs?: Record<string, unknown>;
+      /** Don't ask again for this tool in this conversation. */
+      rememberForSession?: boolean;
+    }
+  | {
+      type: "user_question";
+      answers: Record<string, string | string[]>;
+      cancelled?: boolean;
+    };
+
+export type MessageStatus = "completed" | "requires_action" | "incomplete" | "cancelled";
+
+export interface ResolveActionParams {
+  conversationId: string;
+  actionId: string;
+  resolution: ActionResolution;
+  state?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+  /** Per-request context resolved by `config.resolveContext` (user + custom data). */
+  context?: RequestContext;
 }
 
 /**
@@ -123,6 +202,12 @@ export interface AgentHandler {
    * Process a message and return a response
    */
   processMessage(params: ProcessMessageParams): Promise<ProcessMessageResult>;
+
+  /**
+   * Optional: continue a turn that paused with `status: "requires_action"`.
+   * Returns the continuation like `processMessage` does (it may pause again).
+   */
+  resolveAction?(params: ResolveActionParams): Promise<ProcessMessageResult>;
 }
 
 export interface ProcessMessageParams {
@@ -145,6 +230,10 @@ export interface ProcessMessageResult {
     outputTokens?: number;
     totalTokens?: number;
   };
+  /** Set to `"requires_action"` (with `pendingActions`) to pause the turn. */
+  status?: MessageStatus;
+  /** Everything the turn is waiting on. Replaces the conversation's pending set. */
+  pendingActions?: PendingAction[];
 }
 
 /**
@@ -424,6 +513,22 @@ export interface AgentServerConfig {
    * Turn it on whenever the audience is not the operator.
    */
   maskServerErrors?: boolean;
+
+  /**
+   * What happens when a message arrives while the conversation is waiting on a
+   * pending action (tool approval / question). `"reject"` (default) answers
+   * 409 `action_pending`; `"cancel"` cancels the pending actions and processes
+   * the message normally.
+   */
+  pendingActionPolicy?: "reject" | "cancel";
+
+  /**
+   * Honour `rememberForSession` on tool approvals (default true). The memory is
+   * by tool NAME: once remembered, later calls of that tool in the conversation
+   * skip the approval regardless of arguments. Tools whose `needsApproval` is a
+   * per-call predicate are never remembered. Set false to always ask.
+   */
+  allowRememberApproval?: boolean;
 }
 
 export interface AuthConfig {
@@ -559,7 +664,21 @@ export interface SendMessageResponse {
     outputTokens?: number;
     totalTokens?: number;
   };
+  /** Present (as `"requires_action"`) when the turn paused for a human. */
+  status?: MessageStatus;
+  pendingActions?: PendingAction[];
 }
+
+export interface ResolveActionRequest {
+  resolution: ActionResolution;
+  /** Stream the continuation as SSE, like `POST .../messages` with `stream: true`. */
+  stream?: boolean;
+  /** Passed to a custom handler's `resolveAction` (ignored for SDK agents). */
+  metadata?: Record<string, unknown>;
+}
+
+/** Like {@link SendMessageResponse}, but a resolve adds no user message. */
+export type ResolveActionResponse = Omit<SendMessageResponse, "message">;
 
 // ============================================================================
 // Stream Event Types (SSE)
@@ -645,6 +764,34 @@ export interface StreamDoneEvent extends StreamEventBase {
     outputTokens?: number;
     totalTokens?: number;
   };
+  /** Only set when the turn did not simply complete (e.g. `"requires_action"`). */
+  status?: MessageStatus;
+  pendingActions?: PendingAction[];
+}
+
+/**
+ * The agent paused and is waiting on a human
+ */
+export interface StreamActionRequiredEvent extends StreamEventBase {
+  type: "stream.action_required";
+  conversationId: string;
+  /** The assistant message the actions belong to. */
+  messageId: string;
+  actions: PendingAction[];
+}
+
+/**
+ * A pending action was resolved
+ */
+export interface StreamActionResolvedEvent extends StreamEventBase {
+  type: "stream.action_resolved";
+  conversationId: string;
+  actionId: string;
+  resolution: {
+    type: ActionResolution["type"];
+    decision?: "allow" | "deny";
+    cancelled?: boolean;
+  };
 }
 
 /**
@@ -657,6 +804,8 @@ export type StreamEvent =
   | StreamToolResultEvent
   | StreamProgressEvent
   | StreamErrorEvent
+  | StreamActionRequiredEvent
+  | StreamActionResolvedEvent
   | StreamDoneEvent;
 
 export interface ListAgentsResponse {
@@ -674,6 +823,8 @@ export interface ListConversationsResponse {
 export interface GetConversationResponse {
   conversation: Conversation;
   messages: Message[];
+  /** Actions the conversation is waiting on (omitted when there are none). */
+  pendingActions?: PendingAction[];
 }
 
 export interface CreateConversationRequest {

@@ -46,7 +46,29 @@ import type {
   StreamProgressEvent,
   StreamErrorEvent,
   StreamDoneEvent,
+  StreamActionRequiredEvent,
+  StreamActionResolvedEvent,
+  PendingAction,
+  ActionResolution,
+  MessageStatus,
+  ProcessMessageResult,
+  ResolveActionRequest,
+  ResolveActionResponse,
+  AgentCapabilities,
 } from "./types.js";
+import {
+  HITL_STATE_KEY,
+  applySdkResolution,
+  jsonSafe,
+  portableState,
+  publicState,
+  readHitl,
+  runSdkTurn,
+  supportsSdkPause,
+  writeHitl,
+  type HitlSdkAgent,
+  type HitlStore,
+} from "./hitl.js";
 import { generateOpenAPISpec, generateSwaggerHTML } from "./swagger.js";
 import {
   invokeChatCompletions,
@@ -74,6 +96,122 @@ function extractToolEventProps(event: any): {
     toolCallId: event.id || event.toolCallId || "",
     args: event.args || {},
   };
+}
+
+/** Maps stored messages to the agent-sdk message shape (tool calls preserved). */
+function toSdkMessages(data: Message[]) {
+  return data
+    // A turn that paused with no text yet leaves an empty assistant message behind.
+    .filter((m) => !(m.role === "assistant" && m.content === "" && m.metadata?.requiresAction === true))
+    .map((m) => ({
+      role: m.role,
+      content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+      // Preserve tool call information for proper LLM message history
+      ...(m.toolCalls && m.toolCalls.length > 0 && {
+        tool_calls: m.toolCalls.map(tc => ({
+          id: tc.id,
+          type: "function",
+          function: { name: tc.name, arguments: tc.arguments }
+        }))
+      }),
+      ...(m.toolCallId && { tool_call_id: m.toolCallId }),
+      ...(m.name && { name: m.name }),
+    }));
+}
+
+/**
+ * Turns agent-sdk streaming callbacks into SSE `data:` frames handed to `push`.
+ * The SDK emits tool_call events at multiple phases:
+ *   phase "start"   -> tool execution is beginning
+ *   phase "success" -> tool execution completed with result
+ *   phase "error"   -> tool execution failed
+ *   phase "skipped" -> tool was skipped (limit reached)
+ * Only "start" becomes stream.tool_call; "success"/"error" become stream.tool_result.
+ */
+function createSdkStreamBridge(push: (frame: string) => void) {
+  const bridge = {
+    streamedAnyText: false,
+    finalChunkText: "",
+    onStream: (chunk: { text: string; isFinal?: boolean }) => {
+      // Agent SDK emits a final full-text chunk (isFinal:true). Don't
+      // forward it as stream.text (it would duplicate the streamed
+      // text) - but remember it: an agent that never streamed
+      // (tool agents run non-streaming) only delivers the answer here.
+      if (chunk.isFinal) {
+        bridge.finalChunkText = chunk.text;
+        return;
+      }
+      bridge.streamedAnyText = bridge.streamedAnyText || chunk.text.length > 0;
+      const textEvent: StreamTextEvent = {
+        type: "stream.text",
+        timestamp: Date.now(),
+        text: chunk.text,
+        isFinal: false,
+      };
+      push(`data: ${JSON.stringify(textEvent)}\n\n`);
+    },
+    onEvent: (event: { type: string; [key: string]: unknown }) => {
+      if (event.type === "tool_call") {
+        const phase = (event as { phase?: string }).phase;
+        const props = extractToolEventProps(event);
+
+        if (phase === "success" || phase === "error") {
+          // Tool finished - emit as tool_result
+          const toolResultEvent: StreamToolResultEvent = {
+            type: "stream.tool_result",
+            timestamp: Date.now(),
+            toolName: props.toolName,
+            toolCallId: props.toolCallId,
+            result: phase === "success"
+              ? (event as { result?: unknown }).result
+              : { error: ((event as { error?: { message?: string } }).error)?.message || "Tool execution failed" },
+          };
+          push(`data: ${JSON.stringify(toolResultEvent)}\n\n`);
+        } else if (!phase || phase === "start") {
+          // Tool starting - emit as tool_call
+          const toolEvent: StreamToolCallEvent = {
+            type: "stream.tool_call",
+            timestamp: Date.now(),
+            toolName: props.toolName,
+            toolCallId: props.toolCallId,
+            args: props.args as Record<string, unknown>,
+          };
+          push(`data: ${JSON.stringify(toolEvent)}\n\n`);
+        }
+        // phase "skipped" -> do not emit (already at tool limit)
+      } else if (event.type === "tool_result") {
+        const props = extractToolEventProps(event);
+        const toolResultEvent: StreamToolResultEvent = {
+          type: "stream.tool_result",
+          timestamp: Date.now(),
+          toolName: props.toolName,
+          toolCallId: props.toolCallId,
+          result: event.result,
+        };
+        push(`data: ${JSON.stringify(toolResultEvent)}\n\n`);
+      }
+    },
+  };
+  return bridge;
+}
+
+/** Status follows the actions: pending actions imply requires_action; a bare requires_action is dropped. */
+function normalizeTurnStatus(status: MessageStatus | undefined, pending: PendingAction[]): MessageStatus | undefined {
+  if (pending.length > 0) return "requires_action";
+  return status === "requires_action" ? undefined : status;
+}
+
+/** Everything `executeResolve` needs, gathered (and validated) by `handleResolveAction`. */
+interface ResolveRun {
+  ctx: RouteContext;
+  conversation: Conversation;
+  agent: AgentRegistration;
+  store: HitlStore;
+  action: PendingAction;
+  resolution: ActionResolution;
+  /** SDK state with the decision applied (SDK agents only). */
+  nextSdkState?: unknown;
+  metadata?: Record<string, unknown>;
 }
 
 export interface RouteContext {
@@ -291,10 +429,28 @@ export class AgentServer {
     info?: Partial<Omit<AgentInfo, "id">>
   ): void {
     // Extract info from agent if possible
-    const agentAny = agent as { __runtime?: { name?: string; version?: string } };
+    const agentAny = agent as {
+      __runtime?: {
+        name?: string;
+        version?: string;
+        tools?: Array<{ needsApproval?: unknown }>;
+        humanInTheLoop?: { askUser?: unknown };
+      };
+    };
     const name =
       info?.name || agentAny.__runtime?.name || id;
     const version = info?.version || agentAny.__runtime?.version;
+
+    // Derive what the agent can pause for, when the instance tells us cheaply.
+    let capabilities: AgentCapabilities | undefined = info?.capabilities;
+    if (!capabilities && supportsSdkPause(agent)) {
+      const runtime = agentAny.__runtime;
+      const toolApproval = Array.isArray(runtime?.tools) && runtime!.tools!.some((t) => !!t?.needsApproval);
+      const askUser = !!runtime?.humanInTheLoop?.askUser;
+      if (toolApproval || askUser) {
+        capabilities = { ...(toolApproval && { toolApproval }), ...(askUser && { askUser }) };
+      }
+    }
 
     this.agents.set(id, {
       info: {
@@ -303,6 +459,7 @@ export class AgentServer {
         version,
         description: info?.description,
         metadata: info?.metadata,
+        ...(capabilities && { capabilities }),
       },
       sdkAgent: agent,
     });
@@ -484,6 +641,13 @@ export class AgentServer {
       "POST",
       "/conversations/:conversationId/messages",
       this.handleSendMessage.bind(this)
+    );
+
+    // Human-in-the-loop: answer a pending action (tool approval / question)
+    this.addRoute(
+      "POST",
+      "/conversations/:conversationId/actions/:actionId",
+      this.handleResolveAction.bind(this)
     );
 
     // File routes
@@ -786,7 +950,7 @@ export class AgentServer {
       status: 200,
       body: {
         conversations: result.data.map((conv) => ({
-          ...conv,
+          ...this.publicConversation(conv),
           agentName: registry.get(conv.agentId)?.info.name,
         })),
         total: result.total,
@@ -853,12 +1017,14 @@ export class AgentServer {
     await this.verifyConversationAccess(conversation, ctx);
 
     const messagesResult = await this.config.storage.getMessages(conversationId, undefined, ctx.context);
+    const pendingActions = readHitl(conversation.state)?.pending?.actions;
 
     return {
       status: 200,
       body: {
-        conversation,
+        conversation: this.publicConversation(conversation),
         messages: messagesResult.data,
+        ...(pendingActions?.length && { pendingActions }),
       },
     };
   }
@@ -888,7 +1054,7 @@ export class AgentServer {
 
     return {
       status: 200,
-      body: conversation,
+      body: this.publicConversation(conversation),
     };
   }
 
@@ -948,6 +1114,37 @@ export class AgentServer {
     };
   }
 
+  // ============================================================================
+  // Human-in-the-loop (pending actions)
+  // ============================================================================
+
+  /** Conversation as clients see it: without the internal pending-action store. */
+  private publicConversation<T extends Conversation>(conversation: T): T {
+    if (!conversation.state || !(HITL_STATE_KEY in conversation.state)) return conversation;
+    return { ...conversation, state: publicState(conversation.state) };
+  }
+
+  /**
+   * A new message while the conversation waits on a human: 409 by default, or
+   * (`pendingActionPolicy: "cancel"`) cancel the pending actions and carry on.
+   * Returns the conversation to continue with.
+   */
+  private async guardPendingActions(conversation: Conversation, ctx: RouteContext): Promise<Conversation> {
+    const store = readHitl(conversation.state);
+    if (!store?.pending) return conversation;
+    if (this.config.pendingActionPolicy !== "cancel") {
+      throw {
+        statusCode: 409,
+        code: "action_pending",
+        message: "The conversation is waiting for a pending action to be resolved",
+        details: { pendingActionIds: store.pending.actions.map((a) => a.id) },
+      };
+    }
+    const state = writeHitl(conversation.state, { allowedTools: store.allowedTools });
+    await this.config.storage.updateConversation(conversation.id, { state }, ctx.context);
+    return { ...conversation, state };
+  }
+
   private async handleSendMessage(
     ctx: RouteContext
   ): Promise<RouteResult<SendMessageResponse>> {
@@ -964,11 +1161,18 @@ export class AgentServer {
 
     // Check if streaming is requested
     if (body.stream) {
+      // Waiting on a human? Answer 409 as a real HTTP status (or cancel and continue)
+      // before the SSE response starts. Unknown conversations fall through to the stream's own errors.
+      const existing = await this.config.storage.getConversation(conversationId, ctx.context);
+      if (existing && readHitl(existing.state)?.pending) {
+        await this.verifyConversationAccess(existing, ctx);
+        await this.guardPendingActions(existing, ctx);
+      }
       return this.handleSendMessageStream(ctx);
     }
 
     // Get conversation
-    const conversation = await this.config.storage.getConversation(conversationId, ctx.context);
+    let conversation = await this.config.storage.getConversation(conversationId, ctx.context);
     if (!conversation) {
       throw {
         statusCode: 404,
@@ -989,6 +1193,9 @@ export class AgentServer {
         message: `Agent not found: ${conversation.agentId}`,
       } as NotFoundError;
     }
+
+    // Waiting on a human? Reject (409) or cancel the pending actions, per config.
+    conversation = await this.guardPendingActions(conversation, ctx);
 
     // Handle file attachments
     const files = body.files?.map((file) => ({
@@ -1016,37 +1223,33 @@ export class AgentServer {
     let responseContent: string;
     let responseFiles: Message["files"];
     let usage: SendMessageResponse["usage"];
+    let turnStatus: MessageStatus | undefined;
+    let pendingActions: PendingAction[] = [];
+    let pausedSdkState: unknown;
+    let handlerState: Record<string, unknown> | undefined;
+    const hitlBefore = readHitl(conversation.state);
 
     if (agent.sdkAgent) {
       // Use SDK agent
-      const sdkAgent = agent.sdkAgent as {
-        invoke: (
-          params: {
-            messages: Array<{ role: string; content: string; tool_calls?: any; tool_call_id?: string; name?: string }>;
-          },
-          config?: { context?: RequestContext }
-        ) => Promise<{ content: string; metadata?: { usage?: unknown } }>;
-      };
+      const sdkAgent = agent.sdkAgent as HitlSdkAgent;
 
       // Map messages with tool_calls and tool_call_id preserved
-      const messages = previousMessages.data.map((m) => ({
-        role: m.role,
-        content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
-        // Preserve tool call information for proper LLM message history
-        ...(m.toolCalls && m.toolCalls.length > 0 && {
-          tool_calls: m.toolCalls.map(tc => ({
-            id: tc.id,
-            type: "function",
-            function: { name: tc.name, arguments: tc.arguments }
-          }))
-        }),
-        ...(m.toolCallId && { tool_call_id: m.toolCallId }),
-        ...(m.name && { name: m.name }),
-      }));
+      const messages = toSdkMessages(previousMessages.data);
 
-      const result = await sdkAgent.invoke({ messages }, { context: ctx.context });
+      const run = await runSdkTurn(
+        sdkAgent,
+        { messages },
+        { context: ctx.context },
+        new Set(hitlBefore?.allowedTools ?? [])
+      );
+      const result = run.result;
       responseContent = result.content;
       usage = result.metadata?.usage as SendMessageResponse["usage"];
+      if (run.pending.length > 0) {
+        pendingActions = run.pending;
+        pausedSdkState = portableState(result.state);
+        turnStatus = "requires_action";
+      }
     } else if (agent.chatCompletions) {
       // Use Chat Completions API
       const messages = previousMessages.data.map((m) => ({
@@ -1094,6 +1297,8 @@ export class AgentServer {
       responseContent = result.content;
       responseFiles = result.files;
       usage = result.usage;
+      pendingActions = result.pendingActions ?? [];
+      turnStatus = normalizeTurnStatus(result.status, pendingActions);
 
       // Update conversation state if provided
       if (result.state) {
@@ -1101,6 +1306,7 @@ export class AgentServer {
           state: result.state,
         }, ctx.context);
       }
+      handlerState = result.state;
     } else {
       throw {
         statusCode: 500,
@@ -1115,7 +1321,10 @@ export class AgentServer {
       role: "assistant",
       content: responseContent,
       files: responseFiles,
+      ...(pendingActions.length > 0 && { metadata: { requiresAction: true } }),
     }, ctx.context);
+
+    await this.persistPendingActions(ctx, conversation, handlerState, assistantMessage.id, pendingActions, pausedSdkState);
 
     // Auto-generate title on the first exchange
     let conversationTitle: string | undefined;
@@ -1133,8 +1342,35 @@ export class AgentServer {
         response: assistantMessage,
         conversationTitle,
         usage,
+        ...(turnStatus && turnStatus !== "completed" && { status: turnStatus }),
+        ...(pendingActions.length > 0 && { pendingActions }),
       },
     };
+  }
+
+  /**
+   * Records what a turn is waiting on (or clears it) so a reload can render
+   * it and a resolve can continue. `baseState` is the state the handler just
+   * wrote, if any; without it the conversation's current state is kept.
+   * No-op for agents that never pause.
+   */
+  private async persistPendingActions(
+    ctx: RouteContext,
+    conversation: Conversation,
+    baseState: Record<string, unknown> | undefined,
+    messageId: string,
+    actions: PendingAction[],
+    sdkState?: unknown
+  ): Promise<void> {
+    const before = readHitl(conversation.state);
+    if (actions.length === 0 && !before?.pending) return;
+    const store: HitlStore = {
+      ...(before?.allowedTools && { allowedTools: before.allowedTools }),
+      ...(actions.length > 0 && { pending: { actions, messageId, ...(sdkState !== undefined && { sdkState }) } }),
+    };
+    await this.config.storage.updateConversation(conversation.id, {
+      state: writeHitl(baseState ?? conversation.state, store),
+    }, ctx.context);
   }
 
   /**
@@ -1228,43 +1464,22 @@ export class AgentServer {
         let responseContent = "";
         let responseFiles: Message["files"];
         let usage: SendMessageResponse["usage"];
+        let turnStatus: MessageStatus | undefined;
+        let pendingActions: PendingAction[] = [];
+        let pausedSdkState: unknown;
+        let handlerState: Record<string, unknown> | undefined;
 
         if (agent.sdkAgent) {
           // Use SDK agent with streaming
-          const sdkAgent = agent.sdkAgent as {
-            invoke: (
-              params: { messages: Array<{ role: string; content: string; tool_calls?: any; tool_call_id?: string; name?: string }> },
-              config?: {
-                stream?: boolean;
-                context?: RequestContext;
-                onStream?: (chunk: { text: string; isFinal?: boolean }) => void;
-                onEvent?: (event: { type: string; [key: string]: unknown }) => void;
-              }
-            ) => Promise<{ content: string; metadata?: { usage?: unknown } }>;
-          };
+          const sdkAgent = agent.sdkAgent as HitlSdkAgent;
 
           // Map messages with tool_calls and tool_call_id preserved
-          const messages = previousMessages.data.map((m) => ({
-            role: m.role,
-            content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
-            // Preserve tool call information for proper LLM message history
-            ...(m.toolCalls && m.toolCalls.length > 0 && {
-              tool_calls: m.toolCalls.map(tc => ({
-                id: tc.id,
-                type: "function",
-                function: { name: tc.name, arguments: tc.arguments }
-              }))
-            }),
-            ...(m.toolCallId && { tool_call_id: m.toolCallId }),
-            ...(m.name && { name: m.name }),
-          }));
+          const messages = toSdkMessages(previousMessages.data);
 
           // Use async queue to bridge callback-based streaming with generator-based yielding
           const queue: string[] = [];
           let resolveWait: (() => void) | null = null;
           let streamDone = false;
-          let streamedAnyText = false;
-          let finalChunkText = "";
           let invokeFailure: { error: unknown } | undefined;
 
           const pushToQueue = (item: string) => {
@@ -1284,79 +1499,19 @@ export class AgentServer {
             });
           };
 
+          const bridge = createSdkStreamBridge(pushToQueue);
+
           // Start the agent invocation in background
-          const invokePromise = sdkAgent.invoke(
+          const invokePromise = runSdkTurn(
+            sdkAgent,
             { messages },
             {
               stream: true,
               context: ctx.context,
-              onStream: (chunk) => {
-                // Agent SDK emits a final full-text chunk (isFinal:true). Don't
-                // forward it as stream.text (it would duplicate the streamed
-                // text) - but remember it: an agent that never streamed
-                // (tool agents run non-streaming) only delivers the answer here.
-                if (chunk.isFinal) {
-                  finalChunkText = chunk.text;
-                  return;
-                }
-                streamedAnyText = streamedAnyText || chunk.text.length > 0;
-                const textEvent: StreamTextEvent = {
-                  type: "stream.text",
-                  timestamp: Date.now(),
-                  text: chunk.text,
-                  isFinal: false,
-                };
-                pushToQueue(`data: ${JSON.stringify(textEvent)}\n\n`);
-              },
-              onEvent: (event) => {
-                // Handle tool calls and other events
-                // The SDK emits tool_call events at multiple phases:
-                //   phase "start"   → tool execution is beginning
-                //   phase "success" → tool execution completed with result
-                //   phase "error"   → tool execution failed
-                //   phase "skipped" → tool was skipped (limit reached)
-                // Only emit stream.tool_call on "start"; convert "success"/"error" to stream.tool_result.
-                if (event.type === "tool_call") {
-                  const phase = (event as { phase?: string }).phase;
-                  const props = extractToolEventProps(event);
-
-                  if (phase === "success" || phase === "error") {
-                    // Tool finished — emit as tool_result
-                    const toolResultEvent: StreamToolResultEvent = {
-                      type: "stream.tool_result",
-                      timestamp: Date.now(),
-                      toolName: props.toolName,
-                      toolCallId: props.toolCallId,
-                      result: phase === "success"
-                        ? (event as { result?: unknown }).result
-                        : { error: ((event as { error?: { message?: string } }).error)?.message || "Tool execution failed" },
-                    };
-                    pushToQueue(`data: ${JSON.stringify(toolResultEvent)}\n\n`);
-                  } else if (!phase || phase === "start") {
-                    // Tool starting — emit as tool_call
-                    const toolEvent: StreamToolCallEvent = {
-                      type: "stream.tool_call",
-                      timestamp: Date.now(),
-                      toolName: props.toolName,
-                      toolCallId: props.toolCallId,
-                      args: props.args as Record<string, unknown>,
-                    };
-                    pushToQueue(`data: ${JSON.stringify(toolEvent)}\n\n`);
-                  }
-                  // phase "skipped" → do not emit (already at tool limit)
-                } else if (event.type === "tool_result") {
-                  const props = extractToolEventProps(event);
-                  const toolResultEvent: StreamToolResultEvent = {
-                    type: "stream.tool_result",
-                    timestamp: Date.now(),
-                    toolName: props.toolName,
-                    toolCallId: props.toolCallId,
-                    result: event.result,
-                  };
-                  pushToQueue(`data: ${JSON.stringify(toolResultEvent)}\n\n`);
-                }
-              },
-            }
+              onStream: bridge.onStream,
+              onEvent: bridge.onEvent,
+            },
+            new Set(readHitl(conversation.state)?.allowedTools ?? [])
           ).then(
             (result) => {
               streamDone = true;
@@ -1391,15 +1546,21 @@ export class AgentServer {
           const settled = await invokePromise;
           // Reported as a stream.error event by the catch below (text already sent stays sent).
           if (invokeFailure) throw invokeFailure.error;
-          const result = settled!;
+          const run = settled!;
+          const result = run.result;
 
           responseContent = result.content;
           usage = result.metadata?.usage as SendMessageResponse["usage"];
+          if (run.pending.length > 0) {
+            pendingActions = run.pending;
+            pausedSdkState = portableState(result.state);
+            turnStatus = "requires_action";
+          }
 
           // The agent returned its answer without streaming any text: emit it once
           // so streaming clients (chat-ui) don't end up with an empty bubble.
-          if (!streamedAnyText) {
-            const fallbackText = responseContent || finalChunkText;
+          if (!bridge.streamedAnyText) {
+            const fallbackText = responseContent || bridge.finalChunkText;
             if (fallbackText) {
               const textEvent: StreamTextEvent = {
                 type: "stream.text",
@@ -1493,6 +1654,8 @@ export class AgentServer {
           responseContent = result.content;
           responseFiles = result.files;
           usage = result.usage;
+          pendingActions = result.pendingActions ?? [];
+          turnStatus = normalizeTurnStatus(result.status, pendingActions);
 
           // Send the full content as a single text event
           const textEvent: StreamTextEvent = {
@@ -1509,6 +1672,7 @@ export class AgentServer {
               state: result.state,
             }, ctx.context);
           }
+          handlerState = result.state;
         } else {
           const errorEvent: StreamErrorEvent = {
             type: "stream.error",
@@ -1526,7 +1690,20 @@ export class AgentServer {
           role: "assistant",
           content: responseContent,
           files: responseFiles,
+          ...(pendingActions.length > 0 && { metadata: { requiresAction: true } }),
         }, ctx.context);
+
+        await self.persistPendingActions(ctx, conversation, handlerState, assistantMessage.id, pendingActions, pausedSdkState);
+        if (pendingActions.length > 0) {
+          const requiredEvent: StreamActionRequiredEvent = {
+            type: "stream.action_required",
+            timestamp: Date.now(),
+            conversationId,
+            messageId: assistantMessage.id,
+            actions: pendingActions,
+          };
+          yield `data: ${JSON.stringify(requiredEvent)}\n\n`;
+        }
 
         // Auto-generate title on the first exchange
         let generatedTitle: string | undefined;
@@ -1552,26 +1729,12 @@ export class AgentServer {
                 totalTokens: usage.totalTokens,
               }
             : undefined,
+          ...(turnStatus && turnStatus !== "completed" && { status: turnStatus }),
+          ...(pendingActions.length > 0 && { pendingActions }),
         };
         yield `data: ${JSON.stringify(doneEvent)}\n\n`;
       } catch (error) {
-        const exposed = self.isExposedError(error as { statusCode?: number; expose?: boolean } | null);
-        if (!exposed) console.error("[AgentServer] Stream error:", error);
-        const errorMessage = !exposed
-          ? "An unexpected error occurred"
-          : error instanceof Error
-            ? error.message
-            : "Unknown error";
-        const errorEvent: StreamErrorEvent = {
-          type: "stream.error",
-          timestamp: Date.now(),
-          error: errorMessage,
-          // Host-authored errors (statusCode + code) keep their own code, e.g. CONVERSATION_BUSY.
-          code: exposed && typeof (error as { statusCode?: unknown })?.statusCode === "number" && typeof (error as { code?: unknown }).code === "string"
-            ? (error as { code: string }).code
-            : "INTERNAL_ERROR",
-        };
-        yield `data: ${JSON.stringify(errorEvent)}\n\n`;
+        yield self.streamErrorFrame(error);
       }
     }
 
@@ -1585,6 +1748,356 @@ export class AgentServer {
       },
       stream: generateStream(),
     };
+  }
+
+  /** SSE frame for an error raised mid-stream (honours `maskServerErrors`). */
+  private streamErrorFrame(error: unknown): string {
+    const exposed = this.isExposedError(error as { statusCode?: number; expose?: boolean } | null);
+    if (!exposed) console.error("[AgentServer] Stream error:", error);
+    const errorMessage = !exposed
+      ? "An unexpected error occurred"
+      : error instanceof Error
+        ? error.message
+        : (error as { message?: string } | null)?.message || "Unknown error";
+    const errorEvent: StreamErrorEvent = {
+      type: "stream.error",
+      timestamp: Date.now(),
+      error: errorMessage,
+      // Host-authored errors (statusCode + code) keep their own code, e.g. CONVERSATION_BUSY.
+      code: exposed && typeof (error as { statusCode?: unknown })?.statusCode === "number" && typeof (error as { code?: unknown }).code === "string"
+        ? (error as { code: string }).code
+        : "INTERNAL_ERROR",
+    };
+    return `data: ${JSON.stringify(errorEvent)}\n\n`;
+  }
+
+  // ============================================================================
+  // Resolve a pending action
+  // ============================================================================
+
+  /** `conversationId:actionId` currently being resolved (guards double submits). */
+  private resolvingActions = new Set<string>();
+
+  private validateResolution(body: ResolveActionRequest | undefined): ActionResolution {
+    const bad = (message: string): never => {
+      throw { statusCode: 400, code: "VALIDATION_ERROR", message } as ValidationError;
+    };
+    const r = body?.resolution as Record<string, unknown> | undefined;
+    if (!r || typeof r !== "object") return bad("resolution is required");
+    if (r.type === "tool_approval") {
+      if (r.decision !== "allow" && r.decision !== "deny") return bad('resolution.decision must be "allow" or "deny"');
+      if (r.approvedArgs !== undefined && (!r.approvedArgs || typeof r.approvedArgs !== "object" || Array.isArray(r.approvedArgs))) {
+        return bad("resolution.approvedArgs must be a JSON object");
+      }
+      if (r.comment !== undefined && typeof r.comment !== "string") return bad("resolution.comment must be a string");
+      return r as unknown as ActionResolution;
+    }
+    if (r.type === "user_question") {
+      if (r.cancelled !== true) {
+        const answers = r.answers as Record<string, unknown> | undefined;
+        if (!answers || typeof answers !== "object" || Array.isArray(answers)) return bad("resolution.answers must be an object");
+        for (const value of Object.values(answers)) {
+          const ok = typeof value === "string" || (Array.isArray(value) && value.every((v) => typeof v === "string"));
+          if (!ok) return bad("resolution.answers values must be a string or an array of strings");
+        }
+      }
+      return r as unknown as ActionResolution;
+    }
+    return bad('resolution.type must be "tool_approval" or "user_question"');
+  }
+
+  private async handleResolveAction(ctx: RouteContext): Promise<RouteResult<ResolveActionResponse>> {
+    const { conversationId, actionId } = ctx.params;
+    const body = ctx.body as ResolveActionRequest | undefined;
+    const resolution = this.validateResolution(body);
+
+    const conversation = await this.config.storage.getConversation(conversationId, ctx.context);
+    if (!conversation) {
+      throw { statusCode: 404, code: "NOT_FOUND", message: `Conversation not found: ${conversationId}` } as NotFoundError;
+    }
+    await this.verifyConversationAccess(conversation, ctx);
+
+    const agent = await this.getAgentFor(conversation.agentId, ctx.context);
+    if (!agent) {
+      throw { statusCode: 404, code: "NOT_FOUND", message: `Agent not found: ${conversation.agentId}` } as NotFoundError;
+    }
+    const useSdk = !!agent.sdkAgent;
+    const supported = useSdk ? supportsSdkPause(agent.sdkAgent) : typeof agent.handler?.resolveAction === "function";
+    if (!supported) {
+      throw { statusCode: 404, code: "NOT_FOUND", message: "This agent does not support resolving actions" } as NotFoundError;
+    }
+
+    const store = readHitl(conversation.state);
+    const action = store?.pending?.actions.find((a) => a.id === actionId);
+    if (!store?.pending || !action) {
+      throw { statusCode: 409, code: "action_not_pending", message: `Action is not pending: ${actionId}` };
+    }
+    if (action.type !== resolution.type) {
+      throw {
+        statusCode: 400,
+        code: "VALIDATION_ERROR",
+        message: `resolution.type "${resolution.type}" does not match the action (${action.type})`,
+      } as ValidationError;
+    }
+
+    // Apply the decision to the paused SDK state up front, so an invalid answer is a plain 400.
+    let nextSdkState: unknown;
+    if (useSdk) {
+      if (store.pending.sdkState === undefined) {
+        throw { statusCode: 409, code: "action_not_pending", message: `Action cannot be resumed: ${actionId}` };
+      }
+      try {
+        nextSdkState = applySdkResolution(
+          agent.sdkAgent as HitlSdkAgent,
+          jsonSafe(store.pending.sdkState),
+          action,
+          resolution,
+          ctx.context?.user?.id ?? ctx.user?.id
+        );
+      } catch (error) {
+        throw {
+          statusCode: 400,
+          code: "VALIDATION_ERROR",
+          message: error instanceof Error ? error.message : "Invalid resolution",
+        } as ValidationError;
+      }
+    }
+
+    // Cheap pre-flight so a concurrent duplicate gets a real HTTP 409 even when streaming.
+    if (this.resolvingActions.has(`${conversationId}:${actionId}`)) {
+      throw { statusCode: 409, code: "action_not_pending", message: `Action is already being resolved: ${actionId}` };
+    }
+
+    const run: ResolveRun = { ctx, conversation, agent, store, action, resolution, nextSdkState, metadata: body?.metadata };
+
+    if (body?.stream) {
+      const self = this;
+      async function* generateStream(): AsyncGenerator<string, void, unknown> {
+        const queue: string[] = [];
+        let wake: (() => void) | null = null;
+        let finished = false;
+        const push = (frame: string) => {
+          queue.push(frame);
+          wake?.();
+          wake = null;
+        };
+        const startEvent: StreamStartEvent = {
+          type: "stream.start",
+          timestamp: Date.now(),
+          conversationId,
+          messageId: store!.pending!.messageId,
+        };
+        yield `data: ${JSON.stringify(startEvent)}\n\n`;
+
+        const outcome = self.executeResolve(run, true, push).then(
+          (value) => ({ value }),
+          (error: unknown) => ({ error })
+        ).finally(() => {
+          finished = true;
+          wake?.();
+          wake = null;
+        });
+        while (!finished || queue.length > 0) {
+          if (queue.length === 0) await new Promise<void>((resolve) => { wake = resolve; });
+          while (queue.length > 0) yield queue.shift()!;
+        }
+        const settled = await outcome;
+        if ("error" in settled) {
+          yield self.streamErrorFrame(settled.error);
+          return;
+        }
+        const { assistant, usage, pendingActions, status } = settled.value;
+        if (pendingActions.length > 0) {
+          const requiredEvent: StreamActionRequiredEvent = {
+            type: "stream.action_required",
+            timestamp: Date.now(),
+            conversationId,
+            messageId: assistant.id,
+            actions: pendingActions,
+          };
+          yield `data: ${JSON.stringify(requiredEvent)}\n\n`;
+        }
+        const doneEvent: StreamDoneEvent = {
+          type: "stream.done",
+          timestamp: Date.now(),
+          conversationId,
+          messageId: assistant.id,
+          content: typeof assistant.content === "string" ? assistant.content : JSON.stringify(assistant.content),
+          usage: usage
+            ? { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, totalTokens: usage.totalTokens }
+            : undefined,
+          ...(status && status !== "completed" && { status }),
+          ...(pendingActions.length > 0 && { pendingActions }),
+        };
+        yield `data: ${JSON.stringify(doneEvent)}\n\n`;
+      }
+
+      return {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+          "X-Accel-Buffering": "no",
+        },
+        stream: generateStream(),
+      };
+    }
+
+    const { assistant, usage, pendingActions, status } = await this.executeResolve(run, false, () => {});
+    return {
+      status: 200,
+      body: {
+        response: assistant,
+        usage,
+        ...(status && status !== "completed" && { status }),
+        ...(pendingActions.length > 0 && { pendingActions }),
+      },
+    };
+  }
+
+  /**
+   * Resolves one action and, when nothing else is pending, continues the turn.
+   * `push` receives SSE frames (action_resolved, tool / text events) as they happen.
+   */
+  private async executeResolve(
+    run: ResolveRun,
+    streaming: boolean,
+    push: (frame: string) => void
+  ): Promise<{ assistant: Message; usage?: SendMessageResponse["usage"]; pendingActions: PendingAction[]; status?: MessageStatus }> {
+    const { ctx, conversation, agent, store, action, resolution } = run;
+    const conversationId = conversation.id;
+    const pending = store.pending!;
+
+    const key = `${conversationId}:${action.id}`;
+    if (this.resolvingActions.has(key)) {
+      throw { statusCode: 409, code: "action_not_pending", message: `Action is already being resolved: ${action.id}` };
+    }
+    this.resolvingActions.add(key);
+    try {
+      // Re-check under the lock: another request may have resolved this action since the caller read it.
+      const fresh = await this.config.storage.getConversation(conversationId, ctx.context);
+      if (!readHitl(fresh?.state)?.pending?.actions.some((a) => a.id === action.id)) {
+        throw { statusCode: 409, code: "action_not_pending", message: `Action is not pending: ${action.id}` };
+      }
+      const resolvedEvent: StreamActionResolvedEvent = {
+        type: "stream.action_resolved",
+        timestamp: Date.now(),
+        conversationId,
+        actionId: action.id,
+        resolution: {
+          type: resolution.type,
+          ...(resolution.type === "tool_approval" && { decision: resolution.decision }),
+          ...(resolution.type === "user_question" && resolution.cancelled && { cancelled: true }),
+        },
+      };
+      push(`data: ${JSON.stringify(resolvedEvent)}\n\n`);
+
+      const remaining = pending.actions.filter((a) => a.id !== action.id);
+      const allowedTools = new Set(store.allowedTools ?? []);
+      let responseContent = "";
+      let usage: SendMessageResponse["usage"];
+      let turnStatus: MessageStatus | undefined;
+      let newPending: PendingAction[] = [];
+      let pausedSdkState: unknown;
+      let baseState: Record<string, unknown> | undefined = conversation.state;
+      let handlerFiles: Message["files"];
+
+      if (agent.sdkAgent) {
+        if (resolution.type === "tool_approval" && resolution.decision === "allow" && resolution.rememberForSession
+          && this.config.allowRememberApproval !== false) {
+          const toolName = (action as Extract<PendingAction, { type: "tool_approval" }>).toolName;
+          // A per-call predicate decides on the arguments; remembering by name would skip that check.
+          const runtimeTools = (agent.sdkAgent as { __runtime?: { tools?: Array<{ name?: string; needsApproval?: unknown }> } }).__runtime?.tools;
+          const predicateGated = Array.isArray(runtimeTools)
+            && runtimeTools.some((t) => t?.name === toolName && typeof t.needsApproval === "function");
+          if (!predicateGated) allowedTools.add(toolName);
+        }
+
+        if (remaining.length > 0) {
+          // More actions of the same pause are still open: record this answer and wait.
+          const state = writeHitl(conversation.state, {
+            allowedTools: [...allowedTools],
+            pending: { actions: remaining, messageId: pending.messageId, sdkState: jsonSafe(run.nextSdkState) },
+          });
+          await this.config.storage.updateConversation(conversationId, { state }, ctx.context);
+          const paused = await this.config.storage.getMessage(pending.messageId, ctx.context);
+          const now = new Date();
+          return {
+            assistant: paused ?? { id: pending.messageId, conversationId, role: "assistant", content: "", createdAt: now, updatedAt: now },
+            pendingActions: remaining,
+            status: "requires_action",
+          };
+        }
+
+        const bridge = createSdkStreamBridge(push);
+        const turn = await runSdkTurn(
+          agent.sdkAgent as HitlSdkAgent,
+          run.nextSdkState,
+          streaming
+            ? { stream: true, context: ctx.context, onStream: bridge.onStream, onEvent: bridge.onEvent }
+            : { context: ctx.context },
+          allowedTools
+        );
+        responseContent = turn.result.content;
+        usage = turn.result.metadata?.usage as SendMessageResponse["usage"];
+        if (turn.pending.length > 0) {
+          newPending = turn.pending;
+          pausedSdkState = portableState(turn.result.state);
+          turnStatus = "requires_action";
+        }
+        if (streaming && !bridge.streamedAnyText) {
+          const fallbackText = responseContent || bridge.finalChunkText;
+          if (fallbackText) {
+            const textEvent: StreamTextEvent = { type: "stream.text", timestamp: Date.now(), text: fallbackText, isFinal: true };
+            push(`data: ${JSON.stringify(textEvent)}\n\n`);
+          }
+          responseContent = fallbackText;
+        }
+      } else {
+        const handler = agent.handler!;
+        const result: ProcessMessageResult = await handler.resolveAction!({
+          conversationId,
+          actionId: action.id,
+          resolution,
+          state: publicState(conversation.state),
+          metadata: run.metadata,
+          context: ctx.context,
+        });
+        responseContent = result.content;
+        usage = result.usage;
+        newPending = result.pendingActions ?? [];
+        turnStatus = normalizeTurnStatus(result.status, newPending);
+        if (result.state) baseState = result.state;
+        if (streaming) {
+          const textEvent: StreamTextEvent = { type: "stream.text", timestamp: Date.now(), text: responseContent, isFinal: true };
+          push(`data: ${JSON.stringify(textEvent)}\n\n`);
+        }
+        handlerFiles = result.files;
+      }
+
+      const assistant = await this.config.storage.createMessage({
+        conversationId,
+        role: "assistant",
+        content: responseContent,
+        files: handlerFiles,
+        ...(newPending.length > 0 && { metadata: { requiresAction: true } }),
+      }, ctx.context);
+
+      const nextStore: HitlStore = {
+        ...(allowedTools.size > 0 && { allowedTools: [...allowedTools] }),
+        ...(newPending.length > 0 && {
+          pending: { actions: newPending, messageId: assistant.id, ...(pausedSdkState !== undefined && { sdkState: pausedSdkState }) },
+        }),
+      };
+      await this.config.storage.updateConversation(conversationId, {
+        state: writeHitl(baseState, nextStore),
+      }, ctx.context);
+
+      return { assistant, usage, pendingActions: newPending, status: turnStatus };
+    } finally {
+      this.resolvingActions.delete(key);
+    }
   }
 
   private async handleUploadFile(

@@ -78,6 +78,15 @@ export type {
   // Request/Response types
   SendMessageRequest,
   SendMessageResponse,
+  ResolveActionRequest,
+  ResolveActionResponse,
+  PendingAction,
+  ActionResolution,
+  UserQuestion,
+  UserQuestionOption,
+  MessageStatus,
+  ResolveActionParams,
+  AgentCapabilities,
   ListAgentsResponse,
   ListConversationsResponse,
   GetConversationResponse,
@@ -104,6 +113,8 @@ export type {
   StreamToolResultEvent,
   StreamProgressEvent,
   StreamErrorEvent,
+  StreamActionRequiredEvent,
+  StreamActionResolvedEvent,
   StreamDoneEvent,
 } from "./types.js";
 

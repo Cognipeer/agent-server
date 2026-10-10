@@ -239,6 +239,33 @@ interface StreamErrorEvent {
 }
 ```
 
+### PendingAction
+
+```typescript
+type PendingAction =
+  | { id: string; type: 'tool_approval'; toolName: string; toolCallId?: string; title?: string; summary?: string; args?: Record<string, unknown>; expiresAt?: string }
+  | { id: string; type: 'user_question'; questions: UserQuestion[]; allowFreeText?: boolean; expiresAt?: string };
+
+interface UserQuestion {
+  question: string;
+  header?: string;
+  multiSelect?: boolean;
+  placeholder?: string;
+  required?: boolean;
+  options?: Array<{ label: string; value?: string; description?: string }>;
+}
+```
+
+### ActionResolution
+
+```typescript
+type ActionResolution =
+  | { type: 'tool_approval'; decision: 'allow' | 'deny'; comment?: string; approvedArgs?: Record<string, unknown>; rememberForSession?: boolean }
+  | { type: 'user_question'; answers: Record<string, string | string[]>; cancelled?: boolean };
+
+type MessageStatus = 'completed' | 'requires_action' | 'incomplete' | 'cancelled';
+```
+
 ### StreamDoneEvent
 
 ```typescript

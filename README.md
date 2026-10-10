@@ -144,6 +144,7 @@ export const { GET, POST, PATCH, DELETE, OPTIONS } =
 | DELETE | /conversations/:id          | Delete conversation               |
 | GET    | /conversations/:id/messages | List messages                     |
 | POST   | /conversations/:id/messages | Send message                      |
+| POST   | /conversations/:id/actions/:actionId | Resolve a pending tool approval / question |
 | POST   | /files                      | Upload file                       |
 | GET    | /files/:fileId              | File metadata                     |
 | GET    | /files/:fileId/content      | Download file                     |

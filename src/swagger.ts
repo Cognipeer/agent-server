@@ -207,8 +207,113 @@ function generateSchemas(): Record<string, unknown> {
             totalTokens: { type: "integer" },
           },
         },
+        status: {
+          type: "string",
+          enum: ["completed", "requires_action", "incomplete", "cancelled"],
+          description: "Only present when the turn did not simply complete (e.g. requires_action).",
+        },
+        pendingActions: {
+          type: "array",
+          items: { $ref: "#/components/schemas/PendingAction" },
+        },
       },
       required: ["message", "response"],
+    },
+    PendingAction: {
+      type: "object",
+      description: "Something the agent is waiting on (tool approval or user question).",
+      properties: {
+        id: { type: "string" },
+        type: { type: "string", enum: ["tool_approval", "user_question"] },
+        toolName: { type: "string" },
+        toolCallId: { type: "string" },
+        title: { type: "string" },
+        summary: { type: "string" },
+        args: { type: "object", additionalProperties: true },
+        questions: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              question: { type: "string" },
+              header: { type: "string" },
+              multiSelect: { type: "boolean" },
+              placeholder: { type: "string" },
+              required: { type: "boolean" },
+              options: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    label: { type: "string" },
+                    value: { type: "string" },
+                    description: { type: "string" },
+                  },
+                  required: ["label"],
+                },
+              },
+            },
+            required: ["question"],
+          },
+        },
+        allowFreeText: { type: "boolean" },
+        expiresAt: { type: "string", format: "date-time" },
+      },
+      required: ["id", "type"],
+    },
+    ResolveActionRequest: {
+      type: "object",
+      properties: {
+        resolution: {
+          oneOf: [
+            {
+              type: "object",
+              properties: {
+                type: { type: "string", enum: ["tool_approval"] },
+                decision: { type: "string", enum: ["allow", "deny"] },
+                comment: { type: "string" },
+                approvedArgs: { type: "object", additionalProperties: true },
+                rememberForSession: { type: "boolean" },
+              },
+              required: ["type", "decision"],
+            },
+            {
+              type: "object",
+              properties: {
+                type: { type: "string", enum: ["user_question"] },
+                answers: {
+                  type: "object",
+                  additionalProperties: {
+                    oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
+                  },
+                },
+                cancelled: { type: "boolean" },
+              },
+              required: ["type"],
+            },
+          ],
+        },
+        stream: { type: "boolean", default: false, description: "Stream the continuation as SSE." },
+        metadata: { type: "object", additionalProperties: true },
+      },
+      required: ["resolution"],
+    },
+    ResolveActionResponse: {
+      type: "object",
+      properties: {
+        response: { $ref: "#/components/schemas/Message" },
+        usage: {
+          type: "object",
+          properties: {
+            inputTokens: { type: "integer" },
+            outputTokens: { type: "integer" },
+            totalTokens: { type: "integer" },
+          },
+        },
+        status: { type: "string", enum: ["completed", "requires_action", "incomplete", "cancelled"] },
+        pendingActions: { type: "array", items: { $ref: "#/components/schemas/PendingAction" } },
+      },
+      required: ["response"],
     },
     UploadFileRequest: {
       type: "object",
@@ -349,6 +454,37 @@ function generateSchemas(): Record<string, unknown> {
             inputTokens: { type: "integer" },
             outputTokens: { type: "integer" },
             totalTokens: { type: "integer" },
+          },
+        },
+        status: { type: "string", enum: ["completed", "requires_action", "incomplete", "cancelled"] },
+        pendingActions: { type: "array", items: { $ref: "#/components/schemas/PendingAction" } },
+      },
+    },
+    StreamActionRequiredEvent: {
+      type: "object",
+      description: "The agent paused and is waiting on a human",
+      properties: {
+        type: { type: "string", enum: ["stream.action_required"] },
+        timestamp: { type: "integer" },
+        conversationId: { type: "string" },
+        messageId: { type: "string" },
+        actions: { type: "array", items: { $ref: "#/components/schemas/PendingAction" } },
+      },
+    },
+    StreamActionResolvedEvent: {
+      type: "object",
+      description: "A pending action was resolved",
+      properties: {
+        type: { type: "string", enum: ["stream.action_resolved"] },
+        timestamp: { type: "integer" },
+        conversationId: { type: "string" },
+        actionId: { type: "string" },
+        resolution: {
+          type: "object",
+          properties: {
+            type: { type: "string", enum: ["tool_approval", "user_question"] },
+            decision: { type: "string", enum: ["allow", "deny"] },
+            cancelled: { type: "boolean" },
           },
         },
       },
@@ -862,6 +998,55 @@ function generatePaths(
                 schema: { $ref: "#/components/schemas/Error" },
               },
             },
+          },
+          409: {
+            description: "action_pending: the conversation is waiting for a pending action to be resolved",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/Error" },
+              },
+            },
+          },
+        },
+      },
+    },
+    "/conversations/{conversationId}/actions/{actionId}": {
+      post: {
+        tags: ["Messages"],
+        summary: "Resolve a pending action (tool approval / question) and continue the turn",
+        operationId: "resolveAction",
+        parameters: [
+          { name: "conversationId", in: "path", required: true, schema: { type: "string" } },
+          { name: "actionId", in: "path", required: true, schema: { type: "string" } },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/ResolveActionRequest" },
+            },
+          },
+        },
+        responses: {
+          200: {
+            description: "Action resolved; JSON, or text/event-stream when stream is true",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/ResolveActionResponse" },
+              },
+            },
+          },
+          400: {
+            description: "Validation error (bad resolution or answers)",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+          404: {
+            description: "Conversation not found, or the agent cannot resolve actions",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+          409: {
+            description: "action_not_pending: unknown or already resolved action",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
         },
       },

@@ -291,6 +291,37 @@ event: stream.done
 data: {"message":{"id":"msg_2","role":"assistant","content":"Hello! I'm doing well."},"timestamp":1234567893}
 ```
 
+### Resolve a Pending Action
+
+```
+POST /conversations/:id/actions/:actionId
+```
+
+Answers a tool approval or a question the agent paused on (see [Approvals & Questions](../guide/human-in-the-loop)) and continues the turn.
+
+**Request Body:**
+
+```json
+{
+  "resolution": { "type": "tool_approval", "decision": "allow", "rememberForSession": true },
+  "stream": false
+}
+```
+
+or `{ "resolution": { "type": "user_question", "answers": { "Which env?": "Production" } } }`.
+
+**Response:** same shape as a message response, without the user `message` (`{ response, usage?, status?, pendingActions? }`). With `"stream": true` the response is the usual SSE sequence, starting with `stream.start` and `stream.action_resolved`.
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `VALIDATION_ERROR` | Malformed resolution, wrong type for the action, invalid answers |
+| 404 | `NOT_FOUND` | Unknown conversation, or the agent cannot resolve actions |
+| 409 | `action_not_pending` | Unknown, already resolved, or currently being resolved |
+
+While a conversation has a pending action, `POST /conversations/:id/messages` answers `409 action_pending` (`error.details.pendingActionIds`), unless the server was configured with `pendingActionPolicy: 'cancel'`.
+
+`GET /conversations/:id` includes `pendingActions` (omitted when there are none) so a reloaded UI can render the open request.
+
 ## Files
 
 ### Upload File

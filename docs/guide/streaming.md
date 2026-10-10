@@ -146,6 +146,36 @@ interface StreamDoneEvent {
 }
 ```
 
+### stream.action_required
+
+Sent when the agent pauses to wait for a human (tool approval or a question). The stream then ends with `stream.done` carrying `status: "requires_action"`. See [Approvals & Questions](./human-in-the-loop).
+
+```typescript
+interface StreamActionRequiredEvent {
+  type: 'stream.action_required';
+  conversationId: string;
+  messageId: string;          // the assistant message the actions belong to
+  actions: PendingAction[];
+  timestamp: number;
+}
+```
+
+### stream.action_resolved
+
+First event of the stream returned by `POST /conversations/:id/actions/:actionId` (with `stream: true`):
+
+```typescript
+interface StreamActionResolvedEvent {
+  type: 'stream.action_resolved';
+  conversationId: string;
+  actionId: string;
+  resolution: { type: 'tool_approval' | 'user_question'; decision?: 'allow' | 'deny'; cancelled?: boolean };
+  timestamp: number;
+}
+```
+
+`stream.done` gained two optional fields: `status` (only sent when the turn did not simply complete, e.g. `"requires_action"`) and `pendingActions`. Clients that do not know the new events can ignore them.
+
 ## Client Implementation
 
 ### Using fetch

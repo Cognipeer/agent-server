@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-10
+
+Human-in-the-loop: agents can pause for a tool approval or a question, and a client resumes them. All changes are additive; an agent that never pauses behaves exactly as before.
+
+### Added
+
+- **Pending actions** (`PendingAction`, `ActionResolution`, `UserQuestion`, `MessageStatus`): a turn can end with `status: "requires_action"` and the list of `pendingActions` it waits on.
+- **Resolve route** `POST /conversations/:conversationId/actions/:actionId` with `{ resolution, stream? }`. Streams the continuation (`stream.start`, `stream.action_resolved`, ... `stream.done`) or answers JSON. 404 when the agent cannot resolve actions, 409 `action_not_pending` for an unknown / already resolved action, 400 for an invalid resolution.
+- **Stream events** `stream.action_required` and `stream.action_resolved`; `stream.done` and the non-stream message response gained optional `status` / `pendingActions` (only sent when the turn did not complete).
+- **SDK agents**: a paused `invoke` result (pending approvals / user questions) is persisted in the conversation state; resolving restores it, applies the decision with `resolveToolApproval` / `resolveUserQuestion` and calls `invoke` again with the same streaming hooks. `rememberForSession` auto-approves later pauses on the same tool in that conversation.
+- **Custom handlers**: `ProcessMessageResult.status` / `pendingActions` pass through; new optional `AgentHandler.resolveAction(params)` continues the turn.
+- `GET /conversations/:id` returns `pendingActions`; internal pause state is never exposed in `conversation.state`.
+- **`pendingActionPolicy`** (`'reject'` default | `'cancel'`): what a new message does while an action is pending (409 `action_pending`, or cancel the pending actions and proceed).
+- `AgentInfo.capabilities` (`toolApproval`, `askUser`), derived for SDK agents when cheaply knowable.
+- OpenAPI schemas and path for the new route; docs guide "Approvals & Questions".
+
 ## [0.2.0] - 2026-10-09
 
 All changes are additive; existing configurations keep working unchanged.

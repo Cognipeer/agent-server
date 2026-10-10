@@ -11,6 +11,8 @@ While `@cognipeer/agent-sdk` provides a powerful agent framework, you can also i
 ```typescript
 interface AgentHandler {
   processMessage(params: ProcessMessageParams): Promise<ProcessMessageResult>;
+  // Optional: continue a turn that paused for an approval / question
+  resolveAction?(params: ResolveActionParams): Promise<ProcessMessageResult>;
 }
 
 interface ProcessMessageParams {
@@ -31,6 +33,8 @@ interface ProcessMessageResult {
     outputTokens?: number;
     totalTokens?: number;
   };
+  status?: 'completed' | 'requires_action' | 'incomplete' | 'cancelled';
+  pendingActions?: PendingAction[];  // see "Approvals & Questions"
 }
 ```
 
