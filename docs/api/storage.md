@@ -144,6 +144,7 @@ abstract class BaseStorageProvider {
   abstract getFile(id: string): Promise<FileRecord | null>;
   abstract getFileContent(id: string): Promise<Buffer | null>;
   abstract deleteFile(id: string): Promise<void>;
+  // Optional: the file index (listFiles / purgeExpiredFiles), see capabilities().fileIndex
 }
 ```
 
@@ -264,9 +265,12 @@ Save a file.
 const file = await storage.saveFile({
   name: 'document.pdf',
   mimeType: 'application/pdf',
-  size: 12345,
   content: Buffer.from('...'),
-  metadata: { uploadedBy: 'user-123' },
+  conversationId: 'conv_1',          // optional: the file belongs to this conversation and goes with it
+  userId: 'user-123',                // optional: who uploaded it (the file routes only show it to them)
+  agentId: 'contracts',              // optional
+  expiresAt: new Date(Date.now() + 30 * 86_400_000),   // optional: purgeExpiredFiles deletes it after this
+  metadata: { source: 'upload' },
 });
 ```
 
@@ -286,6 +290,16 @@ Get file content as Buffer.
 ```typescript
 const content = await storage.getFileContent('file-123');
 // Returns null if not found
+```
+
+#### listFiles(params) / purgeExpiredFiles(params)
+
+The file index (`capabilities().fileIndex`; all four built-in providers have it). `listFiles` gives a conversation's files, oldest first, as a `PaginatedResult`;
+`purgeExpiredFiles` deletes the files that expired - record and content, earliest expiry first - and resolves how many.
+
+```typescript
+const page = await storage.listFiles!({ conversationId: 'conv_1', limit: 100, offset: 0, order: 'asc' });
+const deleted = await storage.purgeExpiredFiles!({ before: new Date(), limit: 500 });
 ```
 
 #### deleteFile(id)

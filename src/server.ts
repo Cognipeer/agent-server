@@ -67,6 +67,10 @@ import type {
   CancelConversationResponse,
   NewConversationEvent,
   TaskStatus,
+  ListFilesResponse,
+  AgentFilesConfig,
+  ProcessMessageParams,
+  ContentPart,
 } from "./types.js";
 import {
   HITL_STATE_KEY,
@@ -104,6 +108,32 @@ import {
   type RunTrigger,
   type TurnOutcome,
 } from "./runs.js";
+import {
+  FILES_DEFAULTS,
+  SESSION_FILES_READ_TOOL,
+  SESSION_FILES_VIEW_IMAGE_TOOL,
+  attachmentsCapability,
+  contentDispositionHeader,
+  fileDisposition,
+  isMimeAllowed,
+  isVisionImageMime,
+  isWellFormedMime,
+  resolveFilesConfig,
+  resolveUploadMimeType,
+  type FileDisposition,
+  type ResolvedFilesConfig,
+} from "./files/config.js";
+import { assembleHistory, buildUserTurnContent, type AssembledAttachments, type AttachmentSource } from "./files/assemble.js";
+import { createTextExtractor, type TextExtractor } from "./files/extract.js";
+import {
+  dehydrateImages,
+  hasImageReferences,
+  isSessionImageModel,
+  resolveImageReferences,
+  type ImageFormat,
+  type ImageSource,
+} from "./files/images.js";
+import { runWithTurnFiles, type TurnFiles } from "./files/turn.js";
 import { nanoid } from "nanoid";
 
 /** Largest file the upload route accepts when `limits.maxFileSize` is not set (capped by the storage provider). */
@@ -130,25 +160,31 @@ function extractToolEventProps(event: any): {
   };
 }
 
-/** Maps stored messages to the agent-sdk message shape (tool calls preserved). */
-function toSdkMessages(data: Message[]) {
+/**
+ * Maps stored messages to the agent-sdk message shape (tool calls preserved). A user message that carries
+ * files becomes the turn the model is given: its text plus what the files add (see files/assemble.ts).
+ */
+function toSdkMessages(data: Message[], assembled?: Map<string, AssembledAttachments>) {
   return data
     // A turn that paused or was stopped before it said anything leaves an empty assistant message behind.
     .filter((m) => !(m.role === "assistant" && m.content === "" && (m.metadata?.requiresAction === true || m.metadata?.status === "cancelled" || m.metadata?.status === "incomplete")))
-    .map((m) => ({
-      role: m.role,
-      content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
-      // Preserve tool call information for proper LLM message history
-      ...(m.toolCalls && m.toolCalls.length > 0 && {
-        tool_calls: m.toolCalls.map(tc => ({
-          id: tc.id,
-          type: "function",
-          function: { name: tc.name, arguments: tc.arguments }
-        }))
-      }),
-      ...(m.toolCallId && { tool_call_id: m.toolCallId }),
-      ...(m.name && { name: m.name }),
-    }));
+    .map((m) => {
+      const attached = m.role === "user" && typeof m.content === "string" ? assembled?.get(m.id) : undefined;
+      return {
+        role: m.role,
+        content: attached ? buildUserTurnContent(m.content as string, attached) : m.content,
+        // Preserve tool call information for proper LLM message history
+        ...(m.toolCalls && m.toolCalls.length > 0 && {
+          tool_calls: m.toolCalls.map(tc => ({
+            id: tc.id,
+            type: "function",
+            function: { name: tc.name, arguments: tc.arguments }
+          }))
+        }),
+        ...(m.toolCallId && { tool_call_id: m.toolCallId }),
+        ...(m.name && { name: m.name }),
+      };
+    });
 }
 
 /**
@@ -299,6 +335,8 @@ interface AgentStep {
   stopReason?: StopReason;
   /** What a custom handler reported as `status` ("incomplete" without a reason becomes a `limit`). */
   handlerStatus?: MessageStatus;
+  /** Things worth knowing about the files of the turn (see {@link TurnWarning}). */
+  warnings?: TurnWarning[];
 }
 
 const cancelledStep = (content: string): AgentStep => ({ content, pending: [], cancelled: true });
@@ -325,6 +363,51 @@ const SSE_HEADERS: Record<string, string> = {
 };
 
 const conversationLeaseKey = (conversationId: string) => `conv:${conversationId}`;
+
+/** A file that came with a request and is not stored yet. */
+interface IncomingFile {
+  name: string;
+  mimeType: string;
+  bytes: Buffer;
+}
+
+/** The files a message attaches, checked against the agent's settings. */
+interface PreparedAttachments {
+  /** Stored files, attached by id. */
+  refs: FileAttachment[];
+  /** Files sent inline: stored when the turn starts. */
+  inline: IncomingFile[];
+  cfg: ResolvedFilesConfig;
+}
+
+/**
+ * The content of a stored message as a model API takes it: a user message with files is the turn the files make
+ * (text plus what they add); anything else is passed as it was stored - text, or parts for a message that has them.
+ */
+function modelContent(message: Message, attached: Map<string, AssembledAttachments>): string | ContentPart[] {
+  const assembled = message.role === "user" && typeof message.content === "string" ? attached.get(message.id) : undefined;
+  return assembled ? (buildUserTurnContent(message.content as string, assembled) as ContentPart[] | string) : message.content;
+}
+
+const attachmentOf = (record: FileRecord): FileAttachment => ({
+  id: record.id,
+  name: record.name,
+  mimeType: record.mimeType,
+  size: record.size,
+});
+
+const uniqueAttachments = (files: FileAttachment[]): FileAttachment[] => [
+  ...new Map(files.map((file) => [file.id, file])).values(),
+];
+
+/** What an extractor is told about a stored file. */
+const extractInfo = (record: FileRecord) => ({ id: record.id, name: record.name, mimeType: record.mimeType, size: record.size });
+
+/** What the `register*Agent` methods take besides the agent itself. */
+export interface AgentRegistrationOptions {
+  /** Attachment settings of this agent; each field overrides the server's `files` option. */
+  files?: AgentFilesConfig;
+}
 
 export interface RouteContext {
   user?: AuthUser;
@@ -423,6 +506,9 @@ export class AgentServer {
   private sweepWarned = false;
   private closed = false;
   private startedAt = Date.now();
+  /** Turns files into text for agents; keeps what it read so a file is not converted again for every page. */
+  private extractor: TextExtractor;
+  private lastFilePurge = 0;
 
   constructor(config: AgentServerConfig) {
     this.config = config;
@@ -450,6 +536,11 @@ export class AgentServer {
       recoverOnStart: runs.recoverOnStart !== false,
       assumeSingleNode: runs.assumeSingleNode !== false,
     };
+    this.extractor = createTextExtractor(
+      typeof config.files?.extractCacheBytes === "number" && config.files.extractCacheBytes >= 0
+        ? config.files.extractCacheBytes
+        : FILES_DEFAULTS.extractCacheBytes
+    );
     this.validateStorageLimits();
     this.setupRoutes();
   }
@@ -491,11 +582,125 @@ export class AgentServer {
         `limits.maxFileSize (${maxFileSize} bytes) is larger than the ${capabilities.maxFileBytes} bytes this storage provider can hold`
       );
     }
+    const filesMaxFileSize = this.config.files?.maxFileSize;
+    if (filesMaxFileSize && filesMaxFileSize > capabilities.maxFileBytes) {
+      throw new Error(
+        `files.maxFileSize (${filesMaxFileSize} bytes) is larger than the ${capabilities.maxFileBytes} bytes this storage provider can hold`
+      );
+    }
     if (maxStateBytes && maxStateBytes > capabilities.maxStateBytes) {
       throw new Error(
         `limits.maxStateBytes (${maxStateBytes} bytes) is larger than the ${capabilities.maxStateBytes} bytes this storage provider can hold`
       );
     }
+  }
+
+  // ============================================================================
+  // Files: settings and who may see what
+  // ============================================================================
+
+  /** The attachment settings of one agent (or of the server, for an upload that names no conversation). */
+  private filesConfigFor(agent?: Pick<AgentRegistration, "files">): ResolvedFilesConfig {
+    return resolveFilesConfig(this.config.files, agent?.files, {
+      defaultMaxFileSize: this.maxFileSize,
+      providerMaxFileBytes: this.config.storage.capabilities?.().maxFileBytes ?? Number.MAX_SAFE_INTEGER,
+    });
+  }
+
+  /**
+   * The largest upload any agent of this server accepts, in bytes: what an HTTP adapter has to let through
+   * (`files.maxFileSize` of an agent registered after this call is not known yet).
+   */
+  maxUploadBytes(): number {
+    let largest = this.filesConfigFor(undefined).maxFileSize;
+    for (const registration of this.agents.values()) largest = Math.max(largest, this.filesConfigFor(registration).maxFileSize);
+    return largest;
+  }
+
+  /**
+   * The file listing / expiry queries the built-in providers have; a custom provider may not. A provider that
+   * reports its capabilities has to say `fileIndex: true` (a `BaseStorageProvider` subclass always has the
+   * methods, and only the hooks make them work); one that reports none is judged by the methods it has.
+   */
+  private get filesIndexed(): boolean {
+    const provider = this.config.storage;
+    if (typeof provider.listFiles !== "function" || typeof provider.purgeExpiredFiles !== "function") return false;
+    const capabilities = provider.capabilities?.();
+    return capabilities === undefined ? true : capabilities.fileIndex === true;
+  }
+
+  /** The names of the tools an agent-sdk agent was built with; undefined when the instance does not say. */
+  private sdkToolNames(agent: AgentRegistration): Set<string> | undefined {
+    const tools = (agent.sdkAgent as { __runtime?: { tools?: Array<{ name?: unknown }> } } | undefined)?.__runtime?.tools;
+    if (!Array.isArray(tools)) return undefined;
+    return new Set(tools.map((tool) => tool?.name).filter((name): name is string => typeof name === "string"));
+  }
+
+  /** Whether the agent can read a document in pages (it has `session_files_read`, or does not say what it has). */
+  private agentCanPage(agent: AgentRegistration): boolean {
+    if (!agent.sdkAgent) return false;
+    const names = this.sdkToolNames(agent);
+    return names ? names.has(SESSION_FILES_READ_TOOL) : true;
+  }
+
+  /** Whether notes may send the model to `session_files_view_image`: the tool is there and the model's calls resolve images. */
+  private agentCanViewImages(agent: AgentRegistration, cfg: ResolvedFilesConfig): boolean {
+    if (!agent.sdkAgent || !cfg.vision) return false;
+    const names = this.sdkToolNames(agent);
+    const model = (agent.sdkAgent as { __runtime?: { model?: unknown } }).__runtime?.model;
+    return !!names?.has(SESSION_FILES_VIEW_IMAGE_TOOL) && isSessionImageModel(model);
+  }
+
+  /** `AgentInfo` as the API shows it: `capabilities.attachments` from the files settings (what the host set wins). */
+  private publicInfo(registration: AgentRegistration): AgentInfo {
+    const cfg = this.filesConfigFor(registration);
+    const own = registration.info.capabilities?.attachments ?? {};
+    const set = Object.fromEntries(Object.entries(own).filter(([, value]) => value !== undefined));
+    const attachments = { ...attachmentsCapability(cfg), ...set };
+    // The keys the first chat-ui read from `metadata`; whatever the host put there wins
+    const legacy: Record<string, unknown> = {
+      enableFileUpload: attachments.enabled,
+      maxFileSize: attachments.maxFileSize,
+      maxFiles: attachments.maxFiles,
+      ...(attachments.allowedMimeTypes?.length ? { allowedFileTypes: attachments.allowedMimeTypes } : {}),
+      acceptsImages: attachments.acceptsImages,
+    };
+    return {
+      ...registration.info,
+      capabilities: { ...registration.info.capabilities, attachments },
+      metadata: { ...legacy, ...registration.info.metadata },
+    };
+  }
+
+  /** The current caller is `ownerId` (same rule as for conversations: strict with `resolveContext`, lenient when no identity is known). */
+  private async isOwner(ownerId: string, ctx: RouteContext): Promise<boolean> {
+    const current = ctx.user?.id || (await this.resolveUserId(ctx));
+    return this.config.resolveContext ? current === ownerId : !current || current === ownerId;
+  }
+
+  /**
+   * Whether the caller may see a file: its uploader, in a conversation they may open. A file nobody uploaded
+   * (stored by the host without an identity) follows its conversation; one with neither is only reachable
+   * when the server does not enforce identities. The routes answer 404 for a file that fails this.
+   */
+  private async fileVisible(file: FileRecord, ctx: RouteContext, known?: Conversation): Promise<boolean> {
+    if (file.userId !== undefined && !(await this.isOwner(file.userId, ctx))) return false;
+    if (file.conversationId) {
+      const conversation =
+        known?.id === file.conversationId ? known : await this.config.storage.getConversation(file.conversationId, ctx.context);
+      if (!conversation) return false;
+      try {
+        await this.verifyConversationAccess(conversation, ctx);
+      } catch {
+        return false;
+      }
+      return true;
+    }
+    return file.userId !== undefined || !this.config.resolveContext;
+  }
+
+  private fileNotFound(id: string): NotFoundError {
+    return { statusCode: 404, code: "NOT_FOUND", message: `File not found: ${id}` } as unknown as NotFoundError;
   }
 
   /**
@@ -654,7 +859,8 @@ export class AgentServer {
   registerSDKAgent(
     id: string,
     agent: unknown,
-    info?: Partial<Omit<AgentInfo, "id">>
+    info?: Partial<Omit<AgentInfo, "id">>,
+    options?: AgentRegistrationOptions
   ): void {
     // Extract info from agent if possible
     const agentAny = agent as {
@@ -690,6 +896,7 @@ export class AgentServer {
         ...(capabilities && { capabilities }),
       },
       sdkAgent: agent,
+      ...(options?.files && { files: options.files }),
     });
   }
 
@@ -699,11 +906,13 @@ export class AgentServer {
   registerCustomAgent(
     id: string,
     handler: AgentRegistration["handler"],
-    info: Omit<AgentInfo, "id">
+    info: Omit<AgentInfo, "id">,
+    options?: AgentRegistrationOptions
   ): void {
     this.agents.set(id, {
       info: { id, ...info },
       handler,
+      ...(options?.files && { files: options.files }),
     });
   }
 
@@ -727,11 +936,13 @@ export class AgentServer {
   registerChatCompletionsAgent(
     id: string,
     config: ChatCompletionsConfig,
-    info: Omit<AgentInfo, "id">
+    info: Omit<AgentInfo, "id">,
+    options?: AgentRegistrationOptions
   ): void {
     this.agents.set(id, {
       info: { id, ...info },
       chatCompletions: config,
+      ...(options?.files && { files: options.files }),
     });
   }
 
@@ -756,11 +967,13 @@ export class AgentServer {
   registerResponsesAgent(
     id: string,
     config: ResponsesApiConfig,
-    info: Omit<AgentInfo, "id">
+    info: Omit<AgentInfo, "id">,
+    options?: AgentRegistrationOptions
   ): void {
     this.agents.set(id, {
       info: { id, ...info },
       responsesApi: config,
+      ...(options?.files && { files: options.files }),
     });
   }
 
@@ -769,7 +982,7 @@ export class AgentServer {
    * use `getAgentsFor` for the per-request list)
    */
   getAgents(): AgentInfo[] {
-    return Array.from(this.agents.values()).map((reg) => reg.info);
+    return Array.from(this.agents.values()).map((reg) => this.publicInfo(reg));
   }
 
   /**
@@ -803,7 +1016,7 @@ export class AgentServer {
 
   /** Agents visible to a request context (static + dynamic). */
   async getAgentsFor(rc: RequestContext = { data: {} }): Promise<AgentInfo[]> {
-    return Array.from((await this.resolveRegistry(rc)).values()).map((reg) => reg.info);
+    return Array.from((await this.resolveRegistry(rc)).values()).map((reg) => this.publicInfo(reg));
   }
 
   /** Look an agent up for a request context (static + dynamic). */
@@ -884,6 +1097,7 @@ export class AgentServer {
     this.addRoute("GET", "/conversations/:conversationId/events/stream", this.handleEventsStream.bind(this));
 
     // File routes
+    this.addRoute("GET", "/conversations/:conversationId/files", this.handleListFiles.bind(this));
     this.addRoute("POST", "/files", this.handleUploadFile.bind(this));
     this.addRoute("GET", "/files/:fileId", this.handleGetFile.bind(this));
     this.addRoute("DELETE", "/files/:fileId", this.handleDeleteFile.bind(this));
@@ -1159,7 +1373,7 @@ export class AgentServer {
 
     return {
       status: 200,
-      body: agent.info,
+      body: this.publicInfo(agent),
     };
   }
 
@@ -1742,18 +1956,28 @@ export class AgentServer {
       } as ValidationError;
     }
 
-    // Files the message attaches by id are checked before anything starts, streamed or not.
-    const fileRefs = await this.resolveFileRefs(conversationId, body, ctx);
+    // A message that attaches files is checked against its conversation and agent before anything starts,
+    // streamed or not: a refused file is an HTTP status, not a frame of a stream.
     const streaming = !!body.stream;
+    const attachesFiles =
+      (Array.isArray(body.fileIds) ? body.fileIds.length > 0 : body.fileIds !== undefined) ||
+      (Array.isArray(body.files) ? body.files.length > 0 : body.files !== undefined && body.files !== null);
+    let loaded: { conversation: Conversation; agent: AgentRegistration } | undefined;
+    let attachments: PreparedAttachments | undefined;
+    if (attachesFiles) {
+      loaded = await this.loadForTurn(conversationId, ctx);
+      attachments = await this.prepareAttachments(loaded, body, ctx);
+    }
 
     // A streamed request for a conversation or agent that is not there (or not the caller's) answers with a
     // stream that carries the error, as it always has; a plain request answers the HTTP status.
-    let loaded: { conversation: Conversation; agent: AgentRegistration };
-    try {
-      loaded = await this.loadForTurn(conversationId, ctx);
-    } catch (error) {
-      if (streaming) return this.errorStream(error);
-      throw error;
+    if (!loaded) {
+      try {
+        loaded = await this.loadForTurn(conversationId, ctx);
+      } catch (error) {
+        if (streaming) return this.errorStream(error);
+        throw error;
+      }
     }
     const { agent } = loaded;
     let { conversation } = loaded;
@@ -1769,7 +1993,7 @@ export class AgentServer {
     }
 
     const stream = streaming ? this.attachStream(run) : undefined;
-    this.launch(run, ctx, () => this.executeMessage(run, { ctx, conversation, agent, body, fileRefs }));
+    this.launch(run, ctx, () => this.executeMessage(run, { ctx, conversation, agent, body, attachments }));
     if (stream) return { status: 200, headers: SSE_HEADERS, stream: stream.generator, close: stream.close };
 
     const outcome = await run.done;
@@ -1798,23 +2022,38 @@ export class AgentServer {
       conversation: Conversation;
       agent: AgentRegistration;
       body: SendMessageRequest;
-      fileRefs: FileAttachment[];
+      /** The files the message attaches (checked by `prepareAttachments`; a task hands over its input files). */
+      attachments?: PreparedAttachments;
       /** What a custom handler gets as `metadata`, when it is not the message's own (a task hands over its comments). */
       handlerMetadata?: Record<string, unknown>;
     }
   ): Promise<TurnOutcome> {
-    const { ctx, conversation, agent, body, fileRefs } = x;
+    const { ctx, conversation, agent, body } = x;
     const conversationId = conversation.id;
+    const cfg = x.attachments?.cfg ?? this.filesConfigFor(agent);
 
-    // Handle file attachments
-    const files = this.messageFiles(body, fileRefs);
+    // Which uploads were already sent is known from the conversation's history (only read early when it is needed)
+    const attachNewUploads = cfg.attachNewUploads && cfg.enabled;
+    const prior = attachNewUploads ? await this.loadHistory(conversationId, ctx.context) : undefined;
+
+    // Files sent inline are stored first, so the message carries real ids; then the ones attached by id, then
+    // - if the agent is set up for it - uploads no message has carried yet
+    const stored: FileAttachment[] = [];
+    for (const file of x.attachments?.inline ?? []) {
+      const record = await this.saveIncomingFile(ctx, { file, cfg, conversation });
+      stored.push(attachmentOf(record));
+    }
+    let files = uniqueAttachments([...(x.attachments?.refs ?? []), ...stored]);
+    if (prior) {
+      files = uniqueAttachments([...files, ...(await this.unsentUploads(conversationId, prior, files, ctx.context))]);
+    }
 
     // Save user message
     const userMessage = await this.config.storage.createMessage({
       conversationId,
       role: "user",
       content: body.message,
-      files,
+      files: files.length > 0 ? files : undefined,
       metadata: body.metadata,
     }, ctx.context);
 
@@ -1825,7 +2064,7 @@ export class AgentServer {
           data: {
             content: body.message,
             message_id: userMessage.id,
-            ...(files?.length ? { files: files.map((f) => ({ id: f.id, name: f.name, mime_type: f.mimeType, size: f.size })) } : {}),
+            ...(files.length > 0 ? { files: files.map((f) => ({ id: f.id, name: f.name, mime_type: f.mimeType, size: f.size })) } : {}),
           },
         },
         { type: EVENT_TYPES.statusRunning, data: { trigger: run.trigger } },
@@ -1840,9 +2079,18 @@ export class AgentServer {
     });
 
     // Get previous messages for context
-    const history = await this.loadHistory(conversationId, ctx.context);
+    const history = prior ? [...prior, userMessage] : await this.loadHistory(conversationId, ctx.context);
 
-    const step = await this.runMessageStep(run, { ctx, conversation, agent, history, body, files, handlerMetadata: x.handlerMetadata });
+    const step = await this.runMessageStep(run, {
+      ctx,
+      conversation,
+      agent,
+      history,
+      body,
+      files: files.length > 0 ? files : undefined,
+      currentMessageId: userMessage.id,
+      handlerMetadata: x.handlerMetadata,
+    });
     return this.finalizeTurn(run, {
       ctx,
       conversation,
@@ -1852,6 +2100,25 @@ export class AgentServer {
       firstExchange: history.length === 1 && !run.taskId ? body.message : undefined,
       allowedTools: undefined,
     });
+  }
+
+  /**
+   * Files uploaded to the conversation that no message has carried yet, oldest first (`files.attachNewUploads`),
+   * as many as a message may attach. "Carried" = named in the `files` of a message the conversation holds.
+   */
+  private async unsentUploads(
+    conversationId: string,
+    prior: Message[],
+    already: FileAttachment[],
+    rc?: RequestContext
+  ): Promise<FileAttachment[]> {
+    const taken = new Set(already.map((file) => file.id));
+    for (const message of prior) for (const file of message.files ?? []) taken.add(file.id);
+    const room = Math.max(0, (this.config.limits?.maxFiles ?? FILES_DEFAULTS.maxFiles) - already.length);
+    return (await this.conversationFiles(conversationId, rc))
+      .filter((record) => !taken.has(record.id))
+      .slice(0, room)
+      .map(attachmentOf);
   }
 
   /** The agent's side of a message turn, for every kind of agent. */
@@ -1864,6 +2131,8 @@ export class AgentServer {
       history: Message[];
       body: SendMessageRequest;
       files?: FileAttachment[];
+      /** The user message being answered (its images are shown; its warnings are reported). */
+      currentMessageId?: string;
       handlerMetadata?: Record<string, unknown>;
     }
   ): Promise<AgentStep> {
@@ -1877,22 +2146,44 @@ export class AgentServer {
       ({ type: "stream.text", timestamp: Date.now(), text, isFinal, seq } satisfies StreamTextEvent);
 
     try {
+      // What the conversation's files add to what the model is told (a custom handler reads them itself)
+      const turn = this.turnFilesFor(conversationId, agent, ctx.context);
+      let attached = new Map<string, AssembledAttachments>();
+      let warnings: TurnWarning[] = [];
+      if (!agent.handler && history.some((m) => m.role === "user" && m.files?.length)) {
+        const assembled = await assembleHistory(history, {
+          currentMessageId: x.currentMessageId,
+          source: this.attachmentSource(turn),
+          cfg: turn.cfg,
+          canPage: this.agentCanPage(agent),
+          viewImageTool: turn.viewImageTool,
+          signal: run.signal,
+          onError: (file, error) => console.error(`[AgentServer] Could not read file ${file.id}:`, error),
+        });
+        attached = assembled.byMessage;
+        warnings = assembled.warnings;
+      }
+      const withWarnings = (step: AgentStep): AgentStep => (warnings.length > 0 ? { ...step, warnings } : step);
+
       if (agent.sdkAgent) {
         // Map messages with tool_calls and tool_call_id preserved
-        return await this.runSdk(
-          run,
-          ctx,
-          agent.sdkAgent as HitlSdkAgent,
-          { messages: toSdkMessages(history) },
-          new Set(readHitl(conversation.state)?.allowedTools ?? []),
-          partial
+        return withWarnings(
+          await this.runSdk(
+            run,
+            ctx,
+            agent,
+            { messages: toSdkMessages(history, attached) },
+            new Set(readHitl(conversation.state)?.allowedTools ?? []),
+            partial,
+            turn
+          )
         );
       }
 
       if (agent.chatCompletions) {
-        const messages = history.map((m) => ({
+        const raw = history.map((m) => ({
           role: m.role,
-          content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+          content: modelContent(m, attached),
           ...(m.toolCalls && m.toolCalls.length > 0 && {
             tool_calls: m.toolCalls.map(tc => ({
               id: tc.id,
@@ -1903,10 +2194,11 @@ export class AgentServer {
           ...(m.toolCallId && { tool_call_id: m.toolCallId }),
           ...(m.name && { name: m.name }),
         }));
+        const messages = (await this.resolveImages(raw, turn, "data-url")) as typeof raw;
 
         if (!run.streaming) {
           const result = await invokeChatCompletions(agent.chatCompletions, messages, { signal: run.signal });
-          return { content: result.content, usage: result.usage, pending: [], cancelled: run.cancelled };
+          return withWarnings({ content: result.content, usage: result.usage, pending: [], cancelled: run.cancelled });
         }
         let content = "";
         let usage: SendMessageResponse["usage"];
@@ -1919,13 +2211,21 @@ export class AgentServer {
             usage = event.usage;
           }
         }
-        return { content, usage, pending: [], cancelled: run.cancelled };
+        return withWarnings({ content, usage, pending: [], cancelled: run.cancelled });
       }
 
       if (agent.responsesApi) {
-        const messages = history.map((m) => ({
+        const raw = history.map((m) => ({ role: m.role, content: modelContent(m, attached) }));
+        // Parts of the Responses API: text is input_text, a picture input_image
+        const messages = ((await this.resolveImages(raw, turn, "responses")) as typeof raw).map((m) => ({
           role: m.role,
-          content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+          content: Array.isArray(m.content)
+            ? m.content.map((part) =>
+                (part as { type?: string }).type === "text"
+                  ? { type: m.role === "assistant" ? "output_text" : "input_text", text: (part as { text?: string }).text }
+                  : part
+              )
+            : m.content,
         }));
 
         let content = "";
@@ -1954,7 +2254,7 @@ export class AgentServer {
             state: { ...conversation.state, lastResponseId: responseId },
           }, ctx.context);
         }
-        return { content, usage, pending: [], cancelled: run.cancelled };
+        return withWarnings({ content, usage, pending: [], cancelled: run.cancelled });
       }
 
       if (agent.handler) {
@@ -1977,6 +2277,7 @@ export class AgentServer {
           metadata: x.handlerMetadata ?? body.metadata,
           context: ctx.context,
           signal: run.signal,
+          ...this.handlerFileReaders(turn),
         });
         const raced = await run.raceCancel(work, grace);
         if ("abandoned" in raced) return cancelledStep(partial.text);
@@ -2017,15 +2318,45 @@ export class AgentServer {
     };
   }
 
+  /** The input of a model call written by the server (Chat Completions, Responses) with its image references read from storage. */
+  private async resolveImages<T extends unknown[]>(messages: T, turn: TurnFiles, format: ImageFormat): Promise<unknown[]> {
+    if (!hasImageReferences(messages)) return messages;
+    return resolveImageReferences(messages, {
+      source: turn.images,
+      maxImages: turn.cfg.maxImages,
+      maxBytes: turn.cfg.maxImageBytes,
+      viewImageTool: false,
+      format,
+    });
+  }
+
+  /** An SDK input (`{ messages }` or a resumed state) with the image references of its messages read from storage. */
+  private async hydrateSdkInput(input: unknown, turn: TurnFiles): Promise<unknown> {
+    const messages = (input as { messages?: unknown } | null)?.messages;
+    if (!Array.isArray(messages) || !hasImageReferences(messages)) return input;
+    return {
+      ...(input as Record<string, unknown>),
+      messages: await resolveImageReferences(messages, {
+        source: turn.images,
+        maxImages: turn.cfg.maxImages,
+        maxBytes: turn.cfg.maxImageBytes,
+        viewImageTool: false,
+        format: "sdk",
+      }),
+    };
+  }
+
   /** Invokes an agent-sdk agent (with the remembered-approval loop), cancellable. */
   private async runSdk(
     run: ActiveRun,
     ctx: RouteContext,
-    sdkAgent: HitlSdkAgent,
+    agent: AgentRegistration,
     input: unknown,
     allowedTools: ReadonlySet<string>,
-    partial: { text: string }
+    partial: { text: string },
+    turn: TurnFiles
   ): Promise<AgentStep> {
+    const sdkAgent = agent.sdkAgent as HitlSdkAgent;
     const bridge = createSdkBridge(run, partial);
     const config = {
       context: ctx.context,
@@ -2034,7 +2365,15 @@ export class AgentServer {
       onEvent: bridge.onEvent,
       ...(run.streaming ? { stream: true, onStream: bridge.onStream } : {}),
     };
-    const raced = await run.raceCancel(runSdkTurn(sdkAgent, input, config, allowedTools), this.runCfg.cancelGraceMs);
+    // An agent whose model reads image references itself (`withSessionImages`) is given references; for any other
+    // the server reads the images now - they are put back to references before a paused state is stored.
+    const wrapped = isSessionImageModel((sdkAgent as { __runtime?: { model?: unknown } }).__runtime?.model);
+    const sdkInput = wrapped ? input : await this.hydrateSdkInput(input, turn);
+    // The tools and the model wrapper find the conversation's files through the turn
+    const raced = await run.raceCancel(
+      runWithTurnFiles(turn, () => runSdkTurn(sdkAgent, sdkInput, config, allowedTools)),
+      this.runCfg.cancelGraceMs
+    );
     if ("abandoned" in raced) return cancelledStep(partial.text);
 
     const { result, pending } = raced.value;
@@ -2069,7 +2408,7 @@ export class AgentServer {
       content,
       usage,
       pending,
-      sdkState: pending.length > 0 ? portableState(result.state) : undefined,
+      sdkState: pending.length > 0 ? dehydrateImages(portableState(result.state)) : undefined,
       cancelled: false,
       limited: !!sdkCtx?.__limitBreached,
       ...(typeof sdkCtx?.__limitBreached === "string" ? { detail: sdkCtx.__limitBreached } : {}),
@@ -2115,6 +2454,7 @@ export class AgentServer {
       sdkState: step.sdkState,
       stopReason: wanted,
       allowedTools: x.allowedTools,
+      warnings: step.warnings,
     });
     const assistant = saved.message;
     const stopReason = saved.stopReason;
@@ -2182,7 +2522,11 @@ export class AgentServer {
           data: {
             stop_reason: stopReason,
             ...(pendingActions.length > 0 ? { pending_action_ids: pendingActions.map((a) => a.id) } : {}),
-            ...(saved.warnings ? { detail: saved.warnings[0]!.code } : step.detail ? { detail: step.detail } : {}),
+            ...(saved.warnings?.some((w) => w.code === "pause_state_too_large")
+              ? { detail: "pause_state_too_large" }
+              : step.detail
+                ? { detail: step.detail }
+                : {}),
           },
         },
         ...(stopReason === "end_turn" ? [{ type: EVENT_TYPES.workDone, data: {} }] : []),
@@ -2244,6 +2588,8 @@ export class AgentServer {
       stopReason: StopReason;
       /** Remembered tools to store (a resolve may have added one); default: the ones already stored. */
       allowedTools?: string[];
+      /** Warnings the turn already has (about its files); the message carries them. */
+      warnings?: TurnWarning[];
     }
   ): Promise<{
     message: Message;
@@ -2253,11 +2599,12 @@ export class AgentServer {
     warnings?: TurnWarning[];
   }> {
     let { actions, sdkState, content, stopReason } = turn;
-    let warnings: TurnWarning[] | undefined;
+    let warnings: TurnWarning[] | undefined = turn.warnings?.length ? [...turn.warnings] : undefined;
 
     const dropPause = (bytes: number | undefined) => {
       const max = this.maxStateBytes;
       warnings = [
+        ...(warnings ?? []),
         {
           code: "pause_state_too_large",
           message: `The paused state${bytes ? ` (${bytes} bytes)` : ""} does not fit the ${max} byte limit, so the turn was not paused`,
@@ -2586,7 +2933,7 @@ export class AgentServer {
 
       run.emit({ events: [{ type: EVENT_TYPES.statusRunning, data: { trigger: run.trigger } }] });
       try {
-        step = await this.runSdk(run, ctx, agent.sdkAgent as HitlSdkAgent, resolveRun.nextSdkState, allowedTools, partial);
+        step = await this.runSdk(run, ctx, agent, resolveRun.nextSdkState, allowedTools, partial, this.turnFilesFor(conversationId, agent, ctx.context));
       } catch (error) {
         if (run.cancelled) step = cancelledStep(partial.text);
         else throw error;
@@ -2604,6 +2951,7 @@ export class AgentServer {
             metadata: resolveRun.metadata,
             context: ctx.context,
             signal: run.signal,
+            ...this.handlerFileReaders(this.turnFilesFor(conversationId, agent, ctx.context)),
           }),
           this.runCfg.cancelGraceMs
         );
@@ -3022,6 +3370,7 @@ export class AgentServer {
     try {
       await this.recoverStaleRuns();
       await this.pruneOldEvents();
+      await this.purgeDueFiles();
     } catch (error) {
       // The store going away under a sweep (shutdown) is not a failure worth a log line
       if (!this.config.storage.isConnected() || /closed|not connected|disconnect/i.test((error as Error)?.message ?? "")) return;
@@ -3037,6 +3386,42 @@ export class AgentServer {
     if (days <= 0 || Date.now() - this.lastPrune < 3_600_000) return;
     this.lastPrune = Date.now();
     await this.eventStore.prune?.(new Date(Date.now() - days * 86_400_000), this.systemContext());
+  }
+
+  /** The periodic file purge: at most once per `files.purgeIntervalMs`, and (with storage leases) on one node at a time. */
+  private async purgeDueFiles(): Promise<void> {
+    const interval = this.config.files?.purgeIntervalMs ?? FILES_DEFAULTS.purgeIntervalMs;
+    if (interval <= 0 || Date.now() - this.lastFilePurge < interval) return;
+    this.lastFilePurge = Date.now();
+    await this.purgeExpiredFiles();
+  }
+
+  /**
+   * Deletes the files past their retention (`files.retentionDays`) - record and content - and resolves how many.
+   * The server does it by itself every `files.purgeIntervalMs`; call it to do it now (or when the sweep is off).
+   * With storage leases only one node purges at a time (the others get 0).
+   */
+  async purgeExpiredFiles(): Promise<number> {
+    const storage = this.config.storage;
+    if (!this.filesIndexed || !storage.isConnected()) return 0;
+    const rc = this.systemContext();
+    const key = "files:purge";
+    if (this.leasesAvailable) {
+      const claim = await storage.acquireLease!({ key, owner: this.nodeId, ttlMs: 120_000 }, rc);
+      if (!claim.acquired) return 0;
+    }
+    let purged = 0;
+    try {
+      // A batch at a time, so one sweep never holds the store for long
+      for (let batch = 0; batch < 20; batch++) {
+        const deleted = await storage.purgeExpiredFiles!({ before: new Date(), limit: 500 }, rc);
+        purged += deleted;
+        if (deleted < 500) break;
+      }
+    } finally {
+      if (this.leasesAvailable) await storage.releaseLease!({ key, owner: this.nodeId }, rc).catch(() => undefined);
+    }
+    return purged;
   }
 
   /**
@@ -3173,191 +3558,388 @@ export class AgentServer {
     }
   }
 
-  /**
-   * The stored files a message attaches by id (`fileIds`). Refuses before the
-   * turn starts: too many (400), or an id that is not a file of this
-   * conversation (404, the same answer for a missing file and someone else's).
-   */
-  private async resolveFileRefs(
+  // ============================================================================
+  // Files
+  // ============================================================================
+
+  /** Refuses what the agent's files settings do not allow, before anything is stored. */
+  private checkIncomingFile(cfg: ResolvedFilesConfig, file: IncomingFile): void {
+    if (!cfg.enabled) {
+      throw { statusCode: 403, code: "attachments_disabled", message: "This agent does not take attachments." };
+    }
+    if (file.bytes.length === 0) {
+      throw { statusCode: 400, code: "VALIDATION_ERROR", message: "File is empty" } as ValidationError;
+    }
+    if (file.bytes.length > cfg.maxFileSize) throw this.fileTooLarge(cfg.maxFileSize);
+    if (!isMimeAllowed(file.mimeType, cfg.allowedMimeTypes)) {
+      throw {
+        statusCode: 415,
+        code: "unsupported_file_type",
+        message: `Files of type "${file.mimeType}" are not accepted by this agent.`,
+        details: { mimeType: file.mimeType, allowedMimeTypes: cfg.allowedMimeTypes },
+      };
+    }
+  }
+
+  private fileTooLarge(maxBytes: number) {
+    return {
+      statusCode: 400,
+      code: "VALIDATION_ERROR",
+      message: `File size exceeds limit of ${maxBytes} bytes`,
+      details: { reason: "file_too_large", maxBytes },
+    };
+  }
+
+  /** 409 `too_many_files` when the conversation cannot hold `adding` more files (needs the provider's file index). */
+  private async checkRoomForFiles(
+    cfg: ResolvedFilesConfig,
     conversationId: string,
+    adding: number,
+    ctx: RouteContext
+  ): Promise<void> {
+    if (adding <= 0 || !this.filesIndexed) return;
+    const held = (await this.config.storage.listFiles!({ conversationId, limit: 1 }, ctx.context)).total;
+    if (held + adding > cfg.maxFiles) {
+      throw {
+        statusCode: 409,
+        code: "too_many_files",
+        message: `A conversation holds at most ${cfg.maxFiles} files. Delete one to attach another.`,
+        details: { maxFiles: cfg.maxFiles, held },
+      };
+    }
+  }
+
+  /** When the retention sweep deletes a file uploaded now. */
+  private retentionExpiry(cfg: ResolvedFilesConfig): Date | undefined {
+    return cfg.retentionDays > 0 ? new Date(Date.now() + cfg.retentionDays * 86_400_000) : undefined;
+  }
+
+  /** Stores a file for the caller: owned by them, in the conversation, due for the retention sweep. */
+  private async saveIncomingFile(
+    ctx: RouteContext,
+    x: { file: IncomingFile; cfg: ResolvedFilesConfig; conversation?: Conversation; metadata?: Record<string, unknown> }
+  ): Promise<FileRecord> {
+    return this.config.storage.saveFile(
+      {
+        name: x.file.name,
+        mimeType: x.file.mimeType,
+        content: x.file.bytes,
+        conversationId: x.conversation?.id,
+        agentId: x.conversation?.agentId,
+        userId: await this.effectiveUserId(ctx),
+        expiresAt: this.retentionExpiry(x.cfg),
+        metadata: x.metadata,
+      },
+      ctx.context
+    );
+  }
+
+  /**
+   * The stored files a message attaches by id (`fileIds`) and the files it sends inline. Refuses before the
+   * turn starts: a malformed list or too many files (400), an id that is not a file of this conversation that
+   * the caller uploaded (404, the same answer for a missing file and someone else's), an agent that takes no
+   * files (403), a type it does not accept (415), a conversation that is full (409).
+   */
+  private async prepareAttachments(
+    loaded: { conversation: Conversation; agent: AgentRegistration },
     body: SendMessageRequest | undefined,
     ctx: RouteContext
-  ): Promise<FileAttachment[]> {
-    const raw = body?.fileIds;
-    if (raw === undefined) return [];
-    if (!Array.isArray(raw) || raw.some((id) => typeof id !== "string" || id.length === 0)) {
-      throw {
-        statusCode: 400,
-        code: "VALIDATION_ERROR",
-        message: "fileIds must be an array of file ids",
-      } as ValidationError;
+  ): Promise<PreparedAttachments> {
+    const { conversation } = loaded;
+    const cfg = this.filesConfigFor(loaded.agent);
+    const bad = (message: string): never => {
+      throw { statusCode: 400, code: "VALIDATION_ERROR", message } as ValidationError;
+    };
+
+    const rawIds = body?.fileIds;
+    if (rawIds !== undefined && (!Array.isArray(rawIds) || rawIds.some((id) => typeof id !== "string" || id.length === 0))) {
+      bad("fileIds must be an array of file ids");
     }
-    const ids = [...new Set(raw)];
-    const maxFiles = this.config.limits?.maxFiles ?? 10;
-    if (ids.length + (body?.files?.length ?? 0) > maxFiles) {
-      throw {
-        statusCode: 400,
-        code: "VALIDATION_ERROR",
-        message: `A message can attach at most ${maxFiles} files`,
-      } as ValidationError;
+    const ids = [...new Set((rawIds as string[] | undefined) ?? [])];
+
+    // (`files: null` has always meant none)
+    const rawInline = body?.files ?? undefined;
+    if (rawInline !== undefined && !Array.isArray(rawInline)) bad("files must be an array");
+    const inlineEntries = rawInline ?? [];
+
+    const maxFiles = this.config.limits?.maxFiles ?? FILES_DEFAULTS.maxFiles;
+    if (ids.length + inlineEntries.length > maxFiles) bad(`A message can attach at most ${maxFiles} files`);
+    if (ids.length + inlineEntries.length === 0) return { refs: [], inline: [], cfg };
+    if (!cfg.enabled) {
+      throw { statusCode: 403, code: "attachments_disabled", message: "This agent does not take attachments." };
     }
+
     const refs: FileAttachment[] = [];
     for (const id of ids) {
       const file = await this.config.storage.getFile(id, ctx.context);
-      if (!file || (file.conversationId && file.conversationId !== conversationId)) {
-        throw {
-          statusCode: 404,
-          code: "NOT_FOUND",
-          message: `File not found: ${id}`,
-        } as NotFoundError;
+      // A file of another conversation or another user is "not found", like one that does not exist
+      if (!file || file.conversationId !== conversation.id || !(await this.fileVisible(file, ctx, conversation))) {
+        throw this.fileNotFound(id);
       }
       refs.push({ id: file.id, name: file.name, mimeType: file.mimeType, size: file.size });
     }
-    return refs;
+
+    const inline: IncomingFile[] = [];
+    for (const entry of inlineEntries) {
+      if (!entry || typeof entry.name !== "string" || !entry.name || typeof entry.content !== "string" || typeof entry.mimeType !== "string") {
+        bad("files[].name, files[].content (base64) and files[].mimeType are required");
+      }
+      if (Math.floor((entry.content.length * 3) / 4) > cfg.maxFileSize + 3) throw this.fileTooLarge(cfg.maxFileSize);
+      const file: IncomingFile = {
+        name: entry.name,
+        mimeType: resolveUploadMimeType(entry.mimeType, entry.name),
+        bytes: Buffer.from(entry.content, "base64"),
+      };
+      this.checkIncomingFile(cfg, file);
+      inline.push(file);
+    }
+    await this.checkRoomForFiles(cfg, conversation.id, inline.length, ctx);
+    return { refs, inline, cfg };
   }
 
-  /** The files of a user message: stored ones attached by id, then inline ones (not stored by the server). */
-  private messageFiles(
-    body: SendMessageRequest | undefined,
-    fileRefs: FileAttachment[]
-  ): FileAttachment[] | undefined {
-    const inline = (body?.files ?? []).map((file) => ({
-      id: `file_${Date.now()}_${Math.random().toString(36).slice(2)}`,
-      name: file.name,
-      mimeType: file.mimeType,
-      size: Buffer.from(file.content, "base64").length,
-    }));
-    const all = [...fileRefs, ...inline];
-    return body?.files || fileRefs.length > 0 ? all : undefined;
+  /** Every file the conversation holds, oldest first. */
+  private async conversationFiles(conversationId: string, rc?: RequestContext): Promise<FileRecord[]> {
+    const storage = this.config.storage;
+    if (this.filesIndexed) {
+      const all: FileRecord[] = [];
+      for (let offset = 0; ; ) {
+        const page = await storage.listFiles!({ conversationId, limit: 200, offset }, rc);
+        all.push(...page.data);
+        offset += page.data.length;
+        if (!page.hasMore || page.data.length === 0) return all;
+      }
+    }
+    // A provider without a file index only knows the files that messages carry
+    const seen = new Set<string>();
+    const out: FileRecord[] = [];
+    for (const message of await this.loadHistory(conversationId, rc)) {
+      for (const attached of message.files ?? []) {
+        if (seen.has(attached.id)) continue;
+        seen.add(attached.id);
+        const record = await storage.getFile(attached.id, rc);
+        if (record && record.conversationId === conversationId) out.push(record);
+      }
+    }
+    return out;
+  }
+
+  /** What the tools and the model wrapper of a turn need to know about the conversation's files (turn.ts). */
+  private turnFilesFor(conversationId: string, agent: AgentRegistration, rc?: RequestContext): TurnFiles {
+    const cfg = this.filesConfigFor(agent);
+    const storage = this.config.storage;
+    const records = new Map<string, Promise<FileRecord | null>>();
+    const bytes = new Map<string, Promise<Buffer | null>>();
+
+    // A file of THIS conversation, else it does not exist for the agent
+    const find = (fileId: string): Promise<FileRecord | null> => {
+      let found = records.get(fileId);
+      if (!found) {
+        found = storage.getFile(fileId, rc).then((record) => (record && record.conversationId === conversationId ? record : null));
+        records.set(fileId, found);
+      }
+      return found;
+    };
+    const content = (fileId: string): Promise<Buffer | null> => {
+      let found = bytes.get(fileId);
+      if (!found) {
+        found = storage.getFileContent(fileId, rc);
+        bytes.set(fileId, found);
+      }
+      return found;
+    };
+    const images: ImageSource = {
+      async find(fileId) {
+        const record = await find(fileId).catch(() => null);
+        return record && isVisionImageMime(record.mimeType) ? { name: record.name, size: record.size } : null;
+      },
+      async read(fileId) {
+        const record = await find(fileId);
+        if (!record || !isVisionImageMime(record.mimeType)) return null;
+        const data = await content(fileId);
+        return data ? { bytes: data, mediaType: record.mimeType } : null;
+      },
+    };
+    return {
+      conversationId,
+      cfg,
+      list: () => this.conversationFiles(conversationId, rc),
+      find,
+      text: (record) => this.extractor.extract(extractInfo(record), () => content(record.id), cfg.extractText),
+      bytes: (record) => content(record.id),
+      images,
+      viewImageTool: this.agentCanViewImages(agent, cfg),
+    };
+  }
+
+  /** How a turn finds and reads the files its messages carry. */
+  private attachmentSource(turn: TurnFiles): AttachmentSource {
+    return { find: turn.find, text: turn.text };
+  }
+
+  /** The readers a custom handler gets for the files of its conversation. */
+  private handlerFileReaders(turn: TurnFiles): Pick<ProcessMessageParams, "getFileContent" | "getFileText"> {
+    return {
+      getFileContent: async (fileId) => {
+        const record = await turn.find(fileId).catch(() => null);
+        return record ? turn.bytes(record).catch(() => null) : null;
+      },
+      getFileText: async (fileId) => {
+        const record = await turn.find(fileId).catch(() => null);
+        return record ? turn.text(record) : null;
+      },
+    };
   }
 
   private async handleUploadFile(
     ctx: RouteContext
   ): Promise<RouteResult<UploadFileResponse>> {
-    const body = ctx.body as UploadFileRequest;
+    const upload = this.parseUpload(ctx);
 
-    if (!body?.file) {
-      throw {
-        statusCode: 400,
-        code: "VALIDATION_ERROR",
-        message: "file is required",
-      } as ValidationError;
+    // The conversation the file is for decides whose settings apply
+    let conversation: Conversation | undefined;
+    let agent: AgentRegistration | undefined;
+    if (upload.conversationId) {
+      const found = await this.config.storage.getConversation(upload.conversationId, ctx.context);
+      if (!found) {
+        throw { statusCode: 404, code: "NOT_FOUND", message: `Conversation not found: ${upload.conversationId}` } as NotFoundError;
+      }
+      await this.verifyConversationAccess(found, ctx);
+      conversation = found;
+      agent = await this.getAgentFor(found.agentId, ctx.context);
+    }
+    const cfg = this.filesConfigFor(agent);
+    if (!cfg.enabled) {
+      throw { statusCode: 403, code: "attachments_disabled", message: "This agent does not take attachments." };
     }
 
-    const { name, content, mimeType } = body.file;
-
-    if (!name || !mimeType || content === undefined || content === null) {
-      throw {
-        statusCode: 400,
-        code: "VALIDATION_ERROR",
-        message: "file.name, file.content, and file.mimeType are required",
-      } as ValidationError;
+    let bytes: Buffer;
+    if (typeof upload.content === "string") {
+      if (upload.content === "") {
+        // A named but empty file gets its own message: it is the user's file, not a malformed request
+        throw { statusCode: 400, code: "VALIDATION_ERROR", message: "File is empty" } as ValidationError;
+      }
+      // Check the size from the base64 length before decoding: the text is about a third larger than the file
+      if (Math.floor((upload.content.length * 3) / 4) > cfg.maxFileSize + 3) throw this.fileTooLarge(cfg.maxFileSize);
+      bytes = Buffer.from(upload.content, "base64");
+    } else {
+      bytes = upload.content;
     }
-    // A named but empty file gets its own message: it is the user's file, not a malformed request
-    if (content === "") {
-      throw { statusCode: 400, code: "VALIDATION_ERROR", message: "File is empty" } as ValidationError;
-    }
+    const file: IncomingFile = { name: upload.name, mimeType: resolveUploadMimeType(upload.mimeType, upload.name), bytes };
+    // (base64 that decodes to nothing - whitespace, bare padding - is an empty file too)
+    this.checkIncomingFile(cfg, file);
+    if (conversation) await this.checkRoomForFiles(cfg, conversation.id, 1, ctx);
 
-    // Check file size limits (before decoding: the base64 text is about a third larger than the file)
-    const maxSize = this.maxFileSize;
-    if (typeof content !== "string" || Math.floor((content.length * 3) / 4) > maxSize + 3) {
-      throw {
-        statusCode: 400,
-        code: "VALIDATION_ERROR",
-        message: `File size exceeds limit of ${maxSize} bytes`,
-      } as ValidationError;
-    }
-    const contentBuffer = Buffer.from(content, "base64");
-
-    // Base64 that decodes to nothing (whitespace, bare padding) is an empty file too
-    if (contentBuffer.length === 0) {
-      throw { statusCode: 400, code: "VALIDATION_ERROR", message: "File is empty" } as ValidationError;
-    }
-
-    if (contentBuffer.length > maxSize) {
-      throw {
-        statusCode: 400,
-        code: "VALIDATION_ERROR",
-        message: `File size exceeds limit of ${maxSize} bytes`,
-      } as ValidationError;
-    }
-
-    const file = await this.config.storage.saveFile({
-      name,
-      mimeType,
-      content: contentBuffer,
-      conversationId: body.conversationId,
-      metadata: body.metadata,
-    }, ctx.context);
-
+    const record = await this.saveIncomingFile(ctx, { file, cfg, conversation, metadata: upload.metadata });
     return {
       status: 201,
-      body: { file },
+      body: { file: record },
     };
   }
 
-  private async handleGetFile(ctx: RouteContext): Promise<RouteResult<FileRecord>> {
-    const { fileId } = ctx.params;
+  /** The upload request, whichever way the file travels: the file's raw bytes (`?name=`) or the JSON body. */
+  private parseUpload(ctx: RouteContext): {
+    name: string;
+    mimeType: string;
+    content: string | Buffer;
+    conversationId?: string;
+    metadata?: Record<string, unknown>;
+  } {
+    const bad = (message: string): never => {
+      throw { statusCode: 400, code: "VALIDATION_ERROR", message } as ValidationError;
+    };
+    const one = (value: string | string[] | undefined) => (Array.isArray(value) ? value[0] : value) || undefined;
 
-    const file = await this.config.storage.getFile(fileId, ctx.context);
-    if (!file) {
-      throw {
-        statusCode: 404,
-        code: "NOT_FOUND",
-        message: `File not found: ${fileId}`,
-      } as NotFoundError;
+    if (Buffer.isBuffer(ctx.body)) {
+      const name = one(ctx.query.name) ?? one(ctx.query.filename);
+      if (!name) bad("name is required: send the file's name as ?name=<file name>");
+      const contentType = normalizeHeaders(ctx.headers)["content-type"];
+      return {
+        name: name!,
+        mimeType: one(ctx.query.mimeType) ?? (Array.isArray(contentType) ? contentType[0] : contentType) ?? "application/octet-stream",
+        content: ctx.body,
+        conversationId: one(ctx.query.conversationId),
+      };
     }
 
+    const body = ctx.body as UploadFileRequest | undefined;
+    if (!body?.file) bad("file is required");
+    const { name, content, mimeType } = body!.file;
+    if (!name || !mimeType || content === undefined || content === null) {
+      bad("file.name, file.content, and file.mimeType are required");
+    }
+    if (typeof content !== "string") bad("file.content must be a base64 string");
+    if (body!.conversationId !== undefined && typeof body!.conversationId !== "string") bad("conversationId must be a string");
+    return { name, mimeType, content, conversationId: body!.conversationId, metadata: body!.metadata };
+  }
+
+  private async handleListFiles(ctx: RouteContext): Promise<RouteResult<ListFilesResponse>> {
+    const { conversationId } = ctx.params;
+    const conversation = await this.config.storage.getConversation(conversationId, ctx.context);
+    if (!conversation) {
+      throw { statusCode: 404, code: "NOT_FOUND", message: `Conversation not found: ${conversationId}` } as NotFoundError;
+    }
+    await this.verifyConversationAccess(conversation, ctx);
+    // (an agent that was removed since still has its files listed, under the server's settings)
+    const cfg = this.filesConfigFor(await this.getAgentFor(conversation.agentId, ctx.context));
+    const { limit, offset } = parsePaging(ctx.query, 100, this.maxPageSize);
+
+    if (this.filesIndexed) {
+      const page = await this.config.storage.listFiles!({ conversationId, limit, offset }, ctx.context);
+      return { status: 200, body: { files: page.data, total: page.total, limit, offset, hasMore: page.hasMore, maxFiles: cfg.maxFiles } };
+    }
+    const all = await this.conversationFiles(conversationId, ctx.context);
+    const files = all.slice(offset, offset + limit);
+    return { status: 200, body: { files, total: all.length, limit, offset, hasMore: offset + files.length < all.length, maxFiles: cfg.maxFiles } };
+  }
+
+  /** A file the caller may see, else the 404 every file route answers. */
+  private async visibleFile(ctx: RouteContext): Promise<FileRecord> {
+    const { fileId } = ctx.params;
+    const file = await this.config.storage.getFile(fileId, ctx.context);
+    if (!file || !(await this.fileVisible(file, ctx))) throw this.fileNotFound(fileId);
+    return file;
+  }
+
+  private async handleGetFile(ctx: RouteContext): Promise<RouteResult<FileRecord>> {
     return {
       status: 200,
-      body: file,
+      body: await this.visibleFile(ctx),
     };
   }
 
   private async handleDeleteFile(ctx: RouteContext): Promise<RouteResult> {
-    const { fileId } = ctx.params;
-
-    const file = await this.config.storage.getFile(fileId, ctx.context);
-    if (!file) {
-      throw {
-        statusCode: 404,
-        code: "NOT_FOUND",
-        message: `File not found: ${fileId}`,
-      } as NotFoundError;
-    }
-
-    await this.config.storage.deleteFile(fileId, ctx.context);
+    const file = await this.visibleFile(ctx);
+    await this.config.storage.deleteFile(file.id, ctx.context);
 
     return { status: 204 };
   }
 
   private async handleDownloadFile(ctx: RouteContext): Promise<RouteResult> {
-    const { fileId } = ctx.params;
+    const file = await this.visibleFile(ctx);
 
-    const file = await this.config.storage.getFile(fileId, ctx.context);
-    if (!file) {
-      throw {
-        statusCode: 404,
-        code: "NOT_FOUND",
-        message: `File not found: ${fileId}`,
-      } as NotFoundError;
-    }
-
-    const content = await this.config.storage.getFileContent(fileId, ctx.context);
+    const content = await this.config.storage.getFileContent(file.id, ctx.context);
     if (!content) {
       throw {
         statusCode: 404,
         code: "NOT_FOUND",
-        message: `File content not found: ${fileId}`,
+        message: `File content not found: ${file.id}`,
       } as NotFoundError;
     }
+
+    // A file name or type that came from outside is never echoed into a header as it is
+    const declared = file.mimeType.split(";")[0]!.trim().toLowerCase();
+    const mimeType = isWellFormedMime(declared) ? declared : "application/octet-stream";
+    const asked = Array.isArray(ctx.query.disposition) ? ctx.query.disposition[0] : ctx.query.disposition;
+    const requested: FileDisposition = asked === "inline" ? "inline" : "attachment";
 
     return {
       status: 200,
       headers: {
-        "Content-Type": file.mimeType,
-        "Content-Disposition": `attachment; filename="${file.name}"`,
+        "Content-Type": mimeType,
+        "Content-Disposition": contentDispositionHeader(fileDisposition(mimeType, requested), file.name),
         "Content-Length": content.length.toString(),
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "private, no-store",
       },
       raw: content,
     };
@@ -3392,24 +3974,60 @@ export class AgentServer {
     // Resolve userId
     const userId = await this.effectiveUserId(ctx);
 
-    // Process file uploads if provided
+    // Files that come with the task are checked against the agent's settings first; they are kept in the
+    // conversation the task will run in (so they belong to it: owned, counted, deleted with it)
+    const incoming: IncomingFile[] = [];
+    const cfg = this.filesConfigFor(await this.getAgentFor(body.agentId, ctx.context));
+    if (body.files !== undefined && !Array.isArray(body.files)) {
+      throw { statusCode: 400, code: "VALIDATION_ERROR", message: "files must be an array" } as ValidationError;
+    }
+    for (const f of body.files ?? []) {
+      if (!f || typeof f.name !== "string" || !f.name || typeof f.content !== "string" || typeof f.mimeType !== "string") {
+        throw {
+          statusCode: 400,
+          code: "VALIDATION_ERROR",
+          message: "files[].name, files[].content (base64) and files[].mimeType are required",
+        } as ValidationError;
+      }
+      if (Math.floor((f.content.length * 3) / 4) > cfg.maxFileSize + 3) throw this.fileTooLarge(cfg.maxFileSize);
+      const file: IncomingFile = {
+        name: f.name,
+        mimeType: resolveUploadMimeType(f.mimeType, f.name),
+        bytes: Buffer.from(f.content, "base64"),
+      };
+      this.checkIncomingFile(cfg, file);
+      incoming.push(file);
+    }
+    if (incoming.length > cfg.maxFiles) {
+      throw {
+        statusCode: 409,
+        code: "too_many_files",
+        message: `A conversation holds at most ${cfg.maxFiles} files.`,
+        details: { maxFiles: cfg.maxFiles },
+      };
+    }
+
+    let taskConversation: Conversation | undefined;
     const files: Task["files"] = [];
-    if (body.files && body.files.length > 0) {
-      for (const f of body.files) {
-        const content = Buffer.from(f.content, "base64");
-        const fileRecord = await this.config.storage.saveFile({
-          name: f.name,
-          mimeType: f.mimeType,
-          content,
-          metadata: { uploadedForTask: true },
-        }, ctx.context);
-        files.push({
-          id: fileRecord.id,
-          name: fileRecord.name,
-          mimeType: fileRecord.mimeType,
-          size: fileRecord.size,
-          storageKey: fileRecord.storageKey,
-        });
+    if (incoming.length > 0) {
+      taskConversation = await this.config.storage.createConversation(
+        { agentId: body.agentId, userId, metadata: { source: "task" } },
+        ctx.context
+      );
+      try {
+        for (const file of incoming) {
+          const record = await this.saveIncomingFile(ctx, {
+            file,
+            cfg,
+            conversation: taskConversation,
+            metadata: { uploadedForTask: true },
+          });
+          files.push({ ...attachmentOf(record), storageKey: record.storageKey });
+        }
+      } catch (error) {
+        // (the conversation takes the files saved so far with it)
+        await this.config.storage.deleteConversation(taskConversation.id, ctx.context).catch(() => undefined);
+        throw error;
       }
     }
 
@@ -3417,11 +4035,19 @@ export class AgentServer {
     const task = await this.config.storage.createTask({
       agentId: body.agentId,
       userId,
+      conversationId: taskConversation?.id,
       input: body.input,
       files,
       callbackUrl: body.callbackUrl,
       metadata: body.metadata,
     }, ctx.context);
+    if (taskConversation) {
+      await this.config.storage.updateConversation(
+        taskConversation.id,
+        { metadata: { taskId: task.id, source: "task" } },
+        ctx.context
+      );
+    }
 
     // Start background processing
     this.processTaskInBackground(task.id, ctx.context!).catch((error) => {
@@ -3729,7 +4355,7 @@ export class AgentServer {
           conversation: conversation!,
           agent: agentReg,
           body,
-          fileRefs: started ? [] : task.files ?? [],
+          attachments: { refs: started ? [] : (task.files ?? []).map(({ storageKey: _key, ...file }) => file), inline: [], cfg: this.filesConfigFor(agentReg) },
           handlerMetadata,
         })
       );

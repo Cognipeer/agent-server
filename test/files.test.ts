@@ -78,13 +78,17 @@ describe("messages that attach uploaded files by id", () => {
     expect(streamedBad.headers.get("content-type")).not.toBe("text/event-stream");
   });
 
-  it("keeps working without fileIds (inline files are still described, not stored)", async () => {
-    const { post, conversation } = await boot();
+  it("keeps working without fileIds: inline files are stored, so their ids are real", async () => {
+    const { post, url, conversation } = await boot();
     const res = await post(`/conversations/${conversation.id}/messages`, {
       message: "x",
       files: [{ name: "i.txt", content: b64("inline"), mimeType: "text/plain" }],
     });
-    expect(((await res.json()) as any).message.files[0]).toMatchObject({ name: "i.txt", size: 6 });
+    const attached = ((await res.json()) as any).message.files[0];
+    expect(attached).toMatchObject({ name: "i.txt", size: 6 });
+    const download = await fetch(`${url}/files/${attached.id}/content`);
+    expect(download.status).toBe(200);
+    expect(await download.text()).toBe("inline");
   });
 });
 

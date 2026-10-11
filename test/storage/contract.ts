@@ -108,6 +108,7 @@ export function runStorageContract(
         expect(typeof c.atomicUpdate).toBe("boolean");
         expect(typeof c.events).toBe("boolean");
         expect(typeof c.leases).toBe("boolean");
+        expect(c.fileIndex).toBe(true);
       });
 
       it("is connected, and refuses work once disconnected", async () => {
@@ -674,6 +675,142 @@ export function runStorageContract(
         expect((await s().getFileContent(nobody.id))!.toString()).toBe("d");
       });
 
+      it("keeps who uploaded a file, for which agent, and when it expires - and nothing for a file saved without them", async () => {
+        const conv = await newConversation();
+        const expiresAt = new Date(Date.now() + 86_400_000);
+        const owned = await s().saveFile({
+          name: "owned.txt",
+          mimeType: "text/plain",
+          content: Buffer.from("o"),
+          conversationId: conv.id,
+          userId: "user-1",
+          agentId: conv.agentId,
+          expiresAt,
+        });
+        expect(owned).toMatchObject({ userId: "user-1", agentId: conv.agentId });
+        expect(owned.expiresAt!.getTime()).toBe(expiresAt.getTime());
+        const read = await s().getFile(owned.id);
+        expect(read).toMatchObject({ userId: "user-1", agentId: conv.agentId });
+        expect(read!.expiresAt).toBeInstanceOf(Date);
+        expect(read!.expiresAt!.getTime()).toBe(expiresAt.getTime());
+
+        const plain = await s().saveFile({ name: "plain.txt", mimeType: "text/plain", content: Buffer.from("p") });
+        for (const record of [plain, (await s().getFile(plain.id))!]) {
+          expect(record.userId).toBeUndefined();
+          expect(record.agentId).toBeUndefined();
+          expect(record.expiresAt).toBeUndefined();
+        }
+      });
+
+      it("refuses an expiry that is not a date, and an over-long owner where the store has a limit", async () => {
+        await expect(
+          s().saveFile({ name: "x", mimeType: "text/plain", content: Buffer.from("x"), expiresAt: new Date("nope") })
+        ).rejects.toBeInstanceOf(ValidationError);
+        try {
+          const file = await s().saveFile({ name: "x", mimeType: "text/plain", content: Buffer.from("x"), userId: "u".repeat(256) });
+          await s().deleteFile(file.id);
+        } catch (error) {
+          expect((error as ValidationError).statusCode).toBe(400);
+        }
+      });
+
+      it("lists a conversation's files oldest first, in insertion order within a millisecond, and only that conversation's", async () => {
+        await withFrozenDate(T0, async () => {
+          const conv = await newConversation();
+          const other = await newConversation();
+          const ids: string[] = [];
+          for (let i = 0; i < 6; i++) {
+            ids.push((await s().saveFile({ name: `f${i}.txt`, mimeType: "text/plain", content: Buffer.from(`${i}`), conversationId: conv.id })).id);
+          }
+          await s().saveFile({ name: "elsewhere.txt", mimeType: "text/plain", content: Buffer.from("e"), conversationId: other.id });
+          await s().saveFile({ name: "loose.txt", mimeType: "text/plain", content: Buffer.from("l") });
+
+          const all = await s().listFiles!({ conversationId: conv.id });
+          expect(all.data.map((f) => f.id)).toEqual(ids);
+          expect(all).toMatchObject({ total: 6, offset: 0, hasMore: false });
+          expect((await s().listFiles!({ conversationId: conv.id, order: "desc" })).data.map((f) => f.id)).toEqual([...ids].reverse());
+
+          const page = await s().listFiles!({ conversationId: conv.id, limit: 2, offset: 2 });
+          expect(page.data.map((f) => f.id)).toEqual(ids.slice(2, 4));
+          expect(page).toMatchObject({ total: 6, limit: 2, offset: 2, hasMore: true });
+          expect((await s().listFiles!({ conversationId: other.id })).total).toBe(1);
+        });
+      });
+
+      it("lists nothing for a conversation without files or that does not exist, and forgets deleted files", async () => {
+        const conv = await newConversation();
+        expect(await s().listFiles!({ conversationId: conv.id })).toMatchObject({ data: [], total: 0, hasMore: false });
+        expect(await s().listFiles!({ conversationId: "conv_nope" })).toMatchObject({ data: [], total: 0 });
+        const a = await s().saveFile({ name: "a", mimeType: "text/plain", content: Buffer.from("a"), conversationId: conv.id });
+        const b = await s().saveFile({ name: "b", mimeType: "text/plain", content: Buffer.from("b"), conversationId: conv.id });
+        await s().deleteFile(a.id);
+        expect((await s().listFiles!({ conversationId: conv.id })).data.map((f) => f.id)).toEqual([b.id]);
+        await s().deleteConversation(conv.id);
+        expect((await s().listFiles!({ conversationId: conv.id })).total).toBe(0);
+      });
+
+      it("refuses to list without a conversation", async () => {
+        await expect(s().listFiles!({ conversationId: "" })).rejects.toBeInstanceOf(ValidationError);
+      });
+
+      it("keeps the owner and expiry of listed files", async () => {
+        const conv = await newConversation();
+        const expiresAt = new Date(Date.now() + 5_000_000);
+        await s().saveFile({ name: "a", mimeType: "text/plain", content: Buffer.from("a"), conversationId: conv.id, userId: "u-9", expiresAt });
+        const [listed] = (await s().listFiles!({ conversationId: conv.id })).data;
+        expect(listed).toMatchObject({ userId: "u-9" });
+        expect(listed!.expiresAt!.getTime()).toBe(expiresAt.getTime());
+      });
+
+      it("purges the files that expired - record and content - and leaves the rest", async () => {
+        const conv = await newConversation();
+        const before = await handle.blobCount();
+        const now = Date.now();
+        const old = await s().saveFile({ name: "old", mimeType: "text/plain", content: Buffer.from("o"), conversationId: conv.id, expiresAt: new Date(now - 60_000) });
+        const older = await s().saveFile({ name: "older", mimeType: "text/plain", content: Buffer.from("oo"), expiresAt: new Date(now - 120_000) });
+        const fresh = await s().saveFile({ name: "fresh", mimeType: "text/plain", content: Buffer.from("f"), expiresAt: new Date(now + 3_600_000) });
+        const forever = await s().saveFile({ name: "forever", mimeType: "text/plain", content: Buffer.from("x"), conversationId: conv.id });
+        expect(await handle.blobCount()).toBe(before + 4);
+
+        const purged = await s().purgeExpiredFiles!({ before: new Date(now) });
+        expect(purged).toBeGreaterThanOrEqual(2);
+        expect(await s().getFile(old.id)).toBeNull();
+        expect(await s().getFile(older.id)).toBeNull();
+        expect(await s().getFileContent(old.id)).toBeNull();
+        expect(await s().getFile(fresh.id)).not.toBeNull();
+        expect(await s().getFile(forever.id)).not.toBeNull();
+        expect((await s().listFiles!({ conversationId: conv.id })).data.map((f) => f.id)).toEqual([forever.id]);
+        expect(await handle.blobCount()).toBe(before + 2);
+        // nothing is due any more
+        expect(await s().purgeExpiredFiles!({ before: new Date(now) })).toBe(0);
+      });
+
+      it("purges at most `limit` files per call, the earliest expiry first", async () => {
+        const now = Date.now();
+        const mine: string[] = [];
+        for (let i = 0; i < 4; i++) {
+          mine.push((await s().saveFile({
+            name: `p${i}`,
+            mimeType: "text/plain",
+            content: Buffer.from("p"),
+            expiresAt: new Date(now - (4 - i) * 1_000_000_000),
+          })).id);
+        }
+        // Everything the suite left that has expired goes too, but only the oldest `limit` per call
+        const first = await s().purgeExpiredFiles!({ before: new Date(now), limit: 1 });
+        expect(first).toBe(1);
+        let left = 0;
+        for (const id of mine) if (await s().getFile(id)) left++;
+        expect(left).toBeLessThanOrEqual(4);
+        let guard = 0;
+        while ((await s().purgeExpiredFiles!({ before: new Date(now), limit: 2 })) > 0 && guard++ < 20);
+        for (const id of mine) expect(await s().getFile(id)).toBeNull();
+      });
+
+      it("refuses to purge without a valid cut-off", async () => {
+        await expect(s().purgeExpiredFiles!({ before: new Date("nope") })).rejects.toBeInstanceOf(ValidationError);
+      });
+
       it("refuses a file over its capability with a 413 and stores nothing", async () => {
         const limit = caps().maxFileBytes;
         if (limit > 64 * MiB) return; // too large to allocate here; the in-memory provider covers the path
@@ -1203,7 +1340,16 @@ export function runStorageContract(
         const conv = await newConversation({ userId: "u-restart", title: "kept", state: { a: awkwardJson() } });
         const message = await s().createMessage({ conversationId: conv.id, role: "user", content: AWKWARD_TEXTS.nul });
         const content = randomBytes(300_000);
-        const file = await s().saveFile({ name: "r.bin", mimeType: "application/octet-stream", content, conversationId: conv.id });
+        const expiresAt = new Date(Date.now() + 7 * 86_400_000);
+        const file = await s().saveFile({
+          name: "r.bin",
+          mimeType: "application/octet-stream",
+          content,
+          conversationId: conv.id,
+          userId: "u-restart",
+          agentId: conv.agentId,
+          expiresAt,
+        });
         const task = await s().createTask({ agentId: conv.agentId, input: "again" });
         const comment = { id: "c1", taskId: task.id, role: "user" as const, content: "hi", createdAt: new Date(T0) };
         await s().updateTask(task.id, { comments: [comment] });
@@ -1216,6 +1362,10 @@ export function runStorageContract(
         expect(read!.state).toEqual(jsonRoundTrip({ a: awkwardJson() }));
         expect((await reopened.getMessage(message.id))!.content).toBe(AWKWARD_TEXTS.nul);
         expect((await reopened.getFileContent(file.id))!.equals(content)).toBe(true);
+        const reread = await reopened.getFile(file.id);
+        expect(reread).toMatchObject({ userId: "u-restart", agentId: conv.agentId });
+        expect(reread!.expiresAt!.getTime()).toBe(expiresAt.getTime());
+        expect((await reopened.listFiles!({ conversationId: conv.id })).data.map((f) => f.id)).toEqual([file.id]);
         expect((await reopened.getTask(task.id))!.comments).toEqual([comment]);
         expect((await reopened.getTaskResult(task.id))!.content).toBe("result");
       });

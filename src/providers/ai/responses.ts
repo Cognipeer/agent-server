@@ -125,12 +125,15 @@ function buildHeaders(config: ResponsesApiConfig): Record<string, string> {
   };
 }
 
+/** A message sent to the Responses API: text, or parts (`input_text`, `input_image`) for a message that carries pictures. */
+export type ResponsesApiMessage = { role: string; content: string | unknown[] };
+
 function buildInput(
-  messages: Array<{ role: string; content: string }>
+  messages: ResponsesApiMessage[]
 ): ResponsesApiInputMessage[] {
   return messages.map((m) => ({
     role: m.role === "assistant" ? "assistant" : m.role === "system" ? "developer" : "user",
-    content: m.content,
+    content: m.content as ResponsesApiInputMessage["content"],
   }));
 }
 
@@ -156,7 +159,7 @@ function extractContent(output: ResponsesApiResponse["output"]): string {
  */
 export async function invokeResponsesApi(
   config: ResponsesApiConfig,
-  messages: Array<{ role: string; content: string }>,
+  messages: ResponsesApiMessage[],
   previousResponseId?: string,
   options: { signal?: AbortSignal } = {}
 ): Promise<ResponsesApiResult> {
@@ -219,7 +222,7 @@ export async function invokeResponsesApi(
  */
 export async function* streamResponsesApi(
   config: ResponsesApiConfig,
-  messages: Array<{ role: string; content: string }>,
+  messages: ResponsesApiMessage[],
   previousResponseId?: string,
   options: { signal?: AbortSignal } = {}
 ): AsyncGenerator<ResponsesApiStreamEvent, void, unknown> {

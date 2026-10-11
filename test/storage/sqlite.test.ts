@@ -66,7 +66,7 @@ describeProvider("sqlite", (harness) => {
 
         const check = new Database(file, { readonly: true });
         expect((check.prepare("SELECT COUNT(*) AS n FROM agent_server_task_results").get() as any).n).toBe(1);
-        expect((check.prepare("SELECT value FROM agent_server_meta WHERE key = 'schema_version'").get() as any).value).toBe("3");
+        expect((check.prepare("SELECT value FROM agent_server_meta WHERE key = 'schema_version'").get() as any).value).toBe("4");
         const tables = (check.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as any[]).map((r) => r.name);
         expect(tables).toEqual(expect.arrayContaining(["agent_server_events", "agent_server_event_streams", "agent_server_leases"]));
         const taskColumns = (check.prepare("PRAGMA table_info(agent_server_tasks)").all() as any[]).map((r) => r.name);
@@ -119,7 +119,50 @@ describeProvider("sqlite", (harness) => {
         await upgraded.disconnect();
 
         const check = new Database(file, { readonly: true });
-        expect((check.prepare("SELECT value FROM agent_server_meta WHERE key = 'schema_version'").get() as any).value).toBe("3");
+        expect((check.prepare("SELECT value FROM agent_server_meta WHERE key = 'schema_version'").get() as any).value).toBe("4");
+        check.close();
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("upgrading a database from the previous schema (version 3)", () => {
+    it("gives files an owner, an agent and an expiry, and keeps what was there", async () => {
+      const { default: Database } = await import("better-sqlite3");
+      const dir = await mkdtemp(path.join(tmpdir(), "agent-server-sqlite-v3-"));
+      const file = path.join(dir, "v3.db");
+      try {
+        const first = createSQLiteProvider({ filename: file });
+        await first.connect();
+        const conv = await first.createConversation({ agentId: "a" });
+        const old = await first.saveFile({ name: "old.txt", mimeType: "text/plain", content: Buffer.from("old"), conversationId: conv.id });
+        await first.disconnect();
+
+        const raw = new Database(file);
+        raw.exec(`
+          DROP INDEX idx_agent_server_files_conv_t; DROP INDEX idx_agent_server_files_expires;
+          ALTER TABLE agent_server_files DROP COLUMN user_id; ALTER TABLE agent_server_files DROP COLUMN agent_id; ALTER TABLE agent_server_files DROP COLUMN expires_at;
+          UPDATE agent_server_meta SET value = '3' WHERE key = 'schema_version';
+        `);
+        raw.close();
+
+        const upgraded = createSQLiteProvider({ filename: file });
+        await upgraded.connect();
+        expect(await upgraded.getFile(old.id)).toMatchObject({ name: "old.txt", userId: undefined, expiresAt: undefined });
+        const fresh = await upgraded.saveFile({
+          name: "new.txt", mimeType: "text/plain", content: Buffer.from("new"), conversationId: conv.id, userId: "u1", agentId: "a", expiresAt: new Date(Date.now() - 1000),
+        });
+        expect((await upgraded.listFiles!({ conversationId: conv.id })).data.map((f) => f.id)).toEqual([old.id, fresh.id]);
+        expect(await upgraded.purgeExpiredFiles!({ before: new Date() })).toBe(1);
+        await upgraded.disconnect();
+
+        const check = new Database(file, { readonly: true });
+        expect((check.prepare("SELECT value FROM agent_server_meta WHERE key = 'schema_version'").get() as any).value).toBe("4");
+        const columns = (check.prepare("PRAGMA table_info(agent_server_files)").all() as any[]).map((r) => r.name);
+        expect(columns).toEqual(expect.arrayContaining(["user_id", "agent_id", "expires_at"]));
+        const indexes = (check.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as any[]).map((r) => r.name);
+        expect(indexes).toEqual(expect.arrayContaining(["idx_agent_server_files_conv_t", "idx_agent_server_files_expires"]));
         check.close();
       } finally {
         await rm(dir, { recursive: true, force: true });

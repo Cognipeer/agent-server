@@ -50,7 +50,7 @@ type PoolClient = {
 };
 
 /** Bumped when `migrate()` gains a step that must run once on existing databases. */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 /** `bytea` holds 1 GB; `jsonb` a little over 255 MiB. */
 const MAX_FILE_BYTES = 1_000_000_000;
@@ -205,6 +205,7 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       maxStateBytes: MAX_STATE_BYTES,
       events: true,
       leases: true,
+      fileIndex: true,
     };
   }
 
@@ -433,7 +434,8 @@ export class PostgresStorageProvider extends BaseStorageProvider {
     // Schema version 2 (also what a fresh database gets after the tables above):
     // task comments, an insertion sequence for ordering, one result per task, and the
     // indexes of the time-ordered lists. Version 3: the event log, leases, and the
-    // conversation a task runs in. Every step is additive and repeatable.
+    // conversation a task runs in. Version 4: who uploaded a file, for which agent and when it
+    // expires. Every step is additive and repeatable.
     await db.query("BEGIN");
     try {
       const t = this.tables;
@@ -472,6 +474,22 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       `);
       await db.query(`CREATE INDEX IF NOT EXISTS "idx_${this.tablePrefix}leases_expires" ON ${t.leases} (expires_at)`);
 
+      // Version 4
+      await db.query(`ALTER TABLE ${t.files} ADD COLUMN IF NOT EXISTS user_id VARCHAR(255)`);
+      await db.query(`ALTER TABLE ${t.files} ADD COLUMN IF NOT EXISTS agent_id VARCHAR(255)`);
+      await db.query(`ALTER TABLE ${t.files} ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`);
+      // Rows saved in the same millisecond keep their insertion order, like conversations and messages
+      await db.query(`ALTER TABLE ${t.files} ADD COLUMN IF NOT EXISTS seq BIGINT GENERATED ALWAYS AS IDENTITY`);
+      await db.query(
+        `CREATE INDEX IF NOT EXISTS "idx_${this.tablePrefix}files_conv_t" ON ${t.files} (conversation_id, created_at, seq)`
+      );
+      // (the single-column index of version 2 is a prefix of it)
+      await db.query(`DROP INDEX IF EXISTS "${this.schema}"."idx_${this.tablePrefix}files_conv"`);
+      // The retention sweep only looks at files that expire
+      await db.query(
+        `CREATE INDEX IF NOT EXISTS "idx_${this.tablePrefix}files_expires" ON ${t.files} (expires_at) WHERE expires_at IS NOT NULL`
+      );
+
       await db.query(
         `INSERT INTO ${t.meta} (key, value) VALUES ('schema_version', $1)
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
@@ -506,7 +524,6 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       ["conv_created", t.conversations, "created_at, seq"],
       ["conv_updated", t.conversations, "updated_at, seq"],
       ["msg_conv_t", t.messages, "conversation_id, created_at, seq"],
-      ["files_conv", t.files, "conversation_id"],
       ["files_msg", t.files, "message_id"],
       ["tasks_agent_t", t.tasks, "agent_id, created_at, seq"],
       ["tasks_user_t", t.tasks, "user_id, created_at, seq"],
@@ -805,8 +822,8 @@ export class PostgresStorageProvider extends BaseStorageProvider {
            INSERT INTO ${this.tables.fileContents} (storage_key, content) VALUES ($1, $2)
          )
          INSERT INTO ${this.tables.files}
-           (id, name, mime_type, size, storage_key, conversation_id, message_id, metadata, created_at)
-         VALUES ($3, $4, $5, $6, $1, $7, $8, $9, $10)
+           (id, name, mime_type, size, storage_key, conversation_id, message_id, user_id, agent_id, expires_at, metadata, created_at)
+         VALUES ($3, $4, $5, $6, $1, $7, $8, $9, $10, $11, $12, $13)
          RETURNING *`,
         [
           params.storageKey,
@@ -817,6 +834,9 @@ export class PostgresStorageProvider extends BaseStorageProvider {
           params.size,
           params.conversationId || null,
           params.messageId || null,
+          fits("userId", params.userId || null, LIMITS.userId),
+          fits("agentId", params.agentId || null, LIMITS.agentId),
+          params.expiresAt ?? null,
           toJsonb(params.metadata || {}),
           new Date(),
         ]
@@ -870,6 +890,50 @@ export class PostgresStorageProvider extends BaseStorageProvider {
        DELETE FROM ${this.tables.fileContents} WHERE storage_key IN (SELECT storage_key FROM gone)`,
       [id]
     );
+  }
+
+  protected async _listFiles(params: {
+    conversationId: string;
+    limit: number;
+    offset: number;
+    order: "asc" | "desc";
+  }): Promise<PaginatedResult<FileRecord>> {
+    if (!this.pool) throw new Error("Pool not initialized");
+    const order = params.order === "desc" ? "DESC" : "ASC";
+
+    const count = await this.pool.query<{ count: string }>(
+      `SELECT COUNT(*) AS count FROM ${this.tables.files} WHERE conversation_id = $1`,
+      [params.conversationId]
+    );
+    const total = parseInt(count.rows[0].count, 10);
+    // The insertion sequence breaks ties between files saved in one millisecond
+    const result = await this.pool.query<DbFile>(
+      `SELECT * FROM ${this.tables.files} WHERE conversation_id = $1
+       ORDER BY created_at ${order}, seq ${order} LIMIT $2 OFFSET $3`,
+      [params.conversationId, params.limit, params.offset]
+    );
+    return pageResult(result.rows.map((row) => this.mapFile(row)), total, params.limit, params.offset);
+  }
+
+  protected async _purgeExpiredFiles(params: { before: Date; limit: number }): Promise<number> {
+    if (!this.pool) throw new Error("Pool not initialized");
+
+    // Records and contents together; `SKIP LOCKED` keeps two nodes purging at once off each other's rows
+    const result = await this.pool.query(
+      `WITH due AS (
+         SELECT id FROM ${this.tables.files}
+         WHERE expires_at IS NOT NULL AND expires_at <= $1
+         ORDER BY expires_at, seq LIMIT $2
+         FOR UPDATE SKIP LOCKED
+       ), gone AS (
+         DELETE FROM ${this.tables.files} WHERE id IN (SELECT id FROM due) RETURNING storage_key
+       ), blobs AS (
+         DELETE FROM ${this.tables.fileContents} WHERE storage_key IN (SELECT storage_key FROM gone)
+       )
+       SELECT COUNT(*) AS count FROM gone`,
+      [params.before, params.limit]
+    );
+    return parseInt((result.rows[0] as { count: string }).count, 10);
   }
 
   // ============================================================================
@@ -1350,6 +1414,9 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       storageKey: row.storage_key,
       conversationId: row.conversation_id || undefined,
       messageId: row.message_id || undefined,
+      userId: row.user_id || undefined,
+      agentId: row.agent_id || undefined,
+      expiresAt: row.expires_at ? new Date(row.expires_at) : undefined,
       metadata: row.metadata,
       createdAt: new Date(row.created_at),
     };
@@ -1432,6 +1499,9 @@ interface DbFile {
   storage_key: string;
   conversation_id: string | null;
   message_id: string | null;
+  user_id: string | null;
+  agent_id: string | null;
+  expires_at: string | null;
   metadata: Record<string, unknown>;
   created_at: string;
 }

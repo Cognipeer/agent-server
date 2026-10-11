@@ -89,6 +89,7 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
       maxFileBytes: Math.min(this.config.maxFileStorage || DEFAULT_MAX_FILE_STORAGE, MAX_BUFFER_BYTES),
       events: true,
       leases: true,
+      fileIndex: true,
     };
   }
 
@@ -388,11 +389,15 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
       storageKey: params.storageKey,
       conversationId: params.conversationId,
       messageId: params.messageId,
+      userId: params.userId,
+      agentId: params.agentId,
+      expiresAt: params.expiresAt,
       metadata: params.metadata || {},
       createdAt: now,
     };
 
     this.files.set(id, file);
+    this.seq(id);
     if (params.conversationId) {
       const set = this.conversationFiles.get(params.conversationId) ?? new Set<string>();
       set.add(id);
@@ -427,6 +432,34 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
     }
     if (file.conversationId) this.conversationFiles.get(file.conversationId)?.delete(id);
     this.files.delete(id);
+    this.seqs.delete(id);
+  }
+
+  protected async _listFiles(params: {
+    conversationId: string;
+    limit: number;
+    offset: number;
+    order: "asc" | "desc";
+  }): Promise<PaginatedResult<FileRecord>> {
+    const rows = [...(this.conversationFiles.get(params.conversationId) ?? [])]
+      .map((id) => this.files.get(id))
+      .filter((file): file is FileRecord => !!file);
+    // Oldest first, insertion order breaking ties between files saved in the same millisecond
+    this.sortByTime(rows, (f) => f.createdAt.getTime(), params.order === "desc" ? -1 : 1);
+    const data = rows.slice(params.offset, params.offset + params.limit).map(copy);
+    return pageResult(data, rows.length, params.limit, params.offset);
+  }
+
+  protected async _purgeExpiredFiles(params: { before: Date; limit: number }): Promise<number> {
+    const due = [...this.files.values()]
+      .filter((file) => file.expiresAt && file.expiresAt.getTime() <= params.before.getTime())
+      .sort(
+        (a, b) =>
+          a.expiresAt!.getTime() - b.expiresAt!.getTime() || (this.seqs.get(a.id) ?? 0) - (this.seqs.get(b.id) ?? 0)
+      )
+      .slice(0, params.limit);
+    for (const file of due) this.removeFile(file.id);
+    return due.length;
   }
 
   // ============================================================================

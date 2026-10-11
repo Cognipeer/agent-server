@@ -17,10 +17,14 @@ interface AgentHandler {
 
 interface ProcessMessageParams {
   conversationId: string;
-  message: string;
-  files?: FileAttachment[];
+  message: string;                       // what the person typed
+  files?: FileAttachment[];              // the files the message carries (real ids)
   state?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+  context?: RequestContext;
+  signal?: AbortSignal;                  // aborted when the run is cancelled
+  getFileContent?: (fileId: string) => Promise<Buffer | null>;   // see "With File Processing"
+  getFileText?: (fileId: string) => Promise<string | null>;
 }
 
 interface ProcessMessageResult {
@@ -139,35 +143,42 @@ agentServer.registerCustomAgent('claude-assistant', {
 
 ## With File Processing
 
+A message's files are in `files` (every entry has a real id, also for files sent inline), and two readers are scoped to the
+conversation: `getFileContent(id)` gives the bytes, `getFileText(id)` the text the way an agent-sdk agent would be given it
+(see [Files](./file-management.md)). Both answer `null` for an id that is not a file of this conversation or that expired.
+
 ```typescript
 agentServer.registerCustomAgent('document-analyzer', {
-  processMessage: async ({ message, files }) => {
+  processMessage: async ({ message, files, getFileContent, getFileText }) => {
     if (!files || files.length === 0) {
       return { content: 'Please upload a document to analyze.' };
     }
-    
+
     const results = [];
-    
+
     for (const file of files) {
-      // Get file content from storage
-      const content = await storage.getFileContent(file.id);
-      
-      if (file.mimeType === 'application/pdf') {
-        const text = await extractPDFText(content);
-        results.push(`PDF "${file.name}": ${text.slice(0, 500)}...`);
-      } else if (file.mimeType.startsWith('image/')) {
+      if (file.mimeType.startsWith('image/')) {
         // Use vision API
-        const description = await analyzeImage(content);
+        const bytes = await getFileContent!(file.id);
+        const description = await analyzeImage(bytes!);
         results.push(`Image "${file.name}": ${description}`);
+      } else {
+        // PDF, Word, text ... converted when @cognipeer/to-markdown is installed (or by files.extractText)
+        const text = await getFileText!(file.id);
+        results.push(`"${file.name}": ${text ? text.slice(0, 500) + '...' : '(no text)'}`);
       }
     }
-    
+
     return {
       content: `Analysis complete:\n\n${results.join('\n\n')}`,
     };
   },
+}, { name: 'Document analyzer' }, {
+  files: { allowedMimeTypes: ['application/pdf', 'image/*', 'text/*'], maxFileSize: 25 * 1024 * 1024 },
 });
 ```
+
+`message` is what the person typed; the server does not put the files' text into it for a custom handler.
 
 ## With State Management
 

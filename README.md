@@ -13,7 +13,7 @@ Documentation: <https://docs.cognipeer.com/agent-server/guide/getting-started>
 - 📚 **Swagger UI**: Automatic OpenAPI documentation
 - 🌐 **Framework Agnostic**: Works with Express, Next.js, Fastify, and raw Node HTTP
 - 🧩 **Request Context & Dynamic Agents**: Resolve user/tenant per request, serve a different agent list and storage scope per request
-- 📁 **File Management**: File uploads and viewing files sent by AI
+- 📁 **Files the agent reads**: upload a file as itself or as JSON; it is owned by the uploader, limited per agent, deleted after `retentionDays` or with its conversation, and its text (PDF and Office with `@cognipeer/to-markdown`) or picture reaches the agent - inline, in pages with `session_files_read`, or as an image by reference
 - ⏯️ **Runs that outlive the connection**: a turn keeps running when the client disconnects; cancel it, follow it from another client (event log + SSE), one turn at a time per conversation across server instances
 
 ## Installation
@@ -149,7 +149,8 @@ export const { GET, POST, PATCH, DELETE, OPTIONS } =
 | POST   | /conversations/:id/cancel   | Cancel the running turn (or the open approvals) |
 | GET    | /conversations/:id/events   | The conversation's event log  |
 | GET    | /conversations/:id/events/stream | Replay and follow the event log (SSE) |
-| POST   | /files                      | Upload file                       |
+| GET    | /conversations/:id/files    | The files the conversation holds  |
+| POST   | /files                      | Upload a file (its bytes, or JSON) |
 | GET    | /files/:fileId              | File metadata                     |
 | GET    | /files/:fileId/content      | Download file                     |
 | DELETE | /files/:fileId              | Delete file                       |

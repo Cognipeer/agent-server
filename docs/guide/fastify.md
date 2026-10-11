@@ -21,9 +21,13 @@ Behaviour:
 - Routes are resolved **relative to the prefix**; the server's own `basePath` is not used.
 - Fastify has already parsed the JSON body when our route runs - the parsed body is
   used (the request stream is not read again).
+- A file uploaded as itself (`POST /files?name=...` with the file's own `Content-Type`) reaches the route as a `Buffer`: the plugin registers
+  buffer parsers for `text/plain` and for every type Fastify has no parser for, **in its own scope** - your app's other routes keep Fastify's
+  parsers (and a parser you registered for the same type in the mounted scope is left alone).
 - The reply is hijacked and written on the raw response (needed for SSE). Headers set
   by earlier hooks/plugins (request ids, CORS) are copied over.
-- Raise `bodyLimit` (Fastify default 1 MiB) if clients upload base64 files. A body over the
+- Raise `bodyLimit` (Fastify default 1 MiB) if clients upload base64 files, or use `uploadBodyLimit`, the body limit of `POST /files` alone
+  (a base64 file is a third bigger than the file; a raw one is its size). A body over the
   limit is answered in our envelope (`413`, `{ error: { code: "PAYLOAD_TOO_LARGE", message } }`),
   not Fastify's own error shape; every other Fastify error still goes to your error handler.
 - `fastify` is an optional peer dependency (>= 4).
@@ -47,11 +51,11 @@ http.createServer(async (req, res) => {
 | Option | Default | |
 | --- | --- | --- |
 | `basePath` | `server.getBasePath()` | prefix to strip; `""` if a router already stripped it |
-| `maxBodyBytes` | `limits.maxBodySize`, else ~1.4 x `limits.maxFileSize` | larger bodies answer 413 |
+| `maxBodyBytes` | `limits.maxBodySize`, else ~1.4 x the largest file an agent accepts (`server.maxUploadBytes()`) | larger bodies answer 413 |
 
 The returned function takes optional per-call overrides `{ path, body, mountParams, raw, error }`
 for hosts that did part of the work (this is how the Fastify adapter is built). `error` answers
 with that `{ statusCode, code, message }` instead of routing, with the usual CORS headers.
 
-It handles token auth, `resolveContext`, JSON parsing (400 on invalid JSON), CORS
+It handles token auth, `resolveContext`, JSON parsing (400 on invalid JSON) - and the bytes of a file uploaded as itself (`POST /files` with a non-JSON `Content-Type`) - CORS
 (`config.cors`), SSE with backpressure, and stops consuming the stream when the client disconnects.

@@ -69,9 +69,35 @@ function generateSchemas(): Record<string, unknown> {
         name: { type: "string", description: "Agent name" },
         description: { type: "string", description: "Agent description" },
         version: { type: "string", description: "Agent version" },
-        metadata: { type: "object", additionalProperties: true },
+        metadata: {
+          type: "object",
+          additionalProperties: true,
+          description:
+            "Host data. Also carries enableFileUpload, maxFileSize, maxFiles, allowedFileTypes and acceptsImages (the keys the first chat-ui read; capabilities.attachments is the same information).",
+        },
+        capabilities: {
+          type: "object",
+          description: "What the agent can do.",
+          properties: {
+            toolApproval: { type: "boolean", description: "The agent can pause to ask for approval before running a tool." },
+            askUser: { type: "boolean", description: "The agent can pause to ask the user a question." },
+            attachments: { $ref: "#/components/schemas/AttachmentsCapability" },
+          },
+        },
       },
       required: ["id", "name"],
+    },
+    AttachmentsCapability: {
+      type: "object",
+      description:
+        "What a conversation with the agent accepts as attachments, from the server's `files` option and the agent's own. Clients show the paperclip, the limits and the \"this agent cannot read images\" warning from it.",
+      properties: {
+        enabled: { type: "boolean", description: "Files can be attached at all." },
+        maxFiles: { type: "integer", description: "Files one conversation may hold." },
+        maxFileSize: { type: "integer", description: "Largest file, in bytes." },
+        allowedMimeTypes: { type: "array", items: { type: "string" }, description: "Accepted types (image/* style wildcards); empty means any." },
+        acceptsImages: { type: "boolean", description: "The agent's model looks at images; without it an attached image is only mentioned." },
+      },
     },
     Conversation: {
       type: "object",
@@ -227,10 +253,25 @@ function generateSchemas(): Record<string, unknown> {
         storageKey: { type: "string" },
         conversationId: { type: "string" },
         messageId: { type: "string" },
+        userId: { type: "string", description: "Who uploaded it. Only they (in a conversation they may open) can see the file." },
+        agentId: { type: "string", description: "The agent of the conversation the file was uploaded to." },
+        expiresAt: { type: "string", format: "date-time", description: "When the retention sweep deletes it (absent: never)." },
         metadata: { type: "object", additionalProperties: true },
         createdAt: { type: "string", format: "date-time" },
       },
       required: ["id", "name", "mimeType", "size", "storageKey", "createdAt"],
+    },
+    ListFilesResponse: {
+      type: "object",
+      properties: {
+        files: { type: "array", items: { $ref: "#/components/schemas/FileRecord" }, description: "Oldest first." },
+        total: { type: "integer" },
+        limit: { type: "integer" },
+        offset: { type: "integer" },
+        hasMore: { type: "boolean" },
+        maxFiles: { type: "integer", description: "What the conversation may hold (files.maxFiles of its agent)." },
+      },
+      required: ["files", "total", "limit", "offset", "hasMore", "maxFiles"],
     },
     CreateConversationRequest: {
       type: "object",
@@ -248,6 +289,8 @@ function generateSchemas(): Record<string, unknown> {
         message: { type: "string" },
         files: {
           type: "array",
+          description:
+            "Files sent with the message. They are stored (in this conversation, owned by the sender, under the same limits as an upload) before the turn runs and then count like fileIds.",
           items: {
             type: "object",
             properties: {
@@ -257,6 +300,12 @@ function generateSchemas(): Record<string, unknown> {
             },
             required: ["name", "content", "mimeType"],
           },
+        },
+        fileIds: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Files uploaded earlier with POST /files (conversationId set to this conversation) that this message attaches. A file that is not one of this conversation's, or that the caller did not upload, is a 404. The agent is given their contents.",
         },
         metadata: { type: "object", additionalProperties: true },
         stream: {
@@ -299,7 +348,9 @@ function generateSchemas(): Record<string, unknown> {
       type: "object",
       description:
         "Something worth knowing about a turn that completed anyway; also stored on the assistant message as metadata.warnings. " +
-        "Code pause_state_too_large: the turn needed a human but its state did not fit the store (limits.maxStateBytes or the provider's limit), so it was not paused.",
+        "Code pause_state_too_large: the turn needed a human but its state did not fit the store (limits.maxStateBytes or the provider's limit), so it was not paused. " +
+        "Code file_truncated: a document was longer than files.inlineMaxTokens and the agent cannot read files in pages, so only its start was given to it. " +
+        "Code file_unreadable: a file's text could not be read. Code images_not_supported: an image was attached to an agent that does not read images.",
       properties: {
         code: { type: "string", example: "pause_state_too_large" },
         message: { type: "string" },
@@ -1305,16 +1356,48 @@ function generatePaths(
         },
       },
     },
+    "/conversations/{conversationId}/files": {
+      get: {
+        tags: ["Files"],
+        summary: "List the files a conversation holds",
+        description: "Oldest first. The number the conversation may hold is maxFiles (files.maxFiles of its agent).",
+        operationId: "listConversationFiles",
+        parameters: [
+          { name: "conversationId", in: "path", required: true, schema: { type: "string" } },
+          { name: "limit", in: "query", schema: { type: "integer", default: 100 } },
+          { name: "offset", in: "query", schema: { type: "integer", default: 0 } },
+        ],
+        responses: {
+          200: { description: "The files", content: { "application/json": { schema: { $ref: "#/components/schemas/ListFilesResponse" } } } },
+          403: { description: "Not the caller's conversation", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+          404: { description: "Conversation not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+        },
+      },
+    },
     "/files": {
       post: {
         tags: ["Files"],
         summary: "Upload a file",
+        description:
+          "Send either the file as itself - its bytes as the body, its own Content-Type, and ?name=<file name>&conversationId=<id> in the query " +
+          "(optionally &mimeType= to override the header) - or the JSON form with the file as base64. The file belongs to the caller and, with " +
+          "conversationId, to that conversation: it counts against the agent's files.maxFiles, is checked against its maxFileSize and allowedMimeTypes, " +
+          "and is deleted with the conversation or when files.retentionDays have passed.",
         operationId: "uploadFile",
+        parameters: [
+          { name: "name", in: "query", schema: { type: "string" }, description: "The file's name (raw upload)." },
+          { name: "conversationId", in: "query", schema: { type: "string" }, description: "The conversation the file is for (raw upload)." },
+          { name: "mimeType", in: "query", schema: { type: "string" }, description: "Overrides the Content-Type header (raw upload)." },
+        ],
         requestBody: {
           required: true,
           content: {
             "application/json": {
               schema: { $ref: "#/components/schemas/UploadFileRequest" },
+            },
+            "application/octet-stream": {
+              schema: { type: "string", format: "binary" },
+              description: "The file's bytes. Any other Content-Type than JSON works the same (image/png, application/pdf, text/plain, ...).",
             },
           },
         },
@@ -1333,12 +1416,26 @@ function generatePaths(
             },
           },
           400: {
-            description: "Validation error",
+            description: "Validation error: no file, no name, an empty file, or a file over the size limit (details.reason: file_too_large)",
             content: {
               "application/json": {
                 schema: { $ref: "#/components/schemas/Error" },
               },
             },
+          },
+          403: {
+            description: "The agent takes no files (attachments_disabled), or the conversation is not the caller's",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+          404: { description: "Conversation not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+          409: {
+            description: "The conversation already holds files.maxFiles files (too_many_files)",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+          413: { description: "Request body too large", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+          415: {
+            description: "The agent does not accept this type of file (unsupported_file_type)",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
         },
       },
@@ -1406,6 +1503,9 @@ function generatePaths(
       get: {
         tags: ["Files"],
         summary: "Download file content",
+        description:
+          "Served as a download (Content-Disposition: attachment, nosniff, Cache-Control: private). ?disposition=inline shows a picture, PDF or plain text in place; " +
+          "other types (HTML, SVG, ...) are only ever downloads. A file the caller did not upload is a 404.",
         operationId: "downloadFile",
         parameters: [
           {
@@ -1414,6 +1514,7 @@ function generatePaths(
             required: true,
             schema: { type: "string" },
           },
+          { name: "disposition", in: "query", schema: { type: "string", enum: ["inline", "attachment"], default: "attachment" } },
         ],
         responses: {
           200: {

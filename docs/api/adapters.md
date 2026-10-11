@@ -213,6 +213,11 @@ function extractToken(headers: Record<string, string>): string | undefined {
 }
 ```
 
+**File uploads.** `POST /files` takes the file either as JSON (a parsed object body) or as itself: its bytes as the body, its own `Content-Type` and
+`?name=&conversationId=` in the query. For the second form pass the bytes - a `Buffer` - as `body`; `isRawUploadRequest(method, routePath, contentType)`
+(exported) tells which form a request is (`true`: a `POST` to `/files` whose `Content-Type` is not JSON). Limit the body yourself:
+`server.maxUploadBytes()` is the largest file any agent accepts. See [Files](../guide/file-management.md#uploading).
+
 ## Node HTTP Adapter
 
 ```typescript

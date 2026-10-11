@@ -41,7 +41,8 @@ export interface ChatCompletionsConfig {
 
 interface ChatCompletionsMessage {
   role: string;
-  content: string;
+  /** Text, or parts (`text`, `image_url`) for a message that carries pictures. */
+  content: string | unknown[];
   tool_calls?: Array<{
     id: string;
     type: string;

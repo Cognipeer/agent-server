@@ -100,7 +100,7 @@ snake_case types and data, `seq` unique and ascending within the conversation.
 
 | Type | `data` |
 | --- | --- |
-| `user.message` | `content`, `message_id`, `files?` |
+| `user.message` | `content`, `message_id`, `files?` (`id`, `name`, `mime_type`, `size` of each file the message carries) |
 | `session.status_running` | `trigger`: `message` or `resume` |
 | `agent.tool_use` | `tool_call_id`, `name`, `args` |
 | `agent.tool_result` | `tool_call_id`, `name`, `ok`, `duration_ms?`, `error?` |
@@ -183,7 +183,8 @@ A [task](/tasks) left `running` by a process that is gone is failed (`"The serve
 a task nobody has renewed a lease for in `runs.leaseTtlMs`; without leases the server assumes it is the only node and fails what it finds that is older than itself
 (`runs.assumeSingleNode: false` turns that off for a multi-node deployment on a provider without leases).
 
-Events older than `runs.eventRetentionDays` (30) are pruned by the sweep; a conversation's log is deleted with the conversation.
+Events older than `runs.eventRetentionDays` (30) are pruned by the sweep; a conversation's log is deleted with the conversation. The same sweep deletes the
+[files](./file-management.md#retention) past their `files.retentionDays` (at most once per `files.purgeIntervalMs`); with `sweepIntervalMs: 0` call `server.purgeExpiredFiles()` yourself.
 
 ## Configuration
 

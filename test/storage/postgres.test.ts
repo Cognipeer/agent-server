@@ -69,7 +69,7 @@ describeProvider("postgres", (harness) => {
         await provider.disconnect();
 
         expect(await sql(`SELECT COUNT(*)::int AS n FROM "${schema}"."agent_server_task_results"`)).toEqual([{ n: 1 }]);
-        expect((await sql(`SELECT value FROM "${schema}"."agent_server_meta" WHERE key = 'schema_version'`))[0].value).toBe("3");
+        expect((await sql(`SELECT value FROM "${schema}"."agent_server_meta" WHERE key = 'schema_version'`))[0].value).toBe("4");
         const columns = (await sql(
           `SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = $1 AND column_name IN ('seq', 'comments', 'conversation_id')`,
           [schema]
@@ -126,8 +126,49 @@ describeProvider("postgres", (harness) => {
         expect(await upgraded.acquireLease!({ key: "k", owner: "o", ttlMs: 1000 })).toMatchObject({ acquired: true });
         expect((await upgraded.updateTask(task.id, { conversationId: conv.id })).conversationId).toBe(conv.id);
         await upgraded.disconnect();
-        expect((await client.query(`SELECT value FROM "${schema}"."agent_server_meta" WHERE key = 'schema_version'`)).rows[0].value).toBe("3");
+        expect((await client.query(`SELECT value FROM "${schema}"."agent_server_meta" WHERE key = 'schema_version'`)).rows[0].value).toBe("4");
         // the provider that `open()` gave us is closed; the harness closes the schema
+        opened.storage = createPostgresProvider({ connectionString: url, schema });
+        await opened.storage.connect();
+      } finally {
+        await client.end();
+        await opened.close();
+      }
+    });
+
+    it("upgrades the previous schema (version 3): files learn their owner, agent and expiry", async () => {
+      const opened = await harness.open();
+      const { url, schema } = opened.where as { url: string; schema: string };
+      const { default: pg } = await import("pg");
+      const client = new pg.Client({ connectionString: url });
+      await client.connect();
+      try {
+        const conv = await opened.storage.createConversation({ agentId: "a" });
+        const old = await opened.storage.saveFile({ name: "old.txt", mimeType: "text/plain", content: Buffer.from("old"), conversationId: conv.id });
+        await opened.storage.disconnect();
+
+        // take it back to what version 3 had
+        await client.query(`
+          DROP INDEX "${schema}"."idx_agent_server_files_conv_t"; DROP INDEX "${schema}"."idx_agent_server_files_expires";
+          ALTER TABLE "${schema}"."agent_server_files" DROP COLUMN user_id, DROP COLUMN agent_id, DROP COLUMN expires_at, DROP COLUMN seq;
+          CREATE INDEX "idx_agent_server_files_conv" ON "${schema}"."agent_server_files" (conversation_id);
+          UPDATE "${schema}"."agent_server_meta" SET value = '3' WHERE key = 'schema_version';
+        `);
+
+        const upgraded = createPostgresProvider({ connectionString: url, schema });
+        await upgraded.connect();
+        expect((await upgraded.getFile(old.id))).toMatchObject({ name: "old.txt", userId: undefined, expiresAt: undefined });
+        const fresh = await upgraded.saveFile({
+          name: "new.txt", mimeType: "text/plain", content: Buffer.from("new"), conversationId: conv.id, userId: "u1", agentId: "a", expiresAt: new Date(Date.now() - 1000),
+        });
+        expect((await upgraded.listFiles!({ conversationId: conv.id })).data.map((f) => f.id)).toEqual([old.id, fresh.id]);
+        expect(await upgraded.purgeExpiredFiles!({ before: new Date() })).toBe(1);
+        expect(await upgraded.getFile(fresh.id)).toBeNull();
+        await upgraded.disconnect();
+        const indexes = (await client.query(`SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = 'agent_server_files'`, [schema])).rows.map((r) => r.indexname);
+        expect(indexes).toEqual(expect.arrayContaining(["idx_agent_server_files_conv_t", "idx_agent_server_files_expires"]));
+        expect(indexes).not.toContain("idx_agent_server_files_conv");
+        expect((await client.query(`SELECT value FROM "${schema}"."agent_server_meta" WHERE key = 'schema_version'`)).rows[0].value).toBe("4");
         opened.storage = createPostgresProvider({ connectionString: url, schema });
         await opened.storage.connect();
       } finally {

@@ -123,10 +123,11 @@ const DEFAULT_MAX_STATE_BYTES = 12 * 1024 * 1024;
 const HARD_MAX_STATE_BYTES = 15 * 1024 * 1024;
 
 /** Indexes made by older versions that a longer index with the same leading keys now covers. */
-const SUPERSEDED_INDEXES: Record<"conversations" | "messages" | "tasks", string[]> = {
+const SUPERSEDED_INDEXES: Record<"conversations" | "messages" | "tasks" | "files", string[]> = {
   conversations: ["agentId_1", "userId_1", "createdAt_-1"],
   messages: ["conversationId_1", "conversationId_1_createdAt_1"],
   tasks: ["agentId_1", "userId_1", "status_1", "createdAt_-1"],
+  files: ["conversationId_1"],
 };
 
 export class MongoDBStorageProvider extends BaseStorageProvider {
@@ -153,6 +154,7 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       maxStateBytes: this.maxStateBytes,
       events: true,
       leases: true,
+      fileIndex: true,
     };
   }
 
@@ -253,8 +255,10 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
     await messages.createIndex({ conversationId: 1, createdAt: 1, seq: 1 });
 
     const files = this.db.collection(this.collections.files);
-    await files.createIndex({ conversationId: 1 });
+    await files.createIndex({ conversationId: 1, createdAt: 1, seq: 1 });
     await files.createIndex({ messageId: 1 });
+    // The retention sweep only looks at files that expire
+    await files.createIndex({ expiresAt: 1 }, { partialFilterExpression: { expiresAt: { $type: "date" } } });
     await files.createIndex({ storageKey: 1 }, { unique: true });
 
     const tasks = this.db.collection(this.collections.tasks);
@@ -583,8 +587,12 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
         storageKey: params.storageKey,
         conversationId: params.conversationId || null,
         messageId: params.messageId || null,
+        userId: params.userId || null,
+        agentId: params.agentId || null,
+        expiresAt: params.expiresAt ?? null,
         metadata: params.metadata || {},
         createdAt: now,
+        seq: nextSeq(),
       };
       await this.db.collection<MongoFile>(this.collections.files).insertOne(doc);
       return this.mapFile(doc);
@@ -628,6 +636,47 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       await this.removeBlob(file.storageKey);
       await this.db.collection<MongoFile>(this.collections.files).deleteOne({ _id: id });
     }
+  }
+
+  protected async _listFiles(params: {
+    conversationId: string;
+    limit: number;
+    offset: number;
+    order: "asc" | "desc";
+  }): Promise<PaginatedResult<FileRecord>> {
+    if (!this.db) throw new Error("Database not initialized");
+    const collection = this.db.collection<MongoFile>(this.collections.files);
+    const filter = { conversationId: params.conversationId };
+    const order = params.order === "desc" ? -1 : 1;
+
+    const total = await collection.countDocuments(filter);
+    const docs = await collection
+      .find(filter)
+      .sort({ createdAt: order, seq: order })
+      .skip(params.offset)
+      .limit(params.limit)
+      .toArray();
+    return pageResult(docs.map((doc) => this.mapFile(doc)), total, params.limit, params.offset);
+  }
+
+  protected async _purgeExpiredFiles(params: { before: Date; limit: number }): Promise<number> {
+    if (!this.db) throw new Error("Database not initialized");
+    const collection = this.db.collection<MongoFile>(this.collections.files);
+
+    const due = await collection
+      .find({ expiresAt: { $lte: params.before } }, { projection: { storageKey: 1 } })
+      .sort({ expiresAt: 1 })
+      .limit(params.limit)
+      .toArray();
+    let purged = 0;
+    for (const file of due) {
+      // Content first: a failure part-way leaves a record that is purged again by the next sweep.
+      // Another node purging the same file is harmless: deleting what is gone is a no-op.
+      await this.removeBlob(file.storageKey);
+      const { deletedCount } = await collection.deleteOne({ _id: file._id });
+      purged += deletedCount;
+    }
+    return purged;
   }
 
   // ---- file content (GridFS, with a read fallback to the legacy collection) ----
@@ -1098,6 +1147,9 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       storageKey: doc.storageKey,
       conversationId: doc.conversationId || undefined,
       messageId: doc.messageId || undefined,
+      userId: doc.userId || undefined,
+      agentId: doc.agentId || undefined,
+      expiresAt: doc.expiresAt ? new Date(doc.expiresAt) : undefined,
       metadata: doc.metadata,
       createdAt: doc.createdAt,
     };
@@ -1176,8 +1228,13 @@ interface MongoFile {
   storageKey: string;
   conversationId: string | null;
   messageId: string | null;
+  userId?: string | null;
+  agentId?: string | null;
+  expiresAt?: Date | null;
   metadata: Record<string, unknown>;
   createdAt: Date;
+  /** Insertion sequence: breaks ties between files saved in one millisecond. */
+  seq?: number;
 }
 
 interface MongoFileContent {

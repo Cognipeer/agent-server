@@ -7,6 +7,7 @@
 import type { AgentServer } from "../server.js";
 import type { AuthUser } from "../types.js";
 import { normalizeHeaders } from "../context.js";
+import { isRawUploadRequest } from "../files/config.js";
 
 // Next.js types - minimal to avoid requiring next as a dependency
 interface NextRequest {
@@ -16,6 +17,8 @@ interface NextRequest {
     get(name: string): string | null;
   };
   json(): Promise<unknown>;
+  /** Reads the body as bytes (an upload of a raw file). */
+  arrayBuffer?(): Promise<ArrayBuffer>;
   nextUrl: {
     pathname: string;
     searchParams: URLSearchParams;
@@ -85,7 +88,10 @@ export function createNextHandler(
 
       // Parse body for POST/PATCH requests
       let body: unknown;
-      if (request.method === "POST" || request.method === "PATCH") {
+      if (isRawUploadRequest(request.method, path.startsWith(basePath) ? path.slice(basePath.length) || "/" : path, request.headers.get("content-type") ?? undefined) && request.arrayBuffer) {
+        // A file uploaded as itself (`POST /files?name=...` with its own Content-Type)
+        body = Buffer.from(await request.arrayBuffer());
+      } else if (request.method === "POST" || request.method === "PATCH") {
         try {
           body = await request.json();
         } catch {

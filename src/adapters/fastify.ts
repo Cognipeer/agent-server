@@ -41,6 +41,12 @@ interface FastifyScopeLike {
   setErrorHandler?(
     handler: (error: FastifyErrorLike, request: FastifyRequestLike, reply: FastifyReplyLike) => unknown
   ): unknown;
+  addContentTypeParser?(
+    contentType: string,
+    opts: { parseAs: "buffer" },
+    parser: (request: unknown, body: Buffer, done: (error: Error | null, body?: unknown) => void) => void
+  ): unknown;
+  removeContentTypeParser?(contentType: string): unknown;
 }
 
 export type AgentServerFastifyPlugin = (scope: FastifyScopeLike, opts?: unknown) => Promise<void>;
@@ -52,9 +58,9 @@ export interface FastifyAdapterOptions extends Omit<NodeHandlerOptions, "basePat
    */
   bodyLimit?: number;
   /**
-   * Body limit of `POST /files` ALONE. A file travels base64 in JSON, so this is
-   * about a third above the biggest file you accept; every other route keeps
-   * `bodyLimit`. Leave unset to serve uploads under `bodyLimit` like any route.
+   * Body limit of `POST /files` ALONE. A file travels base64 in JSON (about a third above its
+   * size) or, uploaded as itself, as its raw bytes; set it above the biggest file you accept.
+   * Every other route keeps `bodyLimit`. Leave unset to serve uploads under `bodyLimit` like any route.
    */
   uploadBodyLimit?: number;
 }
@@ -121,6 +127,24 @@ export function createFastifyPlugin(
         message: limit ? `Request body exceeds ${limit} bytes` : "Request body is too large",
       });
     });
+    // A file can be uploaded as itself (`POST /files?name=...` with its own Content-Type): hand the bytes over
+    // as a Buffer. JSON keeps Fastify's own parser; this only covers the types Fastify has no parser for
+    // (it would answer those with a 415) and text/plain (which it would decode as a string, lossily).
+    // The parsers are scoped to this plugin: they never reach the rest of the app.
+    if (scope.addContentTypeParser) {
+      try {
+        scope.removeContentTypeParser?.("text/plain");
+      } catch {
+        // already absent in this scope
+      }
+      for (const type of ["text/plain", "*"]) {
+        try {
+          scope.addContentTypeParser(type, { parseAs: "buffer" }, (_request, body, done) => done(null, body));
+        } catch {
+          // The app registered its own parser for this type in this scope: it keeps it (the Node handler reads a string or a Buffer)
+        }
+      }
+    }
     for (const url of ["/", "/*"]) {
       scope.route({ method: METHODS, url, bodyLimit: options.bodyLimit, handler });
     }

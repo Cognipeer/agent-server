@@ -9,6 +9,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AgentServer, RouteResult } from "../server.js";
 import type { AuthUser } from "../types.js";
+import { isRawUploadRequest } from "../files/config.js";
 
 export interface NodeHandlerOptions {
   /**
@@ -20,7 +21,8 @@ export interface NodeHandlerOptions {
 
   /**
    * Maximum request body in bytes. Defaults to `limits.maxBodySize`, or - when
-   * unset - enough for a base64 upload of `limits.maxFileSize` (10MB default).
+   * unset - enough for a base64 upload of the largest file an agent accepts
+   * (`server.maxUploadBytes()`; 10 MiB by default).
    */
   maxBodyBytes?: number;
 }
@@ -56,8 +58,6 @@ export type NodeHandler = (
   res: ServerResponse,
   overrides?: NodeHandlerOverrides
 ) => Promise<boolean>;
-
-const DEFAULT_MAX_FILE = 10 * 1024 * 1024;
 
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
@@ -104,7 +104,12 @@ function normalizeProvidedBody(body: unknown): unknown {
   }
 }
 
-async function readJsonBody(req: IncomingMessage, limit: number): Promise<unknown> {
+/** The request body as bytes, refused (413) as soon as it is over `limit`. */
+async function readRawBody(req: IncomingMessage, limit: number): Promise<Buffer> {
+  const declared = Number(req.headers["content-length"]);
+  if (Number.isFinite(declared) && declared > limit) {
+    throw { statusCode: 413, code: "PAYLOAD_TOO_LARGE", message: `Request body exceeds ${limit} bytes` };
+  }
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
@@ -115,9 +120,14 @@ async function readJsonBody(req: IncomingMessage, limit: number): Promise<unknow
     }
     chunks.push(buf);
   }
-  if (size === 0) return undefined;
+  return Buffer.concat(chunks);
+}
+
+async function readJsonBody(req: IncomingMessage, limit: number): Promise<unknown> {
+  const raw = await readRawBody(req, limit);
+  if (raw.length === 0) return undefined;
   try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    return JSON.parse(raw.toString("utf8"));
   } catch {
     throw { statusCode: 400, code: "VALIDATION_ERROR", message: "Invalid JSON body" };
   }
@@ -139,7 +149,7 @@ export function createNodeHandler(server: AgentServer, options: NodeHandlerOptio
   const maxBody =
     options.maxBodyBytes ??
     config.limits?.maxBodySize ??
-    Math.ceil((config.limits?.maxFileSize ?? DEFAULT_MAX_FILE) * 1.4) + 64 * 1024;
+    Math.ceil(server.maxUploadBytes() * 1.4) + 64 * 1024;
 
   const applyCors = (req: IncomingMessage, res: ServerResponse): void => {
     const cors = config.cors;
@@ -234,8 +244,15 @@ export function createNodeHandler(server: AgentServer, options: NodeHandlerOptio
       const user = await authenticate(req, routePath);
 
       let body: unknown;
+      // A file uploaded as itself (its own Content-Type, `?name=`) is a body of bytes, not JSON
+      const rawUpload = isRawUploadRequest(req.method ?? "GET", routePath, req.headers["content-type"]);
       if ("body" in overrides) {
-        body = normalizeProvidedBody(overrides.body);
+        // (a framework that already read it hands the bytes, or - for text/plain - a string)
+        body = rawUpload && (Buffer.isBuffer(overrides.body) || typeof overrides.body === "string")
+          ? Buffer.from(overrides.body as Buffer | string)
+          : normalizeProvidedBody(overrides.body);
+      } else if (rawUpload) {
+        body = await readRawBody(req, maxBody);
       } else if (req.method === "POST" || req.method === "PATCH" || req.method === "PUT") {
         body = await readJsonBody(req, maxBody);
       }

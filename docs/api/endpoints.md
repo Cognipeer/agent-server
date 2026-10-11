@@ -269,7 +269,8 @@ POST /conversations/:id/messages
 }
 ```
 
-`fileIds` attaches files uploaded earlier with `POST /files` (`conversationId` set); `files` (`[{ name, content: <base64>, mimeType }]`) attaches inline ones.
+`fileIds` attaches files uploaded earlier into this conversation with `POST /files` (a file that is not this conversation's, or that the caller did not upload, is a 404); `files`
+(`[{ name, content: <base64>, mimeType }]`) attaches inline ones, which are stored first. The agent is given the files' contents - see [Files](../guide/file-management).
 
 **Response (`stream: false`):** the turn runs to its end and the response is the user message, the assistant message and how the turn ended.
 
@@ -308,8 +309,11 @@ The turn runs detached from the connection: closing it does not stop it.
 
 | Status | Code | When |
 |--------|------|------|
-| 400 | `VALIDATION_ERROR` | No `message`; malformed `fileIds`; too many files |
-| 404 | `NOT_FOUND` | Unknown conversation; a `fileIds` entry that is not a file of this conversation |
+| 400 | `VALIDATION_ERROR` | No `message`; malformed `fileIds` / `files`; too many files in the message; a file over the size limit or empty |
+| 403 | `attachments_disabled` | The message carries files and the agent takes none |
+| 404 | `NOT_FOUND` | Unknown conversation; a `fileIds` entry that is not a file of this conversation (or not the caller's) |
+| 409 | `too_many_files` | The files would take the conversation past `files.maxFiles` |
+| 415 | `unsupported_file_type` | An inline file of a type the agent does not accept |
 | 409 | `action_pending` | The conversation waits on a pending action (`error.details.pendingActionIds`) |
 | 409 | `conversation_busy` | A turn is already running in the conversation (`error.details.activeRunId`) |
 
@@ -411,34 +415,76 @@ Server-Sent Events: replays the events after `?after=` (or the `Last-Event-ID` h
 
 ## Files
 
+Settings, limits and what the agent is given: [Files](../guide/file-management).
+
 ### Upload File
 
 ```
 POST /files
 ```
 
-**Content-Type:** `multipart/form-data`
+Either the file **as itself** - its bytes as the body, its own `Content-Type`:
 
-**Form Fields:**
+```
+POST /files?name=contract.pdf&conversationId=conv_123
+Content-Type: application/pdf
 
-| Field | Type | Description |
-|-------|------|-------------|
-| file | File | The file to upload |
+<the bytes>
+```
 
-**Response:**
+| Query | |
+|-------|--|
+| `name` | the file's name (required) |
+| `conversationId` | the conversation the file is for. Without it the file belongs to no conversation and cannot be attached to a message |
+| `mimeType` | overrides the `Content-Type` header |
+
+or **JSON** (a request without a `Content-Type` is read as JSON):
+
+```json
+{ "file": { "name": "contract.pdf", "content": "<base64>", "mimeType": "application/pdf" }, "conversationId": "conv_123", "metadata": {} }
+```
+
+**Response `201`:**
 
 ```json
 {
   "file": {
     "id": "file_123",
-    "name": "document.pdf",
+    "name": "contract.pdf",
     "mimeType": "application/pdf",
     "size": 12345,
-    "url": "/api/agents/files/file_123/content",
+    "storageKey": "...",
+    "conversationId": "conv_123",
+    "userId": "user_1",
+    "agentId": "contracts",
+    "expiresAt": "2025-01-31T00:00:00.000Z",
+    "metadata": {},
     "createdAt": "2025-01-01T00:00:00.000Z"
   }
 }
 ```
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `VALIDATION_ERROR` | No file or name; an empty file (`File is empty`); over the size limit (`error.details.reason: "file_too_large"`) |
+| 403 | `attachments_disabled` | The conversation's agent takes no files |
+| 403 | `FORBIDDEN` | The conversation is not the caller's |
+| 404 | `NOT_FOUND` | Unknown conversation |
+| 409 | `too_many_files` | The conversation already holds `files.maxFiles` files |
+| 413 | `PAYLOAD_TOO_LARGE` | The body is over the adapter's limit |
+| 415 | `unsupported_file_type` | The agent's `allowedMimeTypes` does not include the type |
+
+### List a Conversation's Files
+
+```
+GET /conversations/:id/files?limit=&offset=
+```
+
+```json
+{ "files": [ { "id": "file_123", "name": "contract.pdf" } ], "total": 1, "limit": 100, "offset": 0, "hasMore": false, "maxFiles": 10 }
+```
+
+Oldest first. `maxFiles` is what the conversation may hold.
 
 ### Get File Metadata
 
@@ -446,25 +492,16 @@ POST /files
 GET /files/:fileId
 ```
 
-**Response:**
-
-```json
-{
-  "id": "file_123",
-  "name": "document.pdf",
-  "mimeType": "application/pdf",
-  "size": 12345,
-  "createdAt": "2025-01-01T00:00:00.000Z"
-}
-```
+The record, as in the upload response. `404` for a file that does not exist, that the caller did not upload, or whose conversation the caller cannot open.
 
 ### Download File
 
 ```
-GET /files/:fileId/content
+GET /files/:fileId/content?disposition=attachment|inline
 ```
 
-Returns the file content with appropriate `Content-Type` header.
+Returns the bytes with the file's `Content-Type` (sanitised), `Content-Disposition: attachment; filename="..."`, `X-Content-Type-Options: nosniff` and
+`Cache-Control: private, no-store`. `disposition=inline` shows a picture, PDF or plain text in place; HTML, SVG and other active types are always downloads.
 
 ### Delete File
 
@@ -472,13 +509,7 @@ Returns the file content with appropriate `Content-Type` header.
 DELETE /files/:fileId
 ```
 
-**Response:**
-
-```json
-{
-  "success": true
-}
-```
+`204`. Files also go with their conversation and when `files.retentionDays` have passed.
 
 ## Documentation
 

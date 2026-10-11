@@ -7,7 +7,7 @@
 
 // Core exports
 export { AgentServer, createAgentServer } from "./server.js";
-export type { RouteContext, RouteResult, RouteRequest } from "./server.js";
+export type { RouteContext, RouteResult, RouteRequest, AgentRegistrationOptions } from "./server.js";
 export {
   getRequestContext,
   runWithRequestContext,
@@ -64,6 +64,8 @@ export type {
   CreateMessageParams,
   GetMessagesParams,
   SaveFileParams,
+  ListFilesParams,
+  PurgeExpiredFilesParams,
   CreateTaskParams,
   GetTasksParams,
   UpdateTaskParams,
@@ -101,6 +103,11 @@ export type {
   TurnWarning,
   ResolveActionParams,
   AgentCapabilities,
+  AttachmentsCapability,
+  FilesConfig,
+  AgentFilesConfig,
+  ExtractTextFile,
+  ListFilesResponse,
   StopReason,
   RuntimeStatus,
   ConversationRuntime,
@@ -149,6 +156,25 @@ export {
   AuthorizationError,
   StorageLimitError,
 } from "./types.js";
+
+// Files: what an agent reads attachments with, and the settings around them
+export { createSessionFileTools, SESSION_FILE_TOOL_NAMES } from "./files/tools.js";
+export type { SessionFileTool, SessionFileToolsOptions } from "./files/tools.js";
+export {
+  withSessionImages,
+  createImageAwareTokenCounter,
+  isSessionImageModel,
+  IMAGE_TOKENS,
+} from "./files/images.js";
+export type { WithSessionImagesOptions } from "./files/images.js";
+export {
+  FILES_DEFAULTS,
+  SESSION_FILES_LIST_TOOL,
+  SESSION_FILES_READ_TOOL,
+  SESSION_FILES_VIEW_IMAGE_TOOL,
+  isRawUploadRequest,
+} from "./files/config.js";
+export { defaultExtractText } from "./files/extract.js";
 
 // Run lifecycle and the event log
 export { EVENT_TYPES, MemoryEventLog, nextStopReason } from "./events.js";

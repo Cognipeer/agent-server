@@ -26,6 +26,8 @@ import type {
   CreateMessageParams,
   GetMessagesParams,
   SaveFileParams,
+  ListFilesParams,
+  PurgeExpiredFilesParams,
   CreateTaskParams,
   GetTasksParams,
   UpdateTaskParams,
@@ -49,6 +51,8 @@ import type {
 /** The longest key / owner / event type / run id a provider is asked to store. */
 export const MAX_KEY_LENGTH = 128;
 const MAX_EVENT_BATCH = 1000;
+const MAX_LIST_FILES = 1000;
+const MAX_PURGE_FILES = 5000;
 const MAX_LEASE_TTL_MS = 24 * 60 * 60 * 1000;
 
 /** What a provider's `_listEvents` is asked for (already clamped; `limit` includes one extra row for `hasMore`). */
@@ -87,6 +91,7 @@ export abstract class BaseStorageProvider implements StorageProvider {
       atomicUpdate: false,
       events: false,
       leases: false,
+      fileIndex: false,
     };
   }
 
@@ -138,6 +143,14 @@ export abstract class BaseStorageProvider implements StorageProvider {
   protected abstract _getFile(id: string, ctx?: RequestContext): Promise<FileRecord | null>;
   protected abstract _getFileContent(id: string, ctx?: RequestContext): Promise<Buffer | null>;
   protected abstract _deleteFile(id: string, ctx?: RequestContext): Promise<void>;
+
+  // The file index is optional. A provider that implements the hooks below gets the validated public
+  // `listFiles` / `purgeExpiredFiles` from this class and should report `capabilities().fileIndex`.
+  protected _listFiles?(
+    params: { conversationId: string; limit: number; offset: number; order: "asc" | "desc" },
+    ctx?: RequestContext
+  ): Promise<PaginatedResult<FileRecord>>;
+  protected _purgeExpiredFiles?(params: { before: Date; limit: number }, ctx?: RequestContext): Promise<number>;
 
   // Tasks
   protected abstract _createTask(
@@ -316,12 +329,23 @@ export abstract class BaseStorageProvider implements StorageProvider {
       }
       conversationId = message.conversationId;
     }
+    if (params.expiresAt !== undefined && !(params.expiresAt instanceof Date && Number.isFinite(params.expiresAt.getTime()))) {
+      throw new ValidationError("expiresAt must be a valid Date");
+    }
     const id = this.generateId("file");
     const storageKey = this.generateStorageKey(params.name);
     return normalizeFile(
       await this._saveFile(
         id,
-        { ...params, conversationId, metadata: jsonClone(params.metadata), storageKey, size },
+        {
+          ...params,
+          userId: optional(params.userId),
+          agentId: optional(params.agentId),
+          conversationId,
+          metadata: jsonClone(params.metadata),
+          storageKey,
+          size,
+        },
         ctx
       )
     );
@@ -341,6 +365,34 @@ export abstract class BaseStorageProvider implements StorageProvider {
   async deleteFile(id: string, ctx?: RequestContext): Promise<void> {
     this.ensureConnected();
     return this._deleteFile(id, ctx);
+  }
+
+  /** The files of a conversation, oldest first (an unknown conversation holds none). */
+  async listFiles(params: ListFilesParams, ctx?: RequestContext): Promise<PaginatedResult<FileRecord>> {
+    this.ensureConnected();
+    if (!this._listFiles) throw new Error("This storage provider does not support listing files");
+    if (typeof params?.conversationId !== "string" || params.conversationId.length === 0) {
+      throw new ValidationError("listFiles needs a conversationId");
+    }
+    const limit = params.limit !== undefined && Number.isFinite(params.limit) && params.limit > 0
+      ? Math.min(Math.floor(params.limit), MAX_LIST_FILES)
+      : 100;
+    const offset = params.offset !== undefined && Number.isFinite(params.offset) && params.offset > 0 ? Math.floor(params.offset) : 0;
+    const result = await this._listFiles({ conversationId: params.conversationId, limit, offset, order: params.order === "desc" ? "desc" : "asc" }, ctx);
+    return { ...result, data: result.data.map(normalizeFile) };
+  }
+
+  /** Deletes files whose `expiresAt` is at or before `before` (record and content). Resolves how many. */
+  async purgeExpiredFiles(params: PurgeExpiredFilesParams, ctx?: RequestContext): Promise<number> {
+    this.ensureConnected();
+    if (!this._purgeExpiredFiles) throw new Error("This storage provider does not support purging expired files");
+    if (!(params?.before instanceof Date) || !Number.isFinite(params.before.getTime())) {
+      throw new ValidationError("purgeExpiredFiles needs a valid `before` Date");
+    }
+    const limit = params.limit !== undefined && Number.isFinite(params.limit) && params.limit > 0
+      ? Math.min(Math.floor(params.limit), MAX_PURGE_FILES)
+      : 500;
+    return this._purgeExpiredFiles({ before: params.before, limit }, ctx);
   }
 
   async createTask(params: CreateTaskParams, ctx?: RequestContext): Promise<Task> {
@@ -630,6 +682,9 @@ function normalizeFile(f: FileRecord): FileRecord {
     storageKey: f.storageKey,
     conversationId: optional(f.conversationId),
     messageId: optional(f.messageId),
+    userId: optional(f.userId),
+    agentId: optional(f.agentId),
+    expiresAt: f.expiresAt ? new Date(f.expiresAt) : undefined,
     metadata: f.metadata ?? {},
     createdAt: f.createdAt,
   };

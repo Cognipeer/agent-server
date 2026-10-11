@@ -53,7 +53,7 @@ type Statement = {
 };
 
 /** Bumped when `migrate()` gains a step that must run once on existing databases. */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 export interface SQLiteConfig {
   /**
@@ -126,6 +126,7 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       maxStateBytes: 1_000_000_000,
       events: true,
       leases: true,
+      fileIndex: true,
     };
   }
 
@@ -217,6 +218,9 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
         storage_key TEXT NOT NULL,
         conversation_id TEXT REFERENCES ${this.tables.conversations}(id) ON DELETE SET NULL,
         message_id TEXT REFERENCES ${this.tables.messages}(id) ON DELETE SET NULL,
+        user_id TEXT,
+        agent_id TEXT,
+        expires_at TEXT,
         metadata TEXT DEFAULT '{}',
         created_at TEXT DEFAULT (datetime('now'))
       )
@@ -345,6 +349,13 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
         if (!columns.some((c) => c.name === "conversation_id")) {
           db.exec(`ALTER TABLE ${this.tables.tasks} ADD COLUMN conversation_id TEXT`);
         }
+        // Schema version 4: files know who uploaded them, for which agent, and when they expire
+        const fileColumns = db.prepare(`PRAGMA table_info(${this.tables.files})`).all() as Array<{ name: string }>;
+        for (const column of ["user_id", "agent_id", "expires_at"]) {
+          if (!fileColumns.some((c) => c.name === column)) {
+            db.exec(`ALTER TABLE ${this.tables.files} ADD COLUMN ${column} TEXT`);
+          }
+        }
         db.prepare(
           `INSERT INTO ${this.tables.meta} (key, value) VALUES ('schema_version', ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value`
@@ -352,6 +363,11 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       });
     }
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_${p}tasks_conv ON ${this.tables.tasks}(conversation_id)`);
+    // Files of a conversation by age, and the retention sweep (only files that expire are in the index)
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_${p}files_conv_t ON ${this.tables.files}(conversation_id, created_at)`);
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_${p}files_expires ON ${this.tables.files}(expires_at) WHERE expires_at IS NOT NULL`
+    );
   }
 
   // ============================================================================
@@ -625,8 +641,8 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
 
       db.prepare(
         `INSERT INTO ${this.tables.files}
-         (id, name, mime_type, size, storage_key, conversation_id, message_id, metadata, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         (id, name, mime_type, size, storage_key, conversation_id, message_id, user_id, agent_id, expires_at, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         id,
         params.name,
@@ -635,6 +651,9 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
         params.storageKey,
         params.conversationId || null,
         params.messageId || null,
+        params.userId || null,
+        params.agentId || null,
+        params.expiresAt ? params.expiresAt.toISOString() : null,
         JSON.stringify(params.metadata || {}),
         now
       );
@@ -648,6 +667,9 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       storageKey: params.storageKey,
       conversationId: params.conversationId,
       messageId: params.messageId,
+      userId: params.userId,
+      agentId: params.agentId,
+      expiresAt: params.expiresAt,
       metadata: params.metadata || {},
       createdAt: new Date(now),
     };
@@ -689,6 +711,50 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
         db.prepare(`DELETE FROM ${this.tables.fileContents} WHERE storage_key = ?`).run(fileRow.storage_key);
         db.prepare(`DELETE FROM ${this.tables.files} WHERE id = ?`).run(id);
       }
+    });
+  }
+
+  protected async _listFiles(params: {
+    conversationId: string;
+    limit: number;
+    offset: number;
+    order: "asc" | "desc";
+  }): Promise<PaginatedResult<FileRecord>> {
+    if (!this.db) throw new Error("Database not initialized");
+    const order = params.order === "desc" ? "DESC" : "ASC";
+
+    const total = (
+      this.db.prepare(`SELECT COUNT(*) AS count FROM ${this.tables.files} WHERE conversation_id = ?`).get(params.conversationId) as {
+        count: number;
+      }
+    ).count;
+    // Insertion order (rowid) breaks ties between files saved in the same millisecond
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM ${this.tables.files} WHERE conversation_id = ?
+         ORDER BY created_at ${order}, rowid ${order} LIMIT ? OFFSET ?`
+      )
+      .all(params.conversationId, params.limit, params.offset) as DbFile[];
+    return pageResult(rows.map((row) => this.mapFile(row)), total, params.limit, params.offset);
+  }
+
+  protected async _purgeExpiredFiles(params: { before: Date; limit: number }): Promise<number> {
+    if (!this.db) throw new Error("Database not initialized");
+    const db = this.db;
+
+    return this.tx(() => {
+      const due = db
+        .prepare(
+          `SELECT id, storage_key FROM ${this.tables.files}
+           WHERE expires_at IS NOT NULL AND expires_at <= ?
+           ORDER BY expires_at, rowid LIMIT ?`
+        )
+        .all(params.before.toISOString(), params.limit) as Array<{ id: string; storage_key: string }>;
+      for (const row of due) {
+        db.prepare(`DELETE FROM ${this.tables.fileContents} WHERE storage_key = ?`).run(row.storage_key);
+        db.prepare(`DELETE FROM ${this.tables.files} WHERE id = ?`).run(row.id);
+      }
+      return due.length;
     });
   }
 
@@ -1179,6 +1245,9 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       storageKey: row.storage_key,
       conversationId: row.conversation_id || undefined,
       messageId: row.message_id || undefined,
+      userId: row.user_id || undefined,
+      agentId: row.agent_id || undefined,
+      expiresAt: row.expires_at ? new Date(row.expires_at) : undefined,
       metadata:
         typeof row.metadata === "string" ? JSON.parse(row.metadata) : row.metadata,
       createdAt: new Date(row.created_at),
@@ -1255,6 +1324,9 @@ interface DbFile {
   storage_key: string;
   conversation_id: string | null;
   message_id: string | null;
+  user_id: string | null;
+  agent_id: string | null;
+  expires_at: string | null;
   metadata: string;
   created_at: string;
 }

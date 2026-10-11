@@ -55,10 +55,10 @@ Every built-in provider reports what it can hold:
 
 ```typescript
 storage.capabilities();
-// { maxFileBytes, maxStateBytes, atomicUpdate, events, leases }
+// { maxFileBytes, maxStateBytes, atomicUpdate, events, leases, fileIndex }
 ```
 
-`events` and `leases` are `true` for all four built-in providers. A provider that has no `events` still works - the server keeps a bounded log in
+`events`, `leases` and `fileIndex` (the file listing and expiry purge that [files](./file-management.md) use) are `true` for all four built-in providers. A provider that has no `events` still works - the server keeps a bounded log in
 memory (see [Runs](./runs.md#providers-without-an-event-log)); one without `leases` serialises runs in-process only, which is right for a single server.
 
 The server uses it in three places:
@@ -133,7 +133,7 @@ With `autoMigrate: true` the provider creates (and upgrades) these tables, all n
 | --- | --- |
 | `conversations` | `id`, `agent_id`, `user_id`, `title`, `metadata` / `state` (JSONB), `created_at`, `updated_at`, `seq` |
 | `messages` | `id`, `conversation_id` (cascade), `role`, `content` (JSONB), `name`, `tool_calls`, `tool_call_id`, `files`, `metadata`, times, `seq` |
-| `files` | the file record: `name`, `mime_type`, `size`, `storage_key`, `conversation_id`, `message_id`, `metadata` |
+| `files` | the file record: `name`, `mime_type`, `size`, `storage_key`, `conversation_id`, `message_id`, `user_id` (who uploaded it), `agent_id`, `expires_at`, `metadata`, `seq` |
 | `file_contents` | `storage_key`, `content` (BYTEA) |
 | `tasks` | `agent_id`, `user_id`, `conversation_id`, `status`, `callback_url`, `input`, `files`, `comments` (JSONB), `metadata`, times, `error`, `seq` |
 | `task_results` | `task_id` (unique), `content`, `files`, `metadata`, `usage` |
@@ -149,7 +149,7 @@ Indexes are named `idx_<prefix>...`, so several prefixes can share a schema:
 ```sql
 -- conversations: (agent_id, created_at, seq), (user_id, created_at, seq), (created_at, seq), (updated_at, seq)
 -- messages:      (conversation_id, created_at, seq)
--- files:         (conversation_id), (message_id)
+-- files:         (conversation_id, created_at, seq), (message_id), (expires_at) WHERE expires_at IS NOT NULL
 -- tasks:         (agent_id, created_at, seq), (user_id, created_at, seq), (status, created_at, seq), (created_at, seq), (conversation_id)
 -- task_results:  UNIQUE (task_id)
 -- events:        PRIMARY KEY (conversation_id, seq), (created_at)
@@ -162,6 +162,8 @@ The schema carries a version (`meta.schema_version`). Connecting an older databa
 so a fleet starting together is safe: it adds `tasks.comments` and the `seq` columns, keeps only the newest result of tasks that had
 several, adds the indexes above and drops the old unprefixed ones **if they belong to this prefix's tables**. Nothing is deleted
 besides the duplicate results. Schema version 3 adds the `events`, `event_streams` and `leases` tables and `tasks.conversation_id`.
+Schema version 4 adds `files.user_id`, `files.agent_id`, `files.expires_at` (and, on PostgreSQL, the `files.seq` ordering column) with their indexes; files
+uploaded before it have no owner and no expiry, so they follow their conversation and never expire.
 
 ### Things to know
 
@@ -204,7 +206,7 @@ Content written by older versions in `<prefix>file_contents` is still read and d
 // messages
 { conversationId: 1, createdAt: 1, seq: 1 }
 // files
-{ conversationId: 1 }, { messageId: 1 }, { storageKey: 1 } /* unique */
+{ conversationId: 1, createdAt: 1, seq: 1 }, { messageId: 1 }, { storageKey: 1 } /* unique */, { expiresAt: 1 } /* only files that expire */
 // tasks
 { agentId: 1, createdAt: -1, seq: -1 }, { userId: 1, ... }, { status: 1, ... }, { createdAt: -1, seq: -1 }, { conversationId: 1 }
 // task_results

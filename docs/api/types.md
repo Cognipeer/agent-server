@@ -219,11 +219,13 @@ interface ListAgentsResponse {
 
 ### UploadFileRequest
 
+The JSON form of `POST /files` (the file can also be sent as its own bytes: [Files](../guide/file-management#uploading)).
+
 ```typescript
 interface UploadFileRequest {
-  file: File | Buffer;
-  name: string;
-  mimeType: string;
+  file: { name: string; content: string /* base64 */; mimeType: string };
+  conversationId?: string;
+  metadata?: Record<string, unknown>;
 }
 ```
 
@@ -353,9 +355,67 @@ interface FileRecord {
   name: string;
   mimeType: string;
   size: number;
-  storageKey?: string;
+  storageKey: string;
+  conversationId?: string;
+  messageId?: string;
+  userId?: string;       // who uploaded it
+  agentId?: string;
+  expiresAt?: Date;      // when the retention sweep deletes it
   metadata?: Record<string, unknown>;
   createdAt: Date;
+}
+```
+
+### FilesConfig / AgentFilesConfig
+
+`AgentServerConfig.files` and the `files` of a registration; every field is optional. See [Files](../guide/file-management#settings) for what each does and its default.
+
+```typescript
+interface FilesConfig {
+  enabled?: boolean;
+  maxFiles?: number;
+  maxFileSize?: number;
+  allowedMimeTypes?: string[];
+  inlineMaxTokens?: number;
+  readPageChars?: number;
+  retentionDays?: number;
+  vision?: boolean;
+  attachNewUploads?: boolean;
+  maxImages?: number;
+  maxImageBytes?: number;
+  carryRecentImages?: number;
+  extractText?: (file: { id: string; name: string; mimeType: string; size: number }, bytes: Buffer) =>
+    Promise<string | null | undefined> | string | null | undefined;
+  extractCacheBytes?: number;   // server only
+  purgeIntervalMs?: number;     // server only
+}
+type AgentFilesConfig = Omit<FilesConfig, 'extractCacheBytes' | 'purgeIntervalMs'>;
+```
+
+### AttachmentsCapability
+
+`AgentInfo.capabilities.attachments`: what a conversation with the agent accepts.
+
+```typescript
+interface AttachmentsCapability {
+  enabled?: boolean;
+  maxFiles?: number;
+  maxFileSize?: number;          // bytes
+  allowedMimeTypes?: string[];   // empty = any
+  acceptsImages?: boolean;
+}
+```
+
+### ListFilesResponse
+
+```typescript
+interface ListFilesResponse {
+  files: FileRecord[];   // oldest first
+  total: number;
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+  maxFiles: number;      // what the conversation may hold
 }
 ```
 
@@ -432,11 +492,21 @@ interface GetMessagesParams {
 interface SaveFileParams {
   name: string;
   mimeType: string;
-  size: number;
-  content?: Buffer;
-  storageKey?: string;
+  content: Buffer;
+  conversationId?: string;
+  messageId?: string;
+  userId?: string;
+  agentId?: string;
+  expiresAt?: Date;
   metadata?: Record<string, unknown>;
 }
+```
+
+### ListFilesParams / PurgeExpiredFilesParams
+
+```typescript
+interface ListFilesParams { conversationId: string; limit?: number; offset?: number; order?: 'asc' | 'desc' }
+interface PurgeExpiredFilesParams { before: Date; limit?: number }
 ```
 
 ## Auth Types

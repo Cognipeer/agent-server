@@ -64,6 +64,7 @@ Hook signatures (all end with `ctx?: RequestContext`):
 | Files | `_saveFile(id, params, ctx)`, `_getFile(id, ctx)`, `_getFileContent(id, ctx)`, `_deleteFile(id, ctx)` |
 | Tasks | `_createTask(id, params, ctx)`, `_getTask(id, ctx)`, `_getTasks(params, ctx)`, `_updateTask(id, params, ctx)`, `_deleteTask(id, ctx)` |
 | Task results | `_createTaskResult(id, params, ctx)`, `_getTaskResult(taskId, ctx)` |
+| File index *(optional)* | `_listFiles({ conversationId, limit, offset, order }, ctx)`, `_purgeExpiredFiles({ before, limit }, ctx)` |
 | Events *(optional)* | `_appendEvents(conversationId, events, ctx)`, `_listEvents(conversationId, query, ctx)`, `_eventSummaries(conversationIds, ctx)`, `_pruneEvents(before, ctx)` |
 | Leases *(optional)* | `_acquireLease(params, ctx)`, `_renewLease(params, ctx)`, `_releaseLease(params, ctx)`, `_getLeases(keys, now, ctx)`, `_markLeaseCancel(key, now, ctx)`, `_listExpiredLeases(params, ctx)` |
 
@@ -82,7 +83,8 @@ these rules behaves like them to the server and to every client:
 | Absent | `userId`, `title`, `name`, `toolCallId`, `callbackUrl`, `error` read as `undefined` when absent; `files: []` as `undefined`; `metadata` / `state` default to `{}`; `Task.comments` is always an array of comments with `Date`s. |
 | Copies | Do not hand out objects you keep (a provider that holds records in memory must copy them). |
 | Messages | `createMessage` for a conversation that does not exist throws `NotFoundError` and stores nothing. A new message sets the conversation's `updatedAt`. `deleteMessage` keeps the message's files. |
-| Files | `getFileContent` returns a `Buffer`. `saveFile` for an unknown conversation or message throws `NotFoundError` and stores no content; content and record are written together (or the content is taken back out). A file with a `messageId` belongs to that message's conversation. `deleteConversation` deletes the conversation's files and their content. |
+| Files | `getFileContent` returns a `Buffer`. `saveFile` for an unknown conversation or message throws `NotFoundError` and stores no content; content and record are written together (or the content is taken back out). A file with a `messageId` belongs to that message's conversation. `deleteConversation` deletes the conversation's files and their content. The record keeps `userId` (who uploaded it), `agentId` and `expiresAt` when given, and reads them back as `undefined` when not. |
+| File index | `listFiles({ conversationId, limit?, offset?, order? })`: the conversation's files, oldest first (`order: 'desc'` reverses it; files saved in the same millisecond keep their insertion order), as a `PaginatedResult`; an unknown conversation holds none. `purgeExpiredFiles({ before, limit? })` deletes files whose `expiresAt <= before` - record and content, earliest expiry first, at most `limit` (default 500) - and resolves how many; files without `expiresAt` stay. Index `(conversationId, createdAt)` and `expiresAt`. |
 | Tasks | `createTaskResult` replaces the task's existing result (one per task). `updateTask` / `createTaskResult` for an unknown task throw `NotFoundError`; an update that changes nothing is not an error. `conversationId` is stored, updatable and a `getTasks` filter. |
 | Events | `append` is atomic and ordered: `seq` is 1, 2, 3 ... per conversation with no gaps or repeats, also for appenders running at the same time, and keeps counting after a restart or a `prune`. An unknown conversation is a `NotFoundError`. `list({ after, before, types, limit, order })` returns `{ events, hasMore, lastSeq }` (`lastSeq` = the last event returned, or `after` for an empty page). `summary` gives `lastSeq` and `stopReason` per conversation. The log is deleted with the conversation. |
 | Leases | `acquireLease` is atomic: free, expired or already yours is acquired (an expired one is returned as `takenOver`), otherwise `{ acquired: false, lease }` with the holder. `renewLease` / `releaseLease` only work for the owner, `renewLease` not once expired. `markLeaseCancel` flags a live lease, and the owner sees `cancelRequested` when it renews. `getLeases` returns the live ones, `listExpiredLeases` the expired, oldest first, by key prefix. |
@@ -104,6 +106,7 @@ class MyStorage extends BaseStorageProvider {
       atomicUpdate: false,                   // compare-and-set conversation updates
       events: false,                         // a durable per-conversation event log (implement `_appendEvents` / `_listEvents`)
       leases: false,                         // per-conversation leases (implement the `_...Lease` hooks)
+      fileIndex: false,                      // `listFiles` / `purgeExpiredFiles` (implement `_listFiles` / `_purgeExpiredFiles`)
     };
   }
 }
@@ -161,13 +164,20 @@ class ExistingStoreAdapter implements StorageProvider {
 }
 ```
 
+### The file index (optional)
+
+`listFiles` and `purgeExpiredFiles` serve [files](./file-management.md): the per-conversation file limit, `GET /conversations/:id/files`,
+`files.attachNewUploads` and the retention sweep. Without them (`capabilities().fileIndex` false) files are still stored, owned and served, but those four do nothing -
+the limit is not enforced, the listing shows only the files that messages carry, and expired files are not deleted. Implement `_listFiles` and `_purgeExpiredFiles`
+and report `fileIndex: true`.
+
 Notes for scoped stores:
 
 - Returning `null` from `getConversation` yields a 404 - use that for "not yours"
   instead of leaking existence. (Ownership is additionally enforced by the server
   through `conversation.userId` when `resolveContext` is configured.)
-- Files and tasks have no owner check in the server beyond `task.userId`; scope them
-  by `ctx` too if clients must not reach each other's ids.
+- The server checks a file's `userId` and its conversation before it shows a file (a file of someone else is a 404), so file ids are safe to
+  hand out; scope tasks by `ctx` too if clients must not reach each other's ids (the server checks `task.userId`).
 - `getMessages` is called with `params` possibly `undefined`, and with `before` / `after` when a client pages `GET /conversations/:id`.
 - The server reads a whole conversation for the agent in pages of `limits.maxPageSize` (200): `offset`, `limit` and `hasMore` / `total` must be right.
 - Methods must be safe to call concurrently; the server issues several per request.

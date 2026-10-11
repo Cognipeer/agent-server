@@ -6,6 +6,7 @@
 
 import type { AgentServer } from "../server.js";
 import type { AuthUser } from "../types.js";
+import { isRawUploadRequest } from "../files/config.js";
 
 // Express types - minimal to avoid requiring express as a dependency
 interface Request {
@@ -17,6 +18,10 @@ interface Request {
   body?: unknown;
   user?: AuthUser;
   params?: Record<string, string>;
+  /** The request stream (an `IncomingMessage`); read for an upload of raw bytes the app has not parsed. */
+  [Symbol.asyncIterator]?: () => AsyncIterator<Buffer | string>;
+  readableEnded?: boolean;
+  complete?: boolean;
 }
 
 interface Response {
@@ -56,6 +61,26 @@ export interface ExpressAdapterOptions {
    * Set to false if you're using express.json() middleware
    */
   parseBody?: boolean;
+}
+
+/** The bytes of an upload: a Buffer a body parser already made (`express.raw()`), else read from the request. */
+async function rawBodyOf(req: Request, limit: number): Promise<unknown> {
+  if (Buffer.isBuffer(req.body)) return req.body;
+  if (typeof req.body === "string") return Buffer.from(req.body);
+  const iterate = req[Symbol.asyncIterator];
+  // Nothing parsed it, and there is still a stream to read
+  if (typeof iterate !== "function" || req.readableEnded) return req.body;
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req as unknown as AsyncIterable<Buffer | string>) {
+    const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    size += buf.length;
+    if (size > limit) {
+      throw { statusCode: 413, code: "PAYLOAD_TOO_LARGE", message: `Request body exceeds ${limit} bytes` };
+    }
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks);
 }
 
 /**
@@ -100,11 +125,20 @@ export function createExpressMiddleware(
         }
       }
 
+      // A file uploaded as itself (`POST /files?name=...` with its own Content-Type) is a body of bytes: take
+      // what `express.raw()` left, or read it from the request when no body parser touched it
+      let body = req.body;
+      const fullPath = req.originalUrl.split("?")[0]!;
+      const routePath = fullPath.startsWith(basePath) ? fullPath.slice(basePath.length) || "/" : req.path;
+      if (isRawUploadRequest(req.method, routePath, req.headers["content-type"])) {
+        body = await rawBodyOf(req, config.limits?.maxBodySize ?? Math.ceil(server.maxUploadBytes() * 1.4) + 64 * 1024);
+      }
+
       // Handle request
       const result = await server.handleRequest(req.method, req.path || req.originalUrl, {
         user,
         query: req.query as Record<string, string | string[] | undefined>,
-        body: req.body,
+        body,
         headers: req.headers,
         url: req.originalUrl,
         // Params of a parameterised mount path, e.g. app.use("/p/:key/agents", ...)

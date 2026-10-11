@@ -65,8 +65,30 @@ interface AgentServerConfig {
 
   // Leases, cancellation, the event stream and recovery - see guide/runs
   runs?: RunsConfig;
+
+  // Attachments: limits, how agents read them, images, retention - see guide/file-management
+  files?: FilesConfig;
 }
 ```
+
+`FilesConfig` (every field optional; an agent overrides each but `extractCacheBytes` and `purgeIntervalMs`, see [Files](../guide/file-management#settings)):
+
+| Field | Default | |
+| --- | --- | --- |
+| `enabled` | `true` | `false` on an agent refuses uploads to it (`403 attachments_disabled`) |
+| `maxFiles` | 10 | Files one conversation may hold |
+| `maxFileSize` | `limits.maxFileSize`, else 10 MiB | Bytes, capped by the storage provider |
+| `allowedMimeTypes` | any | Types and `image/*` wildcards |
+| `inlineMaxTokens` | 30 000 | Up to this the documents of a message go into it; over it they are read in pages |
+| `readPageChars` | 20 000 | Page size of `session_files_read` |
+| `retentionDays` | 30 | `0` keeps files for good |
+| `vision` | `false` | The agent's model looks at images |
+| `attachNewUploads` | `false` | Uploads no message carried yet ride along with the next one |
+| `maxImages` / `maxImageBytes` | 6 / 12 000 000 | What one model request carries |
+| `carryRecentImages` | 2 | Earlier image messages that keep showing their images |
+| `extractText(file, bytes)` | | Turns a file into text: the text, `undefined` for the default, `null` for none |
+| `extractCacheBytes` | 32 MiB | Extracted text kept in memory (server only) |
+| `purgeIntervalMs` | 3 600 000 | How often expired files are deleted; 0 turns it off (server only) |
 
 `RunsConfig` (every field optional):
 
@@ -110,7 +132,7 @@ await server.handleRoute('GET', '/agents', { query: {}, headers, context }); // 
 Register an agent created with `@cognipeer/agent-sdk`.
 
 ```typescript
-agentServer.registerSDKAgent(id, agent, info?);
+agentServer.registerSDKAgent(id, agent, info?, options?);
 ```
 
 | Parameter | Type | Description |
@@ -118,6 +140,7 @@ agentServer.registerSDKAgent(id, agent, info?);
 | id | `string` | Unique agent identifier |
 | agent | `SmartAgent` | Agent from agent-sdk |
 | info | `Partial<AgentInfo>` | Optional agent metadata |
+| options | `{ files?: AgentFilesConfig }` | Attachment settings of this agent, overriding the server's `files` (`registerCustomAgent`, `registerChatCompletionsAgent` and `registerResponsesAgent` take the same last argument) |
 
 ```typescript
 import { createSmartAgent } from '@cognipeer/agent-sdk';
@@ -138,7 +161,7 @@ agentServer.registerSDKAgent('assistant', assistant, {
 Register a custom agent handler.
 
 ```typescript
-agentServer.registerCustomAgent(id, handler, info?);
+agentServer.registerCustomAgent(id, handler, info?, options?);
 ```
 
 | Parameter | Type | Description |
@@ -202,6 +225,13 @@ const { conversations, tasks } = await server.recoverStaleRuns();
 
 Closes the runs whose server died (`session.error` + `session.status_idle` with `stop_reason: "error"`) and fails the tasks that were left `running`.
 It runs by itself at the first request and every `runs.sweepIntervalMs`; call it to run it on demand. See [Runs](../guide/runs#recovery).
+
+#### purgeExpiredFiles / maxUploadBytes
+
+```typescript
+const deleted = await server.purgeExpiredFiles(); // deletes files past files.retentionDays now (the server also does it every files.purgeIntervalMs)
+const bytes = server.maxUploadBytes();            // the largest upload any agent accepts: what an HTTP adapter has to let through
+```
 
 #### close
 

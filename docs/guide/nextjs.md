@@ -267,6 +267,11 @@ while (true) {
 }
 ```
 
+## Uploading Files
+
+A file uploaded as itself (`POST /files?name=...` with the file's own `Content-Type`, see [Files](./file-management.md#uploading)) is read with `request.arrayBuffer()`;
+JSON requests are read with `request.json()` as before. Next.js and your host may have their own request size limits - make sure they allow your largest file.
+
 ## Error Handling
 
 ```typescript

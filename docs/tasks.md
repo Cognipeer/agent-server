@@ -18,7 +18,7 @@ The Task system provides a comprehensive background job processing framework for
 
 ### 3. File Support
 - Tasks can accept multiple file uploads as input
-- Files are processed and stored using the configured storage provider
+- The files are checked against the agent's `files` settings (type, size, count; `403 attachments_disabled`, `415`, `400`, `409`) and kept in the conversation the task runs in - owned by the task's user, deleted with the conversation or after `files.retentionDays` - and the agent reads them like the files of a message (see [Files](/guide/file-management)); a task with files has its `conversationId` from the start
 - File metadata is included in task results
 
 ### 4. Storage Flexibility

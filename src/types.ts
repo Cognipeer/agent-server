@@ -161,6 +161,26 @@ export interface AgentCapabilities {
   toolApproval?: boolean;
   /** The agent can pause to ask the user a question. */
   askUser?: boolean;
+  /**
+   * What the agent accepts as attachments. The server fills it from the `files` option (server and
+   * agent) for `GET /agents`; whatever the host sets here wins field by field. Clients show the
+   * paperclip, the limits and the "this agent cannot read images" warning from it.
+   */
+  attachments?: AttachmentsCapability;
+}
+
+/** `AgentInfo.capabilities.attachments`: what a conversation with the agent can hold. */
+export interface AttachmentsCapability {
+  /** Files can be attached at all. */
+  enabled?: boolean;
+  /** Files one conversation may hold. */
+  maxFiles?: number;
+  /** Largest file, in bytes. */
+  maxFileSize?: number;
+  /** Accepted MIME types (`image/*` style wildcards); empty means any. */
+  allowedMimeTypes?: string[];
+  /** The agent's model looks at images; without it an attached image is only mentioned. */
+  acceptsImages?: boolean;
 }
 
 // ============================================================================
@@ -233,6 +253,10 @@ export interface ResolveActionParams {
    * what you have; a handler that ignores it is abandoned after `runs.cancelGraceMs`.
    */
   signal?: AbortSignal;
+  /** Reads a file of this conversation. `null` for any other id or a file that expired. */
+  getFileContent?: (fileId: string) => Promise<Buffer | null>;
+  /** The text of a file of this conversation, extracted the way the server gives it to an agent (`files.extractText`); `null` when it has none. */
+  getFileText?: (fileId: string) => Promise<string | null>;
 }
 
 /**
@@ -253,7 +277,9 @@ export interface AgentHandler {
 
 export interface ProcessMessageParams {
   conversationId: string;
+  /** What the person typed. The files are not in it: see `files`, `getFileContent` and `getFileText`. */
   message: string;
+  /** The files this message carries (uploaded earlier and attached by id, or sent inline - those are stored first, so every entry has a real id). */
   files?: FileAttachment[];
   state?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
@@ -264,6 +290,10 @@ export interface ProcessMessageParams {
    * what you have; a handler that ignores it is abandoned after `runs.cancelGraceMs`.
    */
   signal?: AbortSignal;
+  /** Reads a file of this conversation (`files`, or an earlier upload). `null` for any other id or a file that expired. */
+  getFileContent?: (fileId: string) => Promise<Buffer | null>;
+  /** The text of a file of this conversation, extracted the way the server gives it to an agent (`files.extractText`); `null` when it has none. */
+  getFileText?: (fileId: string) => Promise<string | null>;
 }
 
 export interface ProcessMessageResult {
@@ -300,6 +330,8 @@ export interface AgentRegistration {
   chatCompletions?: import("./providers/ai/chat-completions.js").ChatCompletionsConfig;
   // Responses API config (optional)
   responsesApi?: import("./providers/ai/responses.js").ResponsesApiConfig;
+  /** Attachment settings of this agent; each field overrides the server's `files` option. */
+  files?: AgentFilesConfig;
 }
 
 // ============================================================================
@@ -343,6 +375,18 @@ export interface StorageProvider {
   getFile(id: string, ctx?: RequestContext): Promise<FileRecord | null>;
   getFileContent(id: string, ctx?: RequestContext): Promise<Buffer | null>;
   deleteFile(id: string, ctx?: RequestContext): Promise<void>;
+
+  /**
+   * Optional (`capabilities().fileIndex`): the files of a conversation, oldest first. Needed for the
+   * per-conversation file limit, `GET /conversations/:id/files`, `files.attachNewUploads` and the
+   * `session_files_list` tool; without it the server only knows the files that messages carry.
+   */
+  listFiles?(params: ListFilesParams, ctx?: RequestContext): Promise<PaginatedResult<FileRecord>>;
+  /**
+   * Optional (`capabilities().fileIndex`): deletes files whose `expiresAt` has passed (record and content),
+   * oldest expiry first, at most `limit` (default 500). Resolves how many it deleted.
+   */
+  purgeExpiredFiles?(params: PurgeExpiredFilesParams, ctx?: RequestContext): Promise<number>;
 
   // Tasks
   createTask(params: CreateTaskParams, ctx?: RequestContext): Promise<Task>;
@@ -520,6 +564,8 @@ export interface StorageCapabilities {
   events: boolean;
   /** Per-conversation leases (`acquireLease` / `releaseLease`). */
   leases: boolean;
+  /** Per-conversation file listing and expiry purge (`listFiles` / `purgeExpiredFiles`). Absent: `false`. */
+  fileIndex?: boolean;
 }
 
 export interface CreateConversationParams {
@@ -576,6 +622,12 @@ export interface SaveFileParams {
   content: Buffer;
   conversationId?: string;
   messageId?: string;
+  /** Who uploaded it. The file routes only show a file to its owner. */
+  userId?: string;
+  /** The agent of the conversation the file was uploaded to. */
+  agentId?: string;
+  /** After this the file is deleted by the retention sweep (see `purgeExpiredFiles`). */
+  expiresAt?: Date;
   metadata?: Record<string, unknown>;
 }
 
@@ -587,8 +639,29 @@ export interface FileRecord {
   storageKey: string;
   conversationId?: string;
   messageId?: string;
+  /** Who uploaded it (absent for files saved without an identity). */
+  userId?: string;
+  agentId?: string;
+  /** When the retention sweep deletes it (absent: never). */
+  expiresAt?: Date;
   metadata?: Record<string, unknown>;
   createdAt: Date;
+}
+
+export interface ListFilesParams {
+  conversationId: string;
+  /** Default 100. */
+  limit?: number;
+  offset?: number;
+  /** `asc` (default): oldest first. */
+  order?: "asc" | "desc";
+}
+
+export interface PurgeExpiredFilesParams {
+  /** Files that expire at or before this moment. */
+  before: Date;
+  /** At most this many per call (default 500). */
+  limit?: number;
 }
 
 export interface PaginatedResult<T> {
@@ -766,7 +839,90 @@ export interface AgentServerConfig {
    * How runs are leased, cancelled, followed and recovered. Every value has a default.
    */
   runs?: RunsConfig;
+
+  /**
+   * Files attached to conversations: limits, how an agent gets to read them, images, retention.
+   * Every agent can override each field with `AgentRegistration.files`. Every value has a default.
+   */
+  files?: FilesConfig;
 }
+
+/** What an extractor is told about a file. */
+export type ExtractTextFile = Pick<FileAttachment, "id" | "name" | "mimeType" | "size">;
+
+/**
+ * Attachment settings. `AgentServerConfig.files` sets them for every agent; `AgentRegistration.files`
+ * (and the `options.files` of the `register*Agent` methods) overrides single fields for one agent.
+ */
+export interface FilesConfig {
+  /**
+   * Whether files can be attached. Default `true` (the upload route has always been open); set it to
+   * `false` on an agent to refuse uploads to its conversations (403 `attachments_disabled`).
+   */
+  enabled?: boolean;
+  /** Files one conversation may hold (default 10). Past it an upload is `409 too_many_files`. */
+  maxFiles?: number;
+  /**
+   * Largest file in bytes. Default `limits.maxFileSize`, else 10 MiB; never more than the storage
+   * provider can hold. An agent may ask for more than the server default, up to the provider's limit
+   * (the HTTP body limit of your adapter must allow it too).
+   */
+  maxFileSize?: number;
+  /** MIME types an upload may have; `image/*` style wildcards. Empty or absent: any. Past it: `415 unsupported_file_type`. */
+  allowedMimeTypes?: string[];
+  /**
+   * Estimated tokens (characters / 4) up to which the text of ALL the documents one message carries goes
+   * into the turn. Over it the agent is told to read them in pages with `session_files_list` /
+   * `session_files_read` (SDK agents that have those tools; any other agent gets the start of the
+   * documents, cut at this size, and a `file_truncated` warning). Default 30 000.
+   */
+  inlineMaxTokens?: number;
+  /** Characters per page of `session_files_read` (default 20 000). */
+  readPageChars?: number;
+  /** Days a file is kept after it was uploaded; the retention sweep deletes it then. `0` keeps files for good. Default 30. */
+  retentionDays?: number;
+  /**
+   * The agent's model looks at images. Default `false`: an attached image is then only mentioned to the
+   * agent (and `capabilities.attachments.acceptsImages` is `false`, so clients can warn).
+   */
+  vision?: boolean;
+  /**
+   * Files uploaded to a conversation that no message has carried yet ride along with its next message,
+   * as if they had been listed in `fileIds`. Default `false`: only `fileIds` and inline `files` count.
+   */
+  attachNewUploads?: boolean;
+  /** Images one model request carries at most; when there are more, the newest are kept and an older one is only named (default 6). */
+  maxImages?: number;
+  /** Image bytes (before base64) one model request carries at most (default 12 000 000). */
+  maxImageBytes?: number;
+  /**
+   * How many EARLIER image-carrying messages keep their images in front of the model, besides the one
+   * being answered (default 2). An older image is only named, and `session_files_view_image` shows it again.
+   */
+  carryRecentImages?: number;
+  /**
+   * Turns a file into text for the agent. Return the text, `undefined` to let the default extractor
+   * have it, or `null` when the file has no text. The default reads `text/*`, JSON, XML and the like
+   * as UTF-8 and - when `@cognipeer/to-markdown` is installed - converts PDF, Word, Excel and PowerPoint files.
+   */
+  extractText?: (
+    file: ExtractTextFile,
+    bytes: Buffer
+  ) => Promise<string | null | undefined> | string | null | undefined;
+  /**
+   * Bytes of extracted text kept in memory so a file is not converted again for every page or turn
+   * (default 33 554 432, 32 MiB; 0 turns the cache off). Server-wide.
+   */
+  extractCacheBytes?: number;
+  /**
+   * How often the sweep deletes files past their `expiresAt`, in milliseconds (default 3 600 000, one hour;
+   * 0 turns the periodic purge off). With storage leases only one node purges at a time. Server-wide.
+   */
+  purgeIntervalMs?: number;
+}
+
+/** The per-agent form of {@link FilesConfig}: the fields that make sense for one agent. */
+export type AgentFilesConfig = Omit<FilesConfig, "extractCacheBytes" | "purgeIntervalMs">;
 
 /**
  * A turn (a message or a resolved action) runs detached from the HTTP request that started it: a
@@ -921,7 +1077,8 @@ export interface RequestLimits {
   maxBodySize?: number;
 
   /**
-   * Maximum number of files per request (default: 10)
+   * Maximum number of files one message attaches (`fileIds` plus inline `files`; default: 10).
+   * The number a conversation may hold is `files.maxFiles`.
    */
   maxFiles?: number;
 
@@ -955,16 +1112,21 @@ export interface RequestLimits {
 
 export interface SendMessageRequest {
   message: string;
+  /**
+   * Files sent with the message, base64. They are stored (in this conversation, owned by the
+   * sender, under the same limits as an upload) before the turn runs, and then count exactly like
+   * `fileIds`: `files` of the user message carries their real ids.
+   */
   files?: Array<{
     name: string;
     content: string; // base64
     mimeType: string;
   }>;
   /**
-   * Files uploaded earlier with `POST /files` (`conversationId` set to this
-   * conversation) that this message attaches. Each id must resolve through
-   * `storage.getFile`; the user message carries the stored records. Capped by
-   * `limits.maxFiles` (default 10).
+   * Files uploaded earlier with `POST /files` (`conversationId` set to this conversation) that this
+   * message attaches. Each id must be a file of this conversation that the caller uploaded (404
+   * otherwise); the user message carries the stored records, and the agent gets the files'
+   * contents (see `files` in the server config). Capped by `limits.maxFiles` (default 10).
    */
   fileIds?: string[];
   metadata?: Record<string, unknown>;
@@ -1230,6 +1392,10 @@ export interface CreateConversationResponse {
   conversation: Conversation;
 }
 
+/**
+ * `POST /files` takes either this JSON body or the file's raw bytes with the file's own `Content-Type`
+ * and `?name=<file name>&conversationId=<id>` (and optionally `&mimeType=` to override the header).
+ */
 export interface UploadFileRequest {
   file: {
     name: string;
@@ -1242,6 +1408,17 @@ export interface UploadFileRequest {
 
 export interface UploadFileResponse {
   file: FileRecord;
+}
+
+/** `GET /conversations/:id/files`: the files the conversation holds, oldest first. */
+export interface ListFilesResponse {
+  files: FileRecord[];
+  total: number;
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+  /** What the conversation may hold (`files.maxFiles` of its agent). */
+  maxFiles: number;
 }
 
 // ============================================================================
