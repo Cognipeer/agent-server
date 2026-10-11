@@ -61,6 +61,8 @@ server.registerSDKAgent('support', agent, { name: 'Support' }, {
 The routes **enforce** the same switches: a regeneration of an agent with `messageActions.regenerate: false` is `403 action_disabled` (`error.details.setting` names the switch), feedback is `403 feedback_disabled`, an export `403 export_disabled`.
 A host that builds its agents per request (`config.agents`) puts the portal's own settings in the registration's `experience` and gets the same behaviour.
 
+**An agent that cannot be resolved** (it left the registry or the host's catalog, or the host's `agents` function failed) has no settings to read, and the server does not stand in with its own defaults, which are all on. For a conversation of such an agent, exporting, rating, renaming, pinning and bulk deleting are refused with the same codes as a switched-off action, and `error.details.reason` is `agent_unavailable`; regenerating and editing are `404` as before. Reading the conversation and deleting it one at a time keep working, so a person can still see and clear their own history. The agent coming back brings its switches back.
+
 ## Message actions
 
 ### Regenerate

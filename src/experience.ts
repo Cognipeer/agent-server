@@ -164,6 +164,21 @@ export function resolveExperience(inputs: ResolveInputs): ResolvedExperience {
 }
 
 /**
+ * The switches of an agent that cannot be resolved (it left the registry or the host's catalog, or the host failed to answer): every
+ * one is off and nothing can be exported or rated. The settings that guard those actions belong to the agent, so without it there is
+ * nothing to read them from, and the server's defaults (all on) must not stand in for a policy somebody switched off.
+ */
+export function closedExperience(): ResolvedExperience {
+  return {
+    messageActions: { copy: false, regenerate: false, edit: false },
+    history: { rename: false, pin: false, bulkDelete: false },
+    feedback: { enabled: false, comments: false, reasons: [], maxCommentLength: 0 },
+    export: { enabled: false, includeTools: false, formats: [] },
+    titles: false,
+  };
+}
+
+/**
  * `AgentInfo.metadata` as the API shows it: the host's keys, with `welcome`, `starters` and `experience` filled in from the settings
  * (a `welcome` or `starters` the host put in `metadata` itself wins; so do the fields of its `experience`).
  */

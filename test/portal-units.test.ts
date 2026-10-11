@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import { readActions } from "../src/host.js";
 import { CLIENT_TOOL_GRACE_SECONDS, recordableResolution, stampDeadlines } from "../src/hitl.js";
-import { effectiveExperience, experienceFromMetadata, mergeExperience, normalizeReasons, normalizeStarters, normalizeWelcome, resolveExperience } from "../src/experience.js";
+import { closedExperience, effectiveExperience, experienceFromMetadata, mergeExperience, normalizeReasons, normalizeStarters, normalizeWelcome, resolveExperience } from "../src/experience.js";
 import { exportFileName, htmlContentSecurityPolicy, messageText, renderHtml, renderJson, renderMarkdown, resolveLabels } from "../src/export.js";
 import type { Transcript } from "../src/export.js";
 import { assertTitleGeneration, cleanTitle, titlePrompt } from "../src/titles.js";
@@ -107,6 +107,23 @@ describe("experience", () => {
     expect(resolved.titles).toBe(true);
     const off = resolveExperience({ config: { export: { enabled: false, includeTools: true } }, titles: false, pdf: true });
     expect(off.export).toEqual({ enabled: false, includeTools: false, formats: [] });
+  });
+
+  it("closes every switch for an agent that cannot be resolved, whatever the server's defaults are", () => {
+    const closed = closedExperience();
+    expect(closed).toEqual({
+      messageActions: { copy: false, regenerate: false, edit: false },
+      history: { rename: false, pin: false, bulkDelete: false },
+      feedback: { enabled: false, comments: false, reasons: [], maxCommentLength: 0 },
+      export: { enabled: false, includeTools: false, formats: [] },
+      titles: false,
+    });
+    // the defaults it stands in for are all on
+    const defaults = resolveExperience({ config: {}, titles: false, pdf: false });
+    expect(defaults.export.enabled && defaults.feedback.enabled && defaults.history.pin).toBe(true);
+    // and every call gives a fresh object, so a caller cannot change what the next one sees
+    closed.export.enabled = true;
+    expect(closedExperience().export.enabled).toBe(false);
   });
 });
 

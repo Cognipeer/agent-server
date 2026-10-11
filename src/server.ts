@@ -193,7 +193,7 @@ import {
 } from "./files/images.js";
 import { runWithTurnFiles, type TurnFiles } from "./files/turn.js";
 import { NotFoundError as NotFoundErrorClass } from "./types.js";
-import { experienceMetadata, resolveExperience, type ResolveInputs } from "./experience.js";
+import { closedExperience, experienceMetadata, resolveExperience, type ResolveInputs } from "./experience.js";
 import { assertTitleGeneration, generateConversationTitle } from "./titles.js";
 import {
   DEFAULT_EXPORT_MAX_MESSAGES,
@@ -1007,7 +1007,7 @@ export class AgentServer {
     return agent?.titleGeneration ?? this.config.titleGeneration;
   }
 
-  private experienceInputs(registration?: Pick<AgentRegistration, "info" | "experience" | "titleGeneration">): ResolveInputs {
+  private experienceInputs(registration: Pick<AgentRegistration, "info" | "experience" | "titleGeneration">): ResolveInputs {
     return {
       config: this.config,
       agentExperience: registration?.experience,
@@ -1017,12 +1017,31 @@ export class AgentServer {
     };
   }
 
-  /** The switches in effect for an agent (an agent that cannot be resolved any more gets the server's). */
-  private experienceFor(registration?: Pick<AgentRegistration, "info" | "experience" | "titleGeneration">): ResolvedExperience {
-    return resolveExperience(this.experienceInputs(registration));
+  /**
+   * The switches in effect for an agent. An agent that cannot be resolved (it left the registry or the host's catalog, or the host's
+   * `agents` function failed) gets {@link closedExperience}, not the server's defaults: the switches are the agent's policy, and a
+   * conversation must not become exportable, ratable or editable because the agent that forbade it is gone.
+   */
+  private experienceFor(registration: Pick<AgentRegistration, "info" | "experience" | "titleGeneration"> | undefined): ResolvedExperience {
+    return registration ? resolveExperience(this.experienceInputs(registration)) : closedExperience();
   }
 
-  /** 403 `action_disabled` when the agent's experience switches the action off. */
+  /** The 403 for an action that the experience switches (or the missing agent) rule out. */
+  private experienceDenied(
+    registration: unknown,
+    { code, what, setting }: { code: string; what: string; setting: string }
+  ): { statusCode: 403; code: string; message: string; details: Record<string, unknown> } {
+    return registration
+      ? { statusCode: 403, code, message: `${what} is switched off for this agent`, details: { setting } }
+      : {
+          statusCode: 403,
+          code,
+          message: `${what} is not available because the agent of this conversation is no longer offered`,
+          details: { setting, reason: "agent_unavailable" },
+        };
+  }
+
+  /** 403 `action_disabled` when the agent's experience switches the action off (or the agent cannot be resolved). */
   private assertExperience(
     registration: Pick<AgentRegistration, "info" | "experience" | "titleGeneration"> | undefined,
     group: "messageActions" | "history",
@@ -1030,14 +1049,7 @@ export class AgentServer {
     what: string
   ): void {
     const flags = this.experienceFor(registration)[group] as unknown as Record<string, boolean>;
-    if (flags[key] === false) {
-      throw {
-        statusCode: 403,
-        code: "action_disabled",
-        message: `${what} is switched off for this agent`,
-        details: { setting: `experience.${group}.${key}` },
-      };
-    }
+    if (flags[key] === false) throw this.experienceDenied(registration, { code: "action_disabled", what, setting: `experience.${group}.${key}` });
   }
 
   /**
@@ -2309,7 +2321,7 @@ export class AgentServer {
     const agent = await this.getAgentFor(conversation.agentId, ctx.context).catch(() => undefined);
     const settings = this.experienceFor(agent).feedback;
     if (!settings.enabled) {
-      throw { statusCode: 403, code: "feedback_disabled", message: "Feedback is switched off for this agent" };
+      throw this.experienceDenied(agent, { code: "feedback_disabled", what: "Feedback", setting: "experience.feedback.enabled" });
     }
 
     const invalid = (message: string, details?: Record<string, unknown>) => ({ statusCode: 400, code: "invalid_feedback", message, ...(details ? { details } : {}) });
@@ -2483,7 +2495,7 @@ export class AgentServer {
     const agent = await this.getAgentFor(conversation.agentId, ctx.context).catch(() => undefined);
     const settings = this.experienceFor(agent).export;
     if (!settings.enabled) {
-      throw { statusCode: 403, code: "export_disabled", message: "Downloading conversations is switched off for this agent" };
+      throw this.experienceDenied(agent, { code: "export_disabled", what: "Downloading conversations", setting: "experience.export.enabled" });
     }
 
     const format = (one(ctx.query.format) ?? "md").toLowerCase() as ExportFormat;

@@ -4,7 +4,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { createAgentServer } from "../src/index.js";
+import { createAgentServer, hostAgentRegistration } from "../src/index.js";
 import type {
   AgentServerConfig,
   AuditEntry,
@@ -898,6 +898,141 @@ function suite() {
 // Client tools
 // ============================================================================
 
+/**
+ * The switches are the agent's policy. When the agent of a conversation cannot be resolved any more (it left the host's catalog, or the
+ * host's `agents` function failed) the server must not fall back to its own defaults, which are all on.
+ */
+function unresolvedAgentSuite() {
+  type Catalog = { present: boolean; failing: boolean };
+
+  /** A portal-like host: one agent whose switches are off, offered while `catalog.present`. */
+  async function portalLike(switches: Record<string, unknown> | undefined, config: Partial<AgentServerConfig> = {}) {
+    const catalog: Catalog = { present: true, failing: false };
+    const user = freshUser();
+    const server = createAgentServer({
+      basePath: "/api",
+      storage: currentStorage(),
+      resolveContext: () => ({ user: { id: user }, data: {} }),
+      agents: () => {
+        if (catalog.failing) throw new Error("catalog unavailable");
+        return catalog.present
+          ? [hostAgentRegistration({ info: { id: "h", name: "Host" }, invoke: async () => ({ content: "answer" }), ...(switches ? { experience: switches } : {}) } as any)]
+          : [];
+      },
+      ...quiet(config),
+    } as AgentServerConfig);
+    const call = (method: string, path: string, extra: { body?: unknown; query?: Record<string, string> } = {}) =>
+      server.handleRoute(method, path, { query: extra.query ?? {}, body: extra.body, headers: {} });
+    const id = (((await call("POST", "/conversations", { body: { agentId: "h" } })).body as any).conversation.id) as string;
+    const sent = await call("POST", `/conversations/${id}/messages`, { body: { message: "hello" } });
+    const answerId = (sent.body as any).response.id as string;
+    return { catalog, call, id, answerId };
+  }
+
+  const OFF = {
+    messageActions: { copy: false, regenerate: false, edit: false },
+    history: { rename: false, pin: false, bulkDelete: false },
+    feedback: { enabled: false, comments: false },
+    export: { enabled: false, includeTools: false },
+  };
+
+  it("keeps a policy switched off after the agent has left the catalog", async () => {
+    const t = await portalLike(OFF);
+    const exportIt = (format: string) => t.call("GET", `/conversations/${t.id}/export`, { query: { format } });
+    const rate = () => t.call("POST", `/conversations/${t.id}/messages/${t.answerId}/feedback`, { body: { rating: "up", comment: "x" } });
+
+    // with the agent in the catalog every action is refused
+    expect(errorOf(await exportIt("md")).code).toBe("export_disabled");
+    expect(errorOf(await rate()).code).toBe("feedback_disabled");
+    expect(errorOf(await t.call("PATCH", `/conversations/${t.id}`, { body: { pinned: true } })).code).toBe("action_disabled");
+
+    t.catalog.present = false;
+
+    // ... and still is once the agent is gone
+    for (const format of ["md", "json", "html"]) {
+      const res = await exportIt(format);
+      expect(res.status).toBe(403);
+      expect(errorOf(res)).toMatchObject({ code: "export_disabled", details: { reason: "agent_unavailable" } });
+      expect(res.raw).toBeUndefined();
+    }
+    const withTools = await t.call("GET", `/conversations/${t.id}/export`, { query: { format: "json", tools: "1" } });
+    expect(errorOf(withTools).code).toBe("export_disabled");
+
+    const rated = await rate();
+    expect(rated.status).toBe(403);
+    expect(errorOf(rated)).toMatchObject({ code: "feedback_disabled", details: { reason: "agent_unavailable" } });
+
+    const pinned = await t.call("PATCH", `/conversations/${t.id}`, { body: { pinned: true } });
+    expect(errorOf(pinned)).toMatchObject({ code: "action_disabled", details: { setting: "experience.history.pin", reason: "agent_unavailable" } });
+    const renamed = await t.call("PATCH", `/conversations/${t.id}`, { body: { title: "renamed" } });
+    expect(errorOf(renamed)).toMatchObject({ code: "action_disabled", details: { setting: "experience.history.rename", reason: "agent_unavailable" } });
+
+    const bulk = await t.call("POST", "/conversations/bulk-delete", { body: { ids: [t.id] } });
+    expect(bulk.status).toBe(200);
+    expect((bulk.body as any).deleted).toBe(0);
+    expect((bulk.body as any).results[0]).toMatchObject({ id: t.id, status: "error" });
+
+    // nothing changed: the conversation is still there, unpinned and unrated
+    const shown = (await t.call("GET", `/conversations/${t.id}`)).body as any;
+    expect(shown.conversation.metadata?.pinned).toBeFalsy();
+    expect(shown.conversation.title ?? "").not.toBe("renamed");
+    expect(shown.messages.map((m: any) => m.feedback).filter(Boolean)).toEqual([]);
+  });
+
+  it("does not let the server's defaults, which are all on, stand in for the agent", async () => {
+    // the agent never switched anything off, so while it is offered everything works ...
+    const t = await portalLike(undefined);
+    expect((await t.call("GET", `/conversations/${t.id}/export`, { query: { format: "md" } })).status).toBe(200);
+    expect((await t.call("POST", `/conversations/${t.id}/messages/${t.answerId}/feedback`, { body: { rating: "up" } })).status).toBe(200);
+
+    // ... and once it cannot be resolved nothing is assumed
+    t.catalog.present = false;
+    expect(errorOf(await t.call("GET", `/conversations/${t.id}/export`, { query: { format: "md" } })).code).toBe("export_disabled");
+    expect(errorOf(await t.call("POST", `/conversations/${t.id}/messages/${t.answerId}/feedback`, { body: { rating: "down" } })).code).toBe("feedback_disabled");
+    expect(errorOf(await t.call("PATCH", `/conversations/${t.id}`, { body: { pinned: true } })).code).toBe("action_disabled");
+
+    // the agent coming back brings its own switches back
+    t.catalog.present = true;
+    expect((await t.call("GET", `/conversations/${t.id}/export`, { query: { format: "md" } })).status).toBe(200);
+    expect((await t.call("PATCH", `/conversations/${t.id}`, { body: { pinned: true } })).status).toBe(200);
+  });
+
+  it("holds even when the server's own settings switch things on", async () => {
+    const t = await portalLike(undefined, { experience: { export: { enabled: true, includeTools: true }, feedback: { enabled: true } } });
+    t.catalog.present = false;
+    expect(errorOf(await t.call("GET", `/conversations/${t.id}/export`, { query: { format: "json", tools: "1" } })).code).toBe("export_disabled");
+    expect(errorOf(await t.call("POST", `/conversations/${t.id}/messages/${t.answerId}/feedback`, { body: { rating: "up" } })).code).toBe("feedback_disabled");
+  });
+
+  it("refuses, not fails, when the host cannot say which agents exist", async () => {
+    const t = await portalLike(OFF);
+    t.catalog.failing = true;
+    const res = await t.call("GET", `/conversations/${t.id}/export`, { query: { format: "md" } });
+    // the conversation lookup itself needs no agent, so the refusal comes from the closed switches
+    expect(res.status).toBe(403);
+    expect(errorOf(res).code).toBe("export_disabled");
+    expect(errorOf(await t.call("POST", `/conversations/${t.id}/messages/${t.answerId}/feedback`, { body: { rating: "up" } })).code).toBe("feedback_disabled");
+  });
+
+  it("leaves the person able to read and delete their own history", async () => {
+    const t = await portalLike(OFF);
+    t.catalog.present = false;
+    const shown = await t.call("GET", `/conversations/${t.id}`);
+    expect(shown.status).toBe(200);
+    expect(((shown.body as any).messages as any[]).map((m) => m.content)).toEqual(["hello", "answer"]);
+    expect((await t.call("DELETE", `/conversations/${t.id}`)).status).toBe(204);
+  });
+
+  it("does not offer regeneration or editing for it", async () => {
+    const t = await portalLike(undefined);
+    t.catalog.present = false;
+    const regenerated = await t.call("POST", `/conversations/${t.id}/messages/${t.answerId}/regenerate`);
+    expect(regenerated.status).toBe(404);
+    const edited = await t.call("POST", `/conversations/${t.id}/messages/${t.answerId}/edit`, { body: { content: "changed" } });
+    expect(edited.status).toBe(404);
+  });
+}
+
 function clientToolSuite() {
   const tool = (extra: Record<string, unknown> = {}) => ({
     id: "ct1",
@@ -1204,6 +1339,7 @@ for (const name of PROVIDER_NAMES) {
       active = undefined;
     });
     suite();
+    describe("an agent that cannot be resolved", unresolvedAgentSuite);
     describe("client tools", clientToolSuite);
     describe("rate limits and audit", hooksSuite);
   });

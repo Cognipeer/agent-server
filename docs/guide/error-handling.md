@@ -55,9 +55,9 @@ Every `error.code` the server answers with. Besides `400` / `401` / `404`, the o
 | 403 | `action_forbidden` | hitl.authorizeResolve says you may not answer this request |
 | 403 | `budget_forbidden` | Raising or removing a budget needs the authorizeBudget option |
 | 403 | `attachments_disabled` | The agent does not take attachments |
-| 403 | `action_disabled` | The agent's experience switches this action off (regenerate, edit, rename, pin ...); details.setting says which |
-| 403 | `feedback_disabled` | The agent does not take feedback on its answers |
-| 403 | `export_disabled` | Downloading conversations (or including tool calls in the download) is switched off for the agent |
+| 403 | `action_disabled` | The agent's experience switches this action off (regenerate, edit, rename, pin ...), or the conversation's agent cannot be resolved any more (`details.reason: "agent_unavailable"`); details.setting says which |
+| 403 | `feedback_disabled` | The agent does not take feedback on its answers (or cannot be resolved any more: `details.reason: "agent_unavailable"`) |
+| 403 | `export_disabled` | Downloading conversations (or including tool calls in the download) is switched off for the agent, or the agent cannot be resolved any more (`details.reason: "agent_unavailable"`) |
 | 404 | `NOT_FOUND` | The agent, conversation, message, task, file or tool does not exist (or is not yours) |
 | 409 | `action_pending` | A message or continue while a request is open (details.pendingActionIds) |
 | 409 | `action_not_pending` | The action is unknown, already answered, or cannot be resumed |

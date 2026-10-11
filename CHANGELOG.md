@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A conversation whose agent cannot be resolved no longer falls back to the server's all-on experience defaults.** When the agent had left the registry or the host's catalog (or the host's `agents` function failed), export, feedback, rename, pin and bulk delete were allowed even though the agent had switched them off. They are now refused with the usual `export_disabled` / `feedback_disabled` / `action_disabled` and `error.details.reason: "agent_unavailable"`. Reading the conversation and deleting it one at a time still work. New `closedExperience()` (internal) is the all-off set.
+
 ## [0.3.0] - 2026-10-10
 
 Human-in-the-loop: agents can pause for a tool approval or a question, and a client resumes them. The pause protocol is additive: an agent that never pauses behaves as before. The storage providers were also brought in line with one tested contract, which changes a few behaviours that used to differ between them (see Changed and Fixed).
