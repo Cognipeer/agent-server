@@ -101,7 +101,14 @@ at the first request; `await server.expirePendingActions()` does it now):
 | `cancel` | the pause is dropped - the lapsed requests as `expired`, the others as `cancelled` - the agent is not called, and the turn ends with `stopReason: "cancelled"` (`session.status_idle` with `detail: "action_expired"`). The conversation takes a new message. |
 
 The policy is the one the pause was taken with: changing `hitl.onTimeout` later does not change a pause that is already waiting. If the agent can no longer be found, or the
-[budget](./budgets.md) is used up, a `deny` pause is cancelled instead (there is nobody to carry on). A task whose request lapses under `cancel` ends `cancelled`; under `deny` it carries on.
+[budget](./budgets.md) is used up, a `deny` pause is cancelled instead (there is nobody to carry on) - and when it is the agent that cannot be found, the server logs a warning that says so.
+
+::: warning The sweep runs outside any request
+The sweep finds the agent with a context of its own: `{ user: <the conversation's owner>, data: { system: true, timeout: true } }` - it has no cookie, header or tenant. An `agents` registry
+that is a function of the request (`agents: (ctx) => tenantAgents(ctx.data.tenant)`) and storage that is scoped by `ctx.data` therefore have to **also resolve for that context**: return the agent (and
+reach the data) when `ctx.data.system` is true, e.g. by remembering the tenant on the conversation (`metadata`) and reading it back here. A registry that returns nothing for it makes every
+`deny` pause end as a cancel, without the agent being told (the host's `resolveAction` / `cancel` are not called).
+::: A task whose request lapses under `cancel` ends `cancelled`; under `deny` it carries on.
 
 The events say it: `action.resolved` with `expired: true`, `resolved_by: "system:timeout"`, `channel: "timeout"` (`status: "rejected"` for a refusal, `"expired"` for a dropped request).
 

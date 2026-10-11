@@ -174,6 +174,13 @@ createAgentServer({
 });
 ```
 
+A per-request registry is also asked for work that belongs to no request: the timeout sweep of lapsed approvals looks the agent up with `{ user: <owner>, data: { system: true, timeout: true } }`
+(recovery and pruning reach only the storage provider, with `{ data: { system: true } }`). Return the agent for that context too - for example by keeping the tenant on the conversation's `metadata` and reading
+it from there - or a `deny` pause that lapses is cancelled instead of denied, and the host agent is not told (the server logs a warning). See [Approvals & Questions](./human-in-the-loop.md#requests-that-lapse).
+
+A per-request agent that accepts bigger files than the server's default needs `limits.maxBodySize` (or the Fastify `uploadBodyLimit`) set above its largest file: the default body limit is derived from
+the agents registered at startup only, see [Files](./file-management.md#adapters).
+
 A definition that cannot work (no `info.id`, no `invoke`) throws when it is registered, not at the first message. `files`, `hitl`, `budget` and `pricing` in the definition are the per-agent
 settings of every other agent.
 

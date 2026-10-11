@@ -102,6 +102,7 @@ do not separate tenants: a multi-tenant host resolves a user for each request, s
 `maskServerErrors` keeps internal error text away from the client; use it whenever the audience is not the operator (see [Error Handling](../guide/error-handling)).
 `allowRememberApproval: false` always asks again, whatever the person ticked ("don't ask again", see [Approvals & Questions](../guide/human-in-the-loop#remembered-tools)).
 `titleGeneration` asks an OpenAI-compatible endpoint (`baseUrl` + `path`, default `/v1/chat/completions`) for a three- or four-word title after the first exchange; a failure leaves the conversation untitled.
+The turn holds its conversation while it waits, so the call is bounded: `timeoutMs` (default 10 000) cuts it short, and cancelling the turn ends it at once; a title that did not arrive in time is skipped.
 
 `HitlConfig` (every field optional; an agent overrides `timeoutMinutes`, `onTimeout` and `validateApprovedArgs`, see [Approvals & Questions](../guide/human-in-the-loop)):
 

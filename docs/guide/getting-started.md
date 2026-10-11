@@ -174,7 +174,7 @@ We recommend using environment variables for configuration:
 # Database
 DATABASE_URL=postgresql://user:pass@localhost:5432/mydb
 
-# Authentication
+# Authentication (the secret your JWTs are signed with; the server verifies their signature with it)
 JWT_SECRET=your-secret-key
 
 # Server

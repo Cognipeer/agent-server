@@ -122,6 +122,8 @@ const storage = createPostgresProvider({
   connectionString: process.env.DATABASE_URL!,
 });
 
+// Verifies each token's signature with this secret (HS256 by default). For an identity provider with
+// rotating keys (JWKS), write an AuthProvider on a JWT library instead - see Authentication.
 const authProvider = createJWTAuthProvider({
   secret: process.env.JWT_SECRET!,
   extractUserId: (payload) => payload.sub as string,
@@ -271,8 +273,10 @@ while (true) {
 
 ## Uploading Files
 
-A file uploaded as itself (`POST /files?name=...` with the file's own `Content-Type`, see [Files](./file-management.md#uploading)) is read with `request.arrayBuffer()`;
-JSON requests are read with `request.json()` as before. Next.js and your host may have their own request size limits - make sure they allow your largest file.
+The adapter authenticates a request before it reads its body, and then reads the body in pieces, refusing it with `413` as soon as it is over `limits.maxBodySize` (by default about 1.4 times the largest
+`files.maxFileSize`, plus 64 KiB; set the option when your agents are built per request, see [Files](./file-management.md#adapters)). A file uploaded as itself (`POST /files?name=...` with the file's
+own `Content-Type`, see [Files](./file-management.md#uploading)) arrives as bytes; JSON requests are parsed as before. Next.js and your host may have their own, smaller request size limits - make sure they
+allow your largest file.
 
 ## Error Handling
 

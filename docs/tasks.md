@@ -206,6 +206,8 @@ Each task gets a conversation of its own (`task.conversationId`, created when it
   and the next user comment is the answer. Handlers now receive the task's real conversation id (it used to be `task_<id>`), and `metadata.comments` as before.
 - Follow a task live with `GET /conversations/:conversationId/events/stream`; list a conversation's tasks with `GET /tasks?conversationId=`.
 - The task's conversation is an ordinary conversation of the task's user (`metadata: { source: 'task', taskId }`), so it also shows up in `GET /conversations`; a UI that lists chats can filter on `metadata.source`. It gets no generated title.
+  `taskId` (and `source: 'task'`) are the server's: a client cannot set them when it creates or updates a conversation, and a metadata update keeps the ones a task conversation has. A run only drives the task
+  that points back at its conversation (same `conversationId`, same user), whatever the conversation's metadata says.
 
 Statuses: `pending` -> `running` -> `completed` | `failed` | `cancelled`, or `waiting_for_input` (then `running` again). A task that was `running` when its
 server died is set to `failed` ("The server stopped while the task was running") at the next start, see [Recovery](/guide/runs#recovery).

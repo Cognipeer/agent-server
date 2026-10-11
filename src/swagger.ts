@@ -52,6 +52,7 @@ export const ERROR_CODES: ReadonlyArray<{ code: string; status: number; meaning:
   { code: "PAYLOAD_TOO_LARGE", status: 413, meaning: "The request body is over the body limit" },
   { code: "STORAGE_LIMIT_EXCEEDED", status: 413, meaning: "The storage provider cannot hold this much" },
   { code: "unsupported_file_type", status: 415, meaning: "The file's type is not one the agent accepts" },
+  { code: "unsupported_media_type", status: 415, meaning: "An upload sent as multipart/form-data or a form (send the raw bytes with ?name=, or the JSON form)" },
   { code: "INTERNAL_ERROR", status: 500, meaning: "Anything unexpected (the text is generic with maskServerErrors)" },
   { code: "budget_misconfigured", status: 500, meaning: "The agent has a budget but no pricing" },
   { code: "invalid_host_result", status: 500, meaning: "A host agent returned something the server cannot use" },
@@ -1649,7 +1650,7 @@ function generatePaths(
           },
           413: { description: "Request body too large", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
           415: {
-            description: "The agent does not accept this type of file (unsupported_file_type)",
+            description: "The agent does not accept this type of file (unsupported_file_type), or the upload is a multipart / form request (unsupported_media_type)",
             content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
         },

@@ -379,7 +379,7 @@ await storage.deleteFile('file-123');
 ```typescript
 const events = storage.events!;
 
-// append: atomic, ordered; seq is 1, 2, 3 ... per conversation, with no gaps or repeats
+// append: atomic, ordered; seq is 1, 2, 3 ... per conversation, never repeated (MongoDB can leave a hole after a failed append)
 const stored = await events.append('conv_1', [
   { type: 'user.message', data: { content: 'hi' }, runId: 'run_1' },
   { type: 'session.status_running', data: { trigger: 'message' }, runId: 'run_1' },

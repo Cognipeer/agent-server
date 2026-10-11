@@ -72,7 +72,7 @@ GET /conversations
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | agentId | string | Filter by agent ID |
-| userId | string | Filter by user ID |
+| userId | string | Whose conversations, only for a request that carries no identity of its own (see below) |
 | limit | number | Max results (default: 20) |
 | offset | number | Pagination offset (default: 0) |
 | orderBy | string | `createdAt` (default) or `updatedAt` (last activity) |
@@ -100,8 +100,9 @@ GET /conversations
 
 `runtime` says whether the conversation is running, waiting for a human or idle, and why its last turn stopped - see [Runs, Cancel & Reattach](../guide/runs).
 
-The list is **one user's**: the token user, `context.user` from `resolveContext`, or - without `resolveContext` - `?userId=`. A request that names nobody would list everyone's conversations and is
-refused with `401 identity_required`, unless the server sets `allowAnonymousList` (see [Request Context](../guide/request-context#who-may-list)). With `resolveContext`, `userId` in the query is ignored.
+The list is **one user's**: `context.user` from `resolveContext`, else the token user (or `auth.resolveUserId`), else - only when the request carries no identity at all - `?userId=`. An identity the server
+established always wins: with token auth or `resolveContext`, `userId` in the query is ignored (see [Request Context](../guide/request-context#which-identity-counts)). A request that names nobody would list
+everyone's conversations and is refused with `401 identity_required`, unless the server sets `allowAnonymousList` (see [Request Context](../guide/request-context#who-may-list)).
 
 ### Create Conversation
 
@@ -119,6 +120,10 @@ POST /conversations
   "budget": { "maxCostUsd": 2, "onReach": "pause" }
 }
 ```
+
+The conversation belongs to the identity the server established (the `resolveContext` user, else the token user or `auth.resolveUserId`). A `userId` in the body is used only when the request carries no
+identity at all, and is ignored otherwise (see [Request Context](../guide/request-context#which-identity-counts)). `metadata.taskId` is the server's (it links a task's own conversation): it is dropped
+from what a client sends on create and update, and `metadata.source: "task"` likewise.
 
 `budget` is optional: a spend limit for this conversation (`null`: none). Without it the conversation starts with the agent's (`AgentRegistration.budget`, else the server's `budget`). A limit above that default needs
 the `authorizeBudget` option (`403 budget_forbidden`); a malformed one is `400 invalid_budget`, an agent that cannot price its calls `400 budget_unavailable`. See [Usage & Budgets](../guide/budgets).

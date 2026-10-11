@@ -81,18 +81,22 @@ A request without a `Content-Type` is the JSON form. The answer is `201 { file }
 
 The stored type is the declared one without parameters (`text/plain; charset=utf-8` becomes `text/plain`); `application/octet-stream` - or a value that is not a MIME type - is guessed from the extension. The file is checked against the settings of the conversation's agent: enabled, size (`400` with `details.reason: "file_too_large"`; the base64 form is checked before it is decoded), type, and how many files the conversation already holds. An empty file is `400 File is empty`.
 
-Multipart form uploads are not supported: send the bytes as the body.
+Multipart form uploads are not supported: a `multipart/*` or `application/x-www-form-urlencoded` body is answered `415 unsupported_media_type` (and not read) instead of being stored as a file that is the whole form envelope. Send the bytes as the body, or use the JSON form.
+
+Uploads that arrive together are let in one after the other per conversation, so `maxFiles` holds for them; a file stored by another server instance at the same moment is caught by a check after the file is stored (the oldest `maxFiles` files keep their place, the later one is taken back out and answered `409 too_many_files`).
+
+A file uploaded **without** a `conversationId` counts against no conversation's `maxFiles` and cannot be attached to a message. It is bounded by `maxFileSize` and by `retentionDays` (the retention sweep deletes it); if you expose uploads to many users, put a per-user quota or rate limit in front of the route.
 
 ### Adapters
 
-The adapters hand the route the bytes:
+The adapters hand the route the bytes. The default body limit of the Node, Express and Next.js adapters is derived from the **registered** agents' `files.maxFileSize` (`server.maxUploadBytes()`). An agent your host builds **per request** (`agents: (ctx) => [...]`) is not known when the server starts: if one of them accepts bigger files than the server's default, set `limits.maxBodySize` (Node, Express, Next.js; Node also takes `maxBodyBytes`) or the Fastify `uploadBodyLimit` above your largest file, or its uploads are refused with `413` although the agent advertises the size.
 
 | Adapter | |
 |---------|--|
 | Node (`createNodeHandler`) | reads the body as bytes for `POST /files` with a non-JSON `Content-Type`; the limit is `limits.maxBodySize` or `maxBodyBytes`, by default ~1.4 x the largest `files.maxFileSize` (`server.maxUploadBytes()`) |
 | Fastify | the plugin registers buffer parsers for the types Fastify has none for (and `text/plain`) in its own scope. `uploadBodyLimit` is the body limit of `POST /files` alone: set it above your largest file |
 | Express | takes `req.body` when it is a Buffer (`express.raw({ type: '*/*' })` on the upload route), else reads the request itself |
-| Next.js | reads `request.arrayBuffer()` |
+| Next.js | authenticates first, then reads the body in pieces and answers `413` once it is over `limits.maxBodySize` (by default ~1.4 x the largest `files.maxFileSize`, as for Node) |
 
 ## Who sees a file
 

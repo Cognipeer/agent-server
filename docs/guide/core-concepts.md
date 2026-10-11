@@ -143,7 +143,7 @@ const auth = createTokenAuthProvider({
   tokens: { 'api-key-1': 'user-1' },
 });
 
-// JWT (reads the claims; see Authentication for what it checks)
+// JWT (verifies the signature with the secret; see Authentication for what else it checks)
 const auth = createJWTAuthProvider({
   secret: 'your-secret',
 });

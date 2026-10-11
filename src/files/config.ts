@@ -234,6 +234,21 @@ export function contentDispositionHeader(disposition: FileDisposition, fileName:
   return `${disposition}; filename="${ascii}"; filename*=UTF-8''${encoded}`;
 }
 
+/** Whether `contentType` is a form encoding (`multipart/*`, `application/x-www-form-urlencoded`), which the upload route does not take. */
+export function isFormContentType(contentType: string | string[] | undefined): boolean {
+  const raw = Array.isArray(contentType) ? contentType[0] : contentType;
+  if (!raw) return false;
+  const base = baseMimeType(raw);
+  return base.startsWith("multipart/") || base === "application/x-www-form-urlencoded";
+}
+
+/** Whether `POST /files` is called with a form encoding: answered 415 by the server, so an adapter need not read the body. */
+export function isUnsupportedUploadRequest(method: string, routePath: string, contentType: string | string[] | undefined): boolean {
+  if (method.toUpperCase() !== "POST") return false;
+  const path = routePath.split("?")[0]!.replace(/\/+$/, "");
+  return path === "/files" && isFormContentType(contentType);
+}
+
 /** Whether an upload request carries the file as its raw body instead of JSON. */
 export function isRawUploadRequest(method: string, routePath: string, contentType: string | string[] | undefined): boolean {
   if (method.toUpperCase() !== "POST") return false;

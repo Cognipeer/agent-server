@@ -198,6 +198,7 @@ export {
   SESSION_FILES_READ_TOOL,
   SESSION_FILES_VIEW_IMAGE_TOOL,
   isRawUploadRequest,
+  isUnsupportedUploadRequest,
 } from "./files/config.js";
 export { defaultExtractText } from "./files/extract.js";
 

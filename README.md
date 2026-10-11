@@ -289,8 +289,9 @@ const authProvider = createJWTAuthProvider({
 });
 ```
 
-The built-in JWT provider is a basic one: it reads the claims and checks expiry, issuer and audience. Verify the token's signature in front of the server, or in your own
-`AuthProvider` with a JWT library - see [docs/guide/authentication.md](docs/guide/authentication.md).
+The built-in JWT provider verifies the token's signature with the configured key (HS256/384/512, RS256/384/512 or ES256/384/512; the algorithm comes from the configuration, never from the
+token) and checks expiry, issuer and audience. It holds one static key and has no JWKS support: for keys that rotate, verify in front of the server or write an `AuthProvider` with a JWT
+library - see [docs/guide/authentication.md](docs/guide/authentication.md).
 
 ## Custom Agent Handler
 

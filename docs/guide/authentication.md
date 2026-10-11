@@ -60,15 +60,19 @@ import { createJWTAuthProvider } from '@cognipeer/agent-server';
 
 const authProvider = createJWTAuthProvider({
   secret: process.env.JWT_SECRET!,
-  algorithm: 'HS256',              // Default; 'RS256' with a public key as the secret
+  algorithm: 'HS256',              // Default; HS256/384/512 (secret), RS256/384/512 and ES256/384/512 (the PEM public key as the secret)
   issuer: 'my-app',                // Optional - check the issuer
-  audience: 'my-api',              // Optional - check the audience
-  extractUserId: (payload) => payload.sub as string,   // Default: sub, then userId, then user_id
+  audience: 'my-api',              // Optional - check the audience (a string or a list; the token's `aud` may be either)
+  extractUserId: (payload) => payload.sub as string,   // Default: sub, then userId, then user_id (a non-empty string)
 });
 ```
 
-::: warning A basic provider
-The built-in JWT provider reads a token's claims and checks `exp`, `issuer` and `audience`. It does **not** verify the signature and has no JWKS support. Verify the token in front of the
+The provider **verifies the signature** with the key you configure, then checks `exp`, `nbf`, `iss` and `aud`. The key type comes from the configuration and never from the token:
+a token that says `alg: "none"`, names any algorithm other than the configured one, or is signed with another key is refused. A `secret` is required (creating the provider without one throws).
+A token without `exp` is accepted unless you set `requireExp: true`; `clockToleranceSec` allows for clock drift.
+
+::: warning No JWKS
+The built-in provider has one static key: it does not fetch keys, so it cannot follow a key rotation. For an identity provider that publishes a JWKS, verify the token in front of the
 server (a gateway, an identity-aware proxy), or write an `AuthProvider` that verifies it with a JWT library such as `jose`:
 
 ```typescript
@@ -98,7 +102,9 @@ interface AuthConfig {
   // Enable authentication
   enabled: boolean;
   
-  // Auth provider instance (without one, token auth is off)
+  // Auth provider instance. Required when `enabled` is true: createAgentServer throws without one,
+  // so a missing provider cannot leave the server open. To name the user some other way, set
+  // `enabled: false` and use `resolveUserId` (or `resolveContext`).
   provider?: AuthProvider;
   
   // Header name for token (default: 'Authorization')
@@ -241,7 +247,8 @@ auth: {
 ### Listing needs a user
 
 `GET /conversations` and `GET /tasks` return one user's records, so a request that names no user is refused with `401 identity_required` - unless the server sets `allowAnonymousList: true`
-(a single-user tool or demo). Token auth, `resolveContext` with a `user`, `resolveUserId` or - without `resolveContext` - a `?userId=` query parameter all name a user.
+(a single-user tool or demo). Token auth, `resolveContext` with a `user`, `resolveUserId` or - without any of those - a `?userId=` query parameter all name a user. They are tried in that order and the
+first one wins: with token auth, a `?userId=` or a `userId` in a create body does not change whose conversations are listed or created; it is only taken when nothing else says who is asking.
 See [Request Context](./request-context.md#who-may-list).
 
 ## Several users

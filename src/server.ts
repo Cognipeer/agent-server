@@ -153,6 +153,7 @@ import {
   attachmentsCapability,
   contentDispositionHeader,
   fileDisposition,
+  isFormContentType,
   isMimeAllowed,
   isVisionImageMime,
   isWellFormedMime,
@@ -619,6 +620,12 @@ export class AgentServer {
       for (const registration of config.agents) this.addAgent(registration.info.id, registration);
     }
     this.validateBudgets();
+    // Token auth that is switched on but has nobody to check tokens would let every request in
+    if (config.auth?.enabled && !config.auth.provider) {
+      throw new Error(
+        "auth.enabled needs auth.provider (an AuthProvider that validates tokens). To name the user some other way, set auth.enabled to false and use auth.resolveUserId or resolveContext."
+      );
+    }
     const runs = config.runs ?? {};
     const positive = (value: number | undefined, fallback: number) =>
       typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
@@ -966,13 +973,17 @@ export class AgentServer {
   }
 
   /**
-   * Owner to stamp on / filter by. With `resolveContext` configured the resolved
-   * identity is authoritative and client-supplied ids are ignored (otherwise any
-   * caller could read or create data as someone else by passing `userId`).
+   * Owner to stamp on / filter by. An identity the server established is authoritative and a client-supplied id is
+   * ignored (otherwise any caller could list or create data as someone else by passing `userId`):
+   *   1. with `resolveContext`: the resolved `context.user`
+   *   2. otherwise the token user, then `auth.resolveUserId`
+   *   3. only when the request carries no identity at all (an open demo server) the id the client named
    */
   private async effectiveUserId(ctx: RouteContext, requested?: string): Promise<string | undefined> {
     if (this.config.resolveContext) return ctx.context?.user?.id;
-    return requested || ctx.user?.id || (await this.resolveUserId(ctx));
+    const known = ctx.user?.id || (await this.resolveUserId(ctx));
+    if (known) return known;
+    return typeof requested === "string" && requested ? requested : undefined;
   }
 
   /**
@@ -1050,9 +1061,15 @@ export class AgentServer {
    * using the configured OpenAI-compatible provider. Returns undefined if
    * titleGeneration is not configured or the call fails.
    */
-  private async generateTitle(userMessage: string): Promise<string | undefined> {
+  private async generateTitle(userMessage: string, signal?: AbortSignal): Promise<string | undefined> {
     const cfg = this.config.titleGeneration;
     if (!cfg) return undefined;
+    // The call is bounded: it gives up after `timeoutMs` and when the run is cancelled (the turn holds the conversation while it waits)
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    const timer = setTimeout(abort, typeof cfg.timeoutMs === "number" && cfg.timeoutMs > 0 ? cfg.timeoutMs : 10_000);
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
     try {
       const path = cfg.path ?? "/v1/chat/completions";
       const prompt =
@@ -1071,6 +1088,7 @@ export class AgentServer {
           temperature: 0.5,
           max_tokens: 20,
         }),
+        signal: controller.signal,
       });
       if (!res.ok) return undefined;
       const data = await res.json() as { choices?: Array<{ message?: { content?: string } }> };
@@ -1080,6 +1098,9 @@ export class AgentServer {
       return raw.replace(/^["""''']|["""''']$/g, "").trim() || undefined;
     } catch {
       return undefined;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
     }
   }
 
@@ -1721,7 +1742,7 @@ export class AgentServer {
       agentId: body.agentId,
       userId,
       title: body.title,
-      metadata: body.metadata,
+      metadata: this.clientMetadata(body.metadata),
       ...(state && { state }),
     }, ctx.context);
 
@@ -1894,7 +1915,7 @@ export class AgentServer {
     if (body?.budget === undefined || body.title !== undefined || body.metadata !== undefined) {
       conversation = await this.config.storage.updateConversation(conversationId, {
         title: body?.title,
-        metadata: body?.metadata,
+        metadata: this.clientMetadata(body?.metadata, conversation.metadata),
       }, ctx.context);
     }
 
@@ -2368,11 +2389,12 @@ export class AgentServer {
       bus: this.bus,
       maxEventDataBytes: this.runCfg.maxEventDataBytes,
     });
-    const taskId = conversation.metadata?.taskId;
-    if (typeof taskId === "string") run.taskId = taskId;
     this.runs.set(conversationId, run);
 
     try {
+      // The task a conversation runs for is the one that points back at it, for the same user: the metadata alone is not trusted
+      const taskId = conversation.metadata?.taskId;
+      if (typeof taskId === "string" && (await this.taskOwnsConversation(taskId, conversation, ctx.context))) run.taskId = taskId;
       if (this.leasesAvailable) {
         const key = conversationLeaseKey(conversationId);
         const result = await this.config.storage.acquireLease!(
@@ -2408,8 +2430,8 @@ export class AgentServer {
         }
       }
     } catch (error) {
-      await run.lease?.stop();
-      this.runs.delete(conversationId);
+      // (also resolves `released`: whoever waits for this run to give the conversation back is not left waiting for a run that never started)
+      await this.endRun(run);
       throw error;
     }
     return run;
@@ -2430,7 +2452,7 @@ export class AgentServer {
     run.done = (async () => {
       let outcome: TurnOutcome;
       try {
-        if (run.taskId) await this.markTaskRunning(run.taskId, ctx.context);
+        if (run.taskId) await this.markTaskRunning(run.taskId, ctx.context, run.conversationId);
         outcome = await runWithRequestContext(ctx.context!, execute);
       } catch (error) {
         outcome = await this.failRun(run, error);
@@ -2563,6 +2585,13 @@ export class AgentServer {
     const run = await this.beginRun(ctx, conversation, "message", "message", streaming);
     let budget: TurnBudget;
     try {
+      // Read again under the lease: the turn that held the conversation before this one may have stored a pause (or spent
+      // budget) after it was loaded above, and the checks below have to see that
+      const fresh = await this.config.storage.getConversation(conversationId, ctx.context);
+      if (!fresh) {
+        throw { statusCode: 404, code: "NOT_FOUND", message: `Conversation not found: ${conversationId}` } as NotFoundError;
+      }
+      conversation = fresh;
       // A conversation whose budget is used up takes no message (402 budget_reached, before anything is stored - not even
       // the cancelling of what it waits on)
       budget = this.planTurnBudget(conversation, agent);
@@ -3334,7 +3363,7 @@ export class AgentServer {
     // Auto-generate title on the first exchange
     let conversationTitle: string | undefined;
     if (!conversation.title && x.firstExchange && !step.cancelled) {
-      conversationTitle = await this.generateTitle(x.firstExchange);
+      conversationTitle = await this.generateTitle(x.firstExchange, run.signal);
       if (conversationTitle) {
         await this.config.storage.updateConversation(conversationId, { title: conversationTitle }, ctx.context);
       }
@@ -4679,6 +4708,12 @@ export class AgentServer {
       result.conversations++;
       const agent = await this.getAgentFor(fresh.agentId, owner).catch(() => undefined);
       const policy = store.pending.onTimeout ?? this.hitlFor(agent).onTimeout;
+      if (policy === "deny" && !agent) {
+        console.warn(
+          `[AgentServer] Conversation ${fresh.id}: agent "${fresh.agentId}" could not be resolved for the timeout sweep, so its lapsed request was cancelled instead of denied. ` +
+            "A per-request agents registry (and tenant-scoped storage) has to resolve for the sweep's own context too: { user: <owner>, data: { system: true, timeout: true } }."
+        );
+      }
       const sdkAgent = agent?.sdkAgent;
       let budget: TurnBudget | undefined;
       let canDeny =
@@ -5214,12 +5249,69 @@ export class AgentServer {
     const file: IncomingFile = { name: upload.name, mimeType: resolveUploadMimeType(upload.mimeType, upload.name), bytes };
     // (base64 that decodes to nothing - whitespace, bare padding - is an empty file too)
     this.checkIncomingFile(cfg, file);
-    if (conversation) await this.checkRoomForFiles(cfg, conversation.id, 1, ctx);
 
-    const record = await this.saveIncomingFile(ctx, { file, cfg, conversation, metadata: upload.metadata });
+    // Room for one more is checked and the file stored as one step per conversation: uploads that arrive together are let in one
+    // after the other, so the limit holds for them
+    const record = conversation
+      ? await this.withUploadLock(conversation.id, async () => {
+          await this.checkRoomForFiles(cfg, conversation.id, 1, ctx);
+          const saved = await this.saveIncomingFile(ctx, { file, cfg, conversation, metadata: upload.metadata });
+          await this.confirmRoomForFile(cfg, saved, ctx);
+          return saved;
+        })
+      : await this.saveIncomingFile(ctx, { file, cfg, conversation, metadata: upload.metadata });
     return {
       status: 201,
       body: { file: record },
+    };
+  }
+
+  /** Uploads to one conversation, one at a time (in this process). */
+  private uploadLocks = new Map<string, Promise<void>>();
+
+  private async withUploadLock<T>(conversationId: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.uploadLocks.get(conversationId) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => mine);
+    this.uploadLocks.set(conversationId, tail);
+    await previous;
+    try {
+      return await work();
+    } finally {
+      release();
+      if (this.uploadLocks.get(conversationId) === tail) this.uploadLocks.delete(conversationId);
+    }
+  }
+
+  /**
+   * After a file is stored: it has to be among the first `maxFiles` the conversation holds (oldest first), else it is taken
+   * back out and the upload is refused. The check before storing cannot see an upload another node is making at the same
+   * moment; this one can, and the files that were there first keep their place.
+   */
+  private async confirmRoomForFile(cfg: ResolvedFilesConfig, record: FileRecord, ctx: RouteContext): Promise<void> {
+    if (!this.filesIndexed || !record.conversationId) return;
+    const storage = this.config.storage;
+    const rc = ctx.context;
+    const { total } = await storage.listFiles!({ conversationId: record.conversationId, limit: 1 }, rc);
+    if (total <= cfg.maxFiles) return;
+    for (let offset = 0; offset < cfg.maxFiles; ) {
+      const page = await storage.listFiles!(
+        { conversationId: record.conversationId, limit: Math.min(200, cfg.maxFiles - offset), offset, order: "asc" },
+        rc
+      );
+      if (page.data.some((held) => held.id === record.id)) return;
+      if (page.data.length === 0 || !page.hasMore) break;
+      offset += page.data.length;
+    }
+    await storage.deleteFile(record.id, rc).catch(() => undefined);
+    throw {
+      statusCode: 409,
+      code: "too_many_files",
+      message: `A conversation holds at most ${cfg.maxFiles} files. Delete one to attach another.`,
+      details: { maxFiles: cfg.maxFiles, held: Math.min(total - 1, cfg.maxFiles) },
     };
   }
 
@@ -5235,6 +5327,17 @@ export class AgentServer {
       throw { statusCode: 400, code: "VALIDATION_ERROR", message } as ValidationError;
     };
     const one = (value: string | string[] | undefined) => (Array.isArray(value) ? value[0] : value) || undefined;
+
+    // A form encoding is not a file: storing "the body" would keep the whole envelope (boundaries, headers) as the file
+    const declaredType = normalizeHeaders(ctx.headers)["content-type"];
+    if (isFormContentType(declaredType)) {
+      throw {
+        statusCode: 415,
+        code: "unsupported_media_type",
+        message:
+          "multipart and form uploads are not supported: send the file's bytes as the body with its own Content-Type and ?name=<file name>, or the JSON form { file: { name, content (base64), mimeType } }",
+      };
+    }
 
     if (Buffer.isBuffer(ctx.body)) {
       const name = one(ctx.query.name) ?? one(ctx.query.filename);
@@ -5770,10 +5873,33 @@ export class AgentServer {
     if (task.callbackUrl) await this.sendTaskCallback(task.callbackUrl, task.id, "failed", message);
   }
 
+  /**
+   * Whether `taskId` is the task of this conversation: it names the conversation and belongs to the same user. The
+   * conversation's own metadata is writable by its owner, so it is only a pointer; the task is what says yes.
+   */
+  private async taskOwnsConversation(taskId: string, conversation: Conversation, rc: RequestContext | undefined): Promise<boolean> {
+    const task = await this.config.storage.getTask(taskId, rc);
+    return !!task && task.conversationId === conversation.id && (task.userId ?? undefined) === (conversation.userId ?? undefined);
+  }
+
+  /**
+   * Metadata a client may set on a conversation. `taskId` (and `source: "task"`) belong to the server: what a client sends for
+   * them is dropped and, on an update, the ones the conversation already has are kept (an update replaces the metadata).
+   */
+  private clientMetadata<T extends Record<string, unknown> | undefined>(supplied: T, existing?: Record<string, unknown>): T {
+    if (!supplied || typeof supplied !== "object" || Array.isArray(supplied)) return supplied;
+    const { taskId: _taskId, ...rest } = supplied as Record<string, unknown>;
+    if (rest.source === "task") delete rest.source;
+    if (existing?.taskId !== undefined) rest.taskId = existing.taskId;
+    if (existing?.source === "task") rest.source = "task";
+    return rest as T;
+  }
+
   /** A task whose conversation starts running (also when an answered action resumes it) is running again. */
-  private async markTaskRunning(taskId: string, rc: RequestContext | undefined): Promise<void> {
+  private async markTaskRunning(taskId: string, rc: RequestContext | undefined, conversationId?: string): Promise<void> {
     try {
       const task = await this.config.storage.getTask(taskId, rc);
+      if (conversationId !== undefined && task?.conversationId !== conversationId) return;
       if (task && (task.status === "waiting_for_input" || task.status === "pending")) {
         await this.config.storage.updateTask(taskId, { status: "running" }, rc);
       }
@@ -5793,7 +5919,8 @@ export class AgentServer {
     if (!taskId || outcome.partial || run.leaseLost) return;
     const storage = this.config.storage;
     const task = await storage.getTask(taskId, rc);
-    if (!task || task.status === "cancelled" || task.status === "failed") return;
+    if (!task || task.conversationId !== run.conversationId) return;
+    if (task.status === "cancelled" || task.status === "failed") return;
 
     const callback = async (status: TaskStatus, error?: string) => {
       if (task.callbackUrl && (status === "completed" || status === "failed" || status === "waiting_for_input")) {

@@ -998,6 +998,11 @@ export interface TitleGenerationConfig {
   model: string;
   /** Custom path override (default: "/v1/chat/completions") */
   path?: string;
+  /**
+   * How long to wait for the title, in milliseconds (default 10000). The turn holds its conversation while it waits, so a slow
+   * endpoint must not hold it for long; a title that did not arrive in time is skipped. Cancelling the turn also stops the wait.
+   */
+  timeoutMs?: number;
 }
 
 export interface AgentServerConfig {

@@ -74,6 +74,138 @@ describeProvider("mongodb", (harness) => {
     });
   });
 
+  describe("a file whose content upload fails part-way", () => {
+    it("leaves no chunks behind, and no file", async () => {
+      const opened = await harness.open();
+      try {
+        const bucket = (opened.storage as unknown as { bucket: { openUploadStreamWithId: (...args: unknown[]) => any } }).bucket;
+        const open = bucket.openUploadStreamWithId.bind(bucket);
+        let broken = true;
+        bucket.openUploadStreamWithId = (...args: unknown[]) => {
+          const stream = open(...args);
+          if (!broken) return stream;
+          // write enough for whole chunks to be stored, then fail before the upload is finished
+          const end = stream.end.bind(stream);
+          stream.end = (content: Buffer) => {
+            stream.write(content, () => setTimeout(() => stream.destroy(new Error("the connection dropped mid-upload")), 100));
+            return stream;
+          };
+          void end;
+          return stream;
+        };
+
+        await expect(
+          opened.storage.saveFile({ name: "big.bin", mimeType: "application/octet-stream", content: randomBytes(1 * MiB) })
+        ).rejects.toThrow(/dropped mid-upload/);
+
+        await raw(opened.where, async (db) => {
+          expect(await db.collection("agent_server_files.chunks").countDocuments()).toBe(0);
+          expect(await db.collection("agent_server_files.files").countDocuments()).toBe(0);
+          expect(await db.collection("agent_server_files").countDocuments()).toBe(0);
+        });
+
+        // and the provider carries on: the next upload is stored normally
+        broken = false;
+        const content = randomBytes(300_000);
+        const file = await opened.storage.saveFile({ name: "ok.bin", mimeType: "application/octet-stream", content });
+        expect((await opened.storage.getFileContent(file.id))!.equals(content)).toBe(true);
+        expect(await opened.blobCount()).toBe(1);
+      } finally {
+        await opened.close();
+      }
+    });
+  });
+
+  describe("the event log summary", () => {
+    it("reports the newest stored event, not the sequence numbers already handed out", async () => {
+      const opened = await harness.open();
+      try {
+        const conv = await opened.storage.createConversation({ agentId: "a" });
+        const events = opened.storage.events!;
+        // hold the insert of the next append: its numbers are reserved, its events are not stored yet
+        const db = (opened.storage as unknown as { db: { collection: (name: string, ...rest: unknown[]) => any } }).db;
+        const collection = db.collection.bind(db);
+        const reached: { open?: () => void } = {};
+        const entered = new Promise<void>((resolve) => (reached.open = resolve));
+        let letGo!: () => void;
+        const held = new Promise<void>((resolve) => (letGo = resolve));
+        let hold = false;
+        db.collection = (name: string, ...rest: unknown[]) => {
+          const target = collection(name, ...rest);
+          if (!hold || name !== "agent_server_events") return target;
+          return new Proxy(target, {
+            get(object, prop) {
+              if (prop === "insertMany") {
+                return async (...args: unknown[]) => {
+                  reached.open!();
+                  await held;
+                  return object.insertMany(...args);
+                };
+              }
+              const value = Reflect.get(object, prop);
+              return typeof value === "function" ? value.bind(object) : value;
+            },
+          });
+        };
+
+        await events.append(conv.id, [{ type: "user.message" }, { type: "session.status_running" }]);
+        expect((await events.summary!([conv.id]))[conv.id]).toEqual({ lastSeq: 2 });
+
+        hold = true;
+        const pending = events.append(conv.id, [{ type: "agent.message" }, { type: "agent.message" }, { type: "session.work_done" }]);
+        await entered;
+        // 5 numbers are out; 2 events are stored
+        await raw(opened.where, async (rawDb) => {
+          expect((await rawDb.collection("agent_server_event_streams").findOne({ _id: conv.id as never }))?.lastSeq).toBe(5);
+        });
+        expect((await events.summary!([conv.id]))[conv.id]).toEqual({ lastSeq: 2 });
+        expect((await events.list(conv.id, { limit: 1, order: "desc" })).events[0]!.seq).toBe(2);
+
+        hold = false;
+        letGo();
+        expect((await pending).map((e) => e.seq)).toEqual([3, 4, 5]);
+        expect((await events.summary!([conv.id]))[conv.id]).toEqual({ lastSeq: 5 });
+      } finally {
+        await opened.close();
+      }
+    });
+
+    it("does not count numbers burned by an append that failed, and keeps counting past them", async () => {
+      const opened = await harness.open();
+      try {
+        const conv = await opened.storage.createConversation({ agentId: "a" });
+        const events = opened.storage.events!;
+        await events.append(conv.id, [{ type: "x" }]);
+        // an event already stored under the number the next append will get: its insert is refused (duplicate key)
+        await raw(opened.where, async (db) => {
+          await db.collection("agent_server_events").insertOne({ conversationId: conv.id, seq: 2, type: "squatter", data: {}, runId: null, createdAt: new Date() } as never);
+        });
+        await expect(events.append(conv.id, [{ type: "y" }])).rejects.toBeDefined();
+        // the failed append reserved number 2 and stored nothing of its own: the summary says what its own appends stored
+        expect((await events.summary!([conv.id]))[conv.id]).toEqual({ lastSeq: 1 });
+        // numbers are never handed out twice: the next append goes on from 3
+        const next = await events.append(conv.id, [{ type: "z" }]);
+        expect(next[0]!.seq).toBe(3);
+        expect((await events.summary!([conv.id]))[conv.id]).toEqual({ lastSeq: 3 });
+      } finally {
+        await opened.close();
+      }
+    });
+
+    it("reads a stream written before committedSeq existed from its lastSeq", async () => {
+      const opened = await harness.open();
+      try {
+        const conv = await opened.storage.createConversation({ agentId: "a" });
+        await raw(opened.where, async (db) => {
+          await db.collection("agent_server_event_streams").insertOne({ _id: conv.id as never, lastSeq: 7, updatedAt: new Date() });
+        });
+        expect((await opened.storage.events!.summary!([conv.id]))[conv.id]).toEqual({ lastSeq: 7 });
+      } finally {
+        await opened.close();
+      }
+    });
+  });
+
   describe("conversation state", () => {
     it("is limited to maxStateBytes (12 MiB by default) and reports it", async () => {
       expect(createMongoDBProvider({ connectionString: "mongodb://x" }).capabilities().maxStateBytes).toBe(12 * MiB);

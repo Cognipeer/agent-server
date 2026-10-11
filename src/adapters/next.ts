@@ -7,7 +7,7 @@
 import type { AgentServer } from "../server.js";
 import type { AuthUser } from "../types.js";
 import { normalizeHeaders } from "../context.js";
-import { isRawUploadRequest } from "../files/config.js";
+import { isRawUploadRequest, isUnsupportedUploadRequest } from "../files/config.js";
 
 // Next.js types - minimal to avoid requiring next as a dependency
 interface NextRequest {
@@ -19,6 +19,8 @@ interface NextRequest {
   json(): Promise<unknown>;
   /** Reads the body as bytes (an upload of a raw file). */
   arrayBuffer?(): Promise<ArrayBuffer>;
+  /** The body as a stream: read in pieces, so a body over the limit is turned away without being held in memory. */
+  body?: { getReader(): { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(): Promise<unknown> } } | null;
   nextUrl: {
     pathname: string;
     searchParams: URLSearchParams;
@@ -46,6 +48,40 @@ export interface NextAdapterOptions {
 }
 
 /**
+ * The request body as bytes, refused with 413 as soon as it is over `limit` (the declared length first, then the bytes as
+ * they arrive). `undefined` when the request object offers no way to read bytes (a minimal stand-in).
+ */
+async function readBodyBytes(request: NextRequest, limit: number): Promise<Buffer | undefined> {
+  const tooLarge = () => ({ statusCode: 413, code: "PAYLOAD_TOO_LARGE", message: `Request body exceeds ${limit} bytes` });
+  const declared = Number(request.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > limit) throw tooLarge();
+
+  if (request.body && typeof request.body.getReader === "function") {
+    const reader = request.body.getReader();
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      size += value.byteLength;
+      if (size > limit) {
+        await reader.cancel().catch(() => undefined);
+        throw tooLarge();
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks);
+  }
+  if (request.arrayBuffer) {
+    const bytes = Buffer.from(await request.arrayBuffer());
+    if (bytes.length > limit) throw tooLarge();
+    return bytes;
+  }
+  return undefined;
+}
+
+/**
  * Create a Next.js App Router handler for AgentServer
  *
  * Usage in app/api/[...path]/route.ts:
@@ -64,6 +100,8 @@ export function createNextHandler(
 ): (request: NextRequest, context?: { params?: Record<string, string> }) => Promise<Response> {
   const basePath = server.getBasePath();
   const config = server.getConfig();
+  // The largest request body taken (413 above it): what was set, else room for the biggest file a base64 JSON upload can carry
+  const maxBody = config.limits?.maxBodySize ?? Math.ceil(server.maxUploadBytes() * 1.4) + 64 * 1024;
 
   return async (request, _context) => {
     try {
@@ -86,20 +124,9 @@ export function createNextHandler(
         }
       });
 
-      // Parse body for POST/PATCH requests
-      let body: unknown;
-      if (isRawUploadRequest(request.method, path.startsWith(basePath) ? path.slice(basePath.length) || "/" : path, request.headers.get("content-type") ?? undefined) && request.arrayBuffer) {
-        // A file uploaded as itself (`POST /files?name=...` with its own Content-Type)
-        body = Buffer.from(await request.arrayBuffer());
-      } else if (request.method === "POST" || request.method === "PATCH") {
-        try {
-          body = await request.json();
-        } catch {
-          // No body or not JSON
-        }
-      }
+      const routePath = path.startsWith(basePath) ? path.slice(basePath.length) || "/" : path;
 
-      // Authentication
+      // Authentication comes first: a request that is not let in does not get its body read
       let user: AuthUser | undefined;
       if (config.auth?.enabled) {
         const headerName = config.auth.headerName || "authorization";
@@ -107,7 +134,6 @@ export function createNextHandler(
 
         // Check if route is excluded
         const excludeRoutes = config.auth.excludeRoutes || [];
-        const routePath = path.slice(basePath.length) || "/";
         const isExcluded = excludeRoutes.some((pattern) => {
           if (pattern.includes("*")) {
             const regex = new RegExp(`^${pattern.replace(/\*/g, ".*")}$`);
@@ -120,6 +146,31 @@ export function createNextHandler(
           const authResult = await server.authenticate(token);
           if (authResult) {
             user = authResult;
+          }
+        }
+      }
+
+      // Parse body for POST/PATCH requests, up to the same limit the other adapters apply
+      let body: unknown;
+      const contentType = request.headers.get("content-type") ?? undefined;
+      if (isUnsupportedUploadRequest(request.method, routePath, contentType)) {
+        // (a form or multipart upload is turned away by the server with a 415; its body is not read)
+      } else if (isRawUploadRequest(request.method, routePath, contentType) && (request.arrayBuffer || request.body)) {
+        // A file uploaded as itself (`POST /files?name=...` with its own Content-Type)
+        body = await readBodyBytes(request, maxBody);
+      } else if (request.method === "POST" || request.method === "PATCH") {
+        const bytes = await readBodyBytes(request, maxBody);
+        if (bytes === undefined) {
+          try {
+            body = await request.json();
+          } catch {
+            // No body or not JSON
+          }
+        } else if (bytes.length > 0) {
+          try {
+            body = JSON.parse(bytes.toString("utf8"));
+          } catch {
+            // Not JSON
           }
         }
       }

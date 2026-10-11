@@ -6,7 +6,7 @@
 
 import type { AgentServer } from "../server.js";
 import type { AuthUser } from "../types.js";
-import { isRawUploadRequest } from "../files/config.js";
+import { isRawUploadRequest, isUnsupportedUploadRequest } from "../files/config.js";
 
 // Express types - minimal to avoid requiring express as a dependency
 interface Request {
@@ -130,7 +130,10 @@ export function createExpressMiddleware(
       let body = req.body;
       const fullPath = req.originalUrl.split("?")[0]!;
       const routePath = fullPath.startsWith(basePath) ? fullPath.slice(basePath.length) || "/" : req.path;
-      if (isRawUploadRequest(req.method, routePath, req.headers["content-type"])) {
+      if (isUnsupportedUploadRequest(req.method, routePath, req.headers["content-type"])) {
+        // (a form or multipart upload is turned away by the server with a 415; its body is not read)
+        body = undefined;
+      } else if (isRawUploadRequest(req.method, routePath, req.headers["content-type"])) {
         body = await rawBodyOf(req, config.limits?.maxBodySize ?? Math.ceil(server.maxUploadBytes() * 1.4) + 64 * 1024);
       }
 

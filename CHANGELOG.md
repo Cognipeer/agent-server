@@ -86,6 +86,14 @@ Human-in-the-loop: agents can pause for a tool approval or a question, and a cli
 
 ### Changed
 
+- **The identity the server established wins over one the client names.** With token auth, `auth.resolveUserId` or `resolveContext`, a `?userId=` on a list and a `userId` in a create-conversation body are ignored (as they already were with `resolveContext`); they are only taken when a request carries no identity at all (an open demo server). See [Request Context](docs/guide/request-context.md#which-identity-counts).
+- **`createJWTAuthProvider` verifies the token's signature** (HS256/384/512, RS256/384/512, ES256/384/512, with `node:crypto`; the algorithm is the configured one, never the token's), `nbf` and a list-valued `aud`, accepts `audience` as a list, and takes `clockToleranceSec` / `requireExp`. It throws when created without a `secret` (or with a public key of the wrong kind). It used to read the claims without checking the signature; tokens signed with another key now fail validation.
+- **`createAgentServer` throws when `auth.enabled` is true and `auth.provider` is missing**, instead of running without authentication. Use `auth.enabled: false` with `resolveUserId` (or `resolveContext`) to name the user another way.
+- `TokenAuthProvider.generateToken` returns `tok_` plus 256 random bits and keeps only a hash; new `tokenTtlMs` lets generated tokens lapse. The old shape (`tok_` + base64 of the user and the time) is gone.
+- `metadata.taskId` (and `source: "task"`) of a conversation belong to the server: a client cannot set them on create or update, a metadata update keeps the ones a task conversation has, and a run only drives the task that points back at its conversation for the same user.
+- `POST /files` answers `multipart/*` and `application/x-www-form-urlencoded` bodies with `415 unsupported_media_type` (the adapters do not read them); it stored the whole form envelope as the file before.
+- The Next.js adapter authenticates before it reads the body and refuses a body over `limits.maxBodySize` (by default derived from the largest `files.maxFileSize`, as for the Node handler) with `413`.
+- `titleGeneration` has `timeoutMs` (default 10 000) and stops when the turn is cancelled.
 - **Listing needs a user.** `GET /conversations` and `GET /tasks` used to return every user's records to a request that named nobody (single reads were already refused). They now answer `401 identity_required` unless the server sets `allowAnonymousList: true` - a server that has no sign-in (a local tool, a demo) sets it. A request that names a user (a token, `resolveContext` with a `user`, `resolveUserId`, or without `resolveContext` a `?userId=`) is unaffected.
 - `FileRecord.mimeType` is stored without parameters (`text/plain; charset=utf-8` becomes `text/plain`), and `application/octet-stream` (or a value that is not a MIME type) is guessed from the extension.
 - A file can only be attached to a message of the conversation it was uploaded to, by the person who uploaded it. A file uploaded without `conversationId` is stored but cannot be attached (it used to be attachable to any conversation).
@@ -120,6 +128,13 @@ Human-in-the-loop: agents can pause for a tool approval or a question, and a cli
 
 ### Fixed
 
+- Uploads that arrive together can no longer put more than `files.maxFiles` files into a conversation (per-conversation ordering plus a check after the file is stored, for a rival on another instance).
+- A message that arrives while the previous turn finishes now sees the approval that turn stored (the conversation is read again once the turn holds it) and is answered `409 action_pending`.
+- A run that fails to start (for example its lease could not be taken) now releases its waiters at once instead of leaving them to time out.
+- MongoDB: `summary().lastSeq` is the newest stored event (`committedSeq`), not the numbers already reserved; a file whose content upload fails part-way leaves no chunks behind.
+- A storage key never carries an odd or over-long file name extension (a 223+ character extension was a driver error on PostgreSQL).
+- `withSessionImages` keeps the wrapped model's own `constructor`, `toString` and the like.
+- A lapsed `deny` pause whose agent cannot be found for the timeout sweep now logs a warning; the per-request registry requirement is documented.
 - **MongoDB** returned file content as a BSON `Binary` (downloads and any code reading bytes broke), failed uploads over 16 MiB with a generic 500, stored left-out fields as `null` (pending actions came back with `title: null, args: null`), dropped task comments, failed an update that changed nothing with "Task not found", and failed a second task result with a duplicate-key error.
 - **PostgreSQL** returned message text that is valid JSON as a number, boolean, object or `null` (`"42"` came back as `42`), refused NUL characters with a 500, dropped task comments, and answered an over-long title or name with a 500.
 - **History**: the agent and `GET /conversations/:id` saw only the first 100 messages of a conversation, so after about 50 turns the model never received the newest message. The agent now gets the whole conversation.

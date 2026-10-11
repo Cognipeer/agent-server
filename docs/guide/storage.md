@@ -39,8 +39,9 @@ database each. In short:
 - **Tasks.** Comments are stored (with real `Date`s). A task has one result: creating another replaces the first
   (the `waiting_for_input` cycle writes a partial result, then the final one). A task records the conversation it runs in
   (`conversationId`, filterable in `getTasks`).
-- **Event log.** `storage.events` appends and lists a conversation's events (`seq` 1, 2, 3 ... unique, gap-free, still counting after a restart or a prune);
-  `summary()` gives the newest `seq` and the stop reason of the last finished turn for many conversations at once; the log goes with its conversation.
+- **Event log.** `storage.events` appends and lists a conversation's events (`seq` 1, 2, 3 ... unique, in order, still counting after a restart or a prune; SQLite, PostgreSQL and the in-memory provider append in one
+  transaction, so the numbers have no holes. MongoDB reserves the numbers first and inserts the events after: an insert that fails leaves its numbers unused, so after a failed append a hole is possible - numbers are never reused);
+  `summary()` gives the newest **stored** `seq` (never one whose event `list()` cannot return yet) and the stop reason of the last finished turn for many conversations at once; the log goes with its conversation.
   See [Runs, Cancel & Reattach](./runs.md).
 - **Leases.** `acquireLease` / `renewLease` / `releaseLease` / `getLeases` / `markLeaseCancel` / `listExpiredLeases`: a time-limited claim on a key,
   decided atomically (of twelve askers at once exactly one gets it), taken over after it expired - the taker is handed the residue. The server holds one per
@@ -48,6 +49,7 @@ database each. In short:
   instances' clocks within a few seconds (a lease lives 60 s by default).
 - **Limits are typed.** A write the provider cannot hold is a `StorageLimitError` (HTTP 413, `STORAGE_LIMIT_EXCEEDED`);
   a value a column cannot hold is a `ValidationError` (400); an unknown parent is a `NotFoundError` (404). Never a driver error.
+  A file's `storageKey` is 32 random characters plus the name's extension when that is a short plain one (letters and digits, up to 16); an odd or very long "extension" is left out, so the key always fits its column.
 
 ### Capabilities and limits
 

@@ -21,8 +21,15 @@ interface TokenAuthConfig {
 
   // Dynamic validation function
   validateFn?: (token: string) => Promise<AuthResult>;
+
+  // How long a token made by generateToken() is good for, in milliseconds (default: until revoked)
+  tokenTtlMs?: number;
 }
 ```
+
+`generateToken(userId)` returns `tok_` plus 256 random bits (base64url): nothing in it comes from the user or the time, so it cannot be guessed. The provider keeps only a hash of it, in memory -
+generated tokens are lost when the process ends, so they suit tests and single-process tools; for sessions that must outlive a restart, issue and store tokens yourself and validate them with `validateFn`.
+`revokeToken(token)` ends one.
 
 ### Example with Static Tokens
 
@@ -83,27 +90,36 @@ const authProvider = createJWTAuthProvider(config);
 
 ```typescript
 interface JWTAuthConfig {
-  // Secret for HS256, or the public key for RS256
+  // The shared secret (HS*), or the PEM public key / certificate (RS*, ES*). Required.
   secret: string;
 
-  // Algorithm (default: 'HS256')
-  algorithm?: 'HS256' | 'RS256';
+  // The one algorithm tokens must be signed with (default: 'HS256')
+  algorithm?: 'HS256' | 'HS384' | 'HS512' | 'RS256' | 'RS384' | 'RS512' | 'ES256' | 'ES384' | 'ES512';
 
   // Expected issuer (checks the 'iss' claim)
   issuer?: string;
 
-  // Expected audience (checks the 'aud' claim)
-  audience?: string;
+  // Expected audience (checks the 'aud' claim, which may be a string or a list). A list here accepts any of them.
+  audience?: string | string[];
+
+  // Seconds of clock difference allowed for 'exp' and 'nbf' (default 0)
+  clockToleranceSec?: number;
+
+  // Refuse a token without 'exp' (default false)
+  requireExp?: boolean;
 
   // Extract the user id from the payload (default: sub, then userId, then user_id)
   extractUserId?: (payload: Record<string, unknown>) => string | undefined;
 }
 ```
 
-::: warning A basic provider
-`createJWTAuthProvider` reads the token's claims and checks expiry (`exp`), `issuer` and `audience`. It is a basic implementation: it does **not** verify the token's signature, and it does not
-fetch keys (no JWKS). Put signature verification in front of the server (a gateway or an identity-aware proxy), or write an `AuthProvider` that verifies with a JWT library (`jose`, `jsonwebtoken`) -
-see below.
+`createJWTAuthProvider` **verifies the token's signature** (HMAC, RSA or ECDSA, with `node:crypto`) against the configured key, and then checks `exp`, `nbf`, `iss` and `aud`. The algorithm is the
+configured one: the token's header cannot change it, so `alg: "none"` and an RSA key used as an HMAC secret are refused. It throws when created without a `secret`, or with a `secret` that is not a
+PEM key of the kind the algorithm needs.
+
+::: warning No JWKS
+It holds one static key and does not fetch keys, so it cannot follow a key rotation. For an identity provider that publishes a JWKS, put verification in front of the server (a gateway or an
+identity-aware proxy), or write an `AuthProvider` that verifies with a JWT library (`jose`, `jsonwebtoken`) - see below.
 :::
 
 ### Example
@@ -201,7 +217,7 @@ const agentServer = createAgentServer({
     // Enable authentication
     enabled: true,
     
-    // Auth provider
+    // Auth provider (required when enabled is true: createAgentServer throws without one)
     provider: authProvider,
     
     // Header name (default: 'Authorization')

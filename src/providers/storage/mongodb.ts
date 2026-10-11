@@ -623,7 +623,14 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
 
     // Content first, then the record that points at it. A refused record takes its content back
     // out, so a failed save leaves no orphan blob behind.
-    await this.putBlob(params.storageKey, params.name, params.content);
+    try {
+      await this.putBlob(params.storageKey, params.name, params.content);
+    } catch (error) {
+      // A failure part-way through leaves chunks under this id without a file document; they are deleted by id
+      // (deleting what was never completed is a no-op)
+      await this.removeBlob(params.storageKey).catch(() => undefined);
+      throw error;
+    }
     try {
       const now = new Date();
       const doc: MongoFile = {
@@ -974,7 +981,12 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
     const streams = this.db.collection<MongoEventStream>(this.collections.eventStreams);
     const reserved = await streams.findOneAndUpdate(
       { _id: conversationId },
-      { $inc: { lastSeq: events.length }, $set: { updatedAt: events[events.length - 1]!.createdAt } },
+      {
+        $inc: { lastSeq: events.length },
+        $set: { updatedAt: events[events.length - 1]!.createdAt },
+        // (nothing is stored yet for a stream that starts now)
+        $setOnInsert: { committedSeq: 0 },
+      },
       { upsert: true, returnDocument: "after" }
     );
     if (!reserved) throw new Error("The event counter could not be reserved");
@@ -990,11 +1002,17 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
     }));
     await this.guarded(() => this.db!.collection<MongoEvent>(this.collections.events).insertMany(docs));
 
-    // What the last finished turn stopped for; the appender of a conversation is its run, so no race here
+    // The events are stored now: `committedSeq` moves up to them (the reservation above ran ahead of the insert, and a reader of the
+    // summary must not be told about a number whose event is not there yet). What the last finished turn stopped for goes with it;
+    // the appender of a conversation is its run, so no race there.
     const stopReason = nextStopReason(reserved.stopReason, events) ?? null;
-    if (stopReason !== (reserved.stopReason ?? null)) {
-      await streams.updateOne({ _id: conversationId }, { $set: { stopReason } });
-    }
+    await streams.updateOne(
+      { _id: conversationId },
+      {
+        $max: { committedSeq: first + events.length - 1 },
+        ...(stopReason !== (reserved.stopReason ?? null) ? { $set: { stopReason } } : {}),
+      }
+    );
 
     return docs.map((doc) => this.mapEvent(doc));
   }
@@ -1024,7 +1042,11 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       .toArray();
     const out: Record<string, EventSummary> = {};
     for (const doc of docs) {
-      out[doc._id] = { lastSeq: doc.lastSeq, ...(doc.stopReason ? { stopReason: doc.stopReason } : {}) };
+      // (the newest STORED event: `lastSeq` counts the numbers handed out, which can be ahead for the length of an insert, and for good
+      // after one that failed; a stream written before `committedSeq` existed has only `lastSeq`)
+      const lastSeq = doc.committedSeq ?? doc.lastSeq;
+      if (lastSeq === 0 && !doc.stopReason) continue; // (reserved, not stored yet: nothing to report)
+      out[doc._id] = { lastSeq, ...(doc.stopReason ? { stopReason: doc.stopReason } : {}) };
     }
     return out;
   }
@@ -1325,7 +1347,10 @@ interface MongoEvent {
 
 interface MongoEventStream {
   _id: string;
+  /** The last sequence number handed out (reserved before the events are inserted). */
   lastSeq: number;
+  /** The newest sequence number whose event is stored. */
+  committedSeq?: number;
   stopReason?: string | null;
   updatedAt: Date;
 }

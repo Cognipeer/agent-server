@@ -675,10 +675,14 @@ export abstract class BaseStorageProvider implements StorageProvider {
     return `${prefix}_${nanoid(21)}`;
   }
 
+  /**
+   * A key for a stored file: 32 random characters plus the file name's extension - when that is a short, plain one. The name
+   * comes from the client, so an odd or very long "extension" is left out; the key then always fits a bounded column.
+   */
   protected generateStorageKey(filename: string): string {
     const ext = filename.includes(".") ? filename.split(".").pop() : "";
     const key = nanoid(32);
-    return ext ? `${key}.${ext}` : key;
+    return ext && /^[A-Za-z0-9]{1,16}$/.test(ext) ? `${key}.${ext}` : key;
   }
 
   protected normalizeParams<T extends { limit?: number; offset?: number }>(

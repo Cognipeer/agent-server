@@ -605,6 +605,36 @@ export function runStorageContract(
         expect(fetched!.metadata).toEqual(jsonRoundTrip(awkwardJson()));
       });
 
+      it("stores a file whatever its name's last dot-segment looks like, under a key a bounded column holds", async () => {
+        const conv = await newConversation();
+        const names = [
+          `long.${"x".repeat(300)}`,
+          "odd.ex t",
+          "tab.t\tb",
+          "emoji.\u{1F600}",
+          "slash.a/b",
+          "path.../..",
+          `${"n".repeat(480)}.${"y".repeat(19)}`,
+          "trailing.",
+          ".hidden",
+          "no-extension",
+          "archive.tar.gz",
+          "report.PDF",
+        ];
+        for (const name of names) {
+          const content = Buffer.from(`content of ${name.length}`);
+          const file = await s().saveFile({ name, mimeType: "application/octet-stream", content, conversationId: conv.id });
+          expect(file.name, name).toBe(name);
+          // 32 random characters, plus the extension when it is a short plain one
+          expect(file.storageKey, name).toMatch(/^[A-Za-z0-9_-]{32}(\.[A-Za-z0-9]{1,16})?$/);
+          expect((await s().getFileContent(file.id))!.equals(content), name).toBe(true);
+        }
+        expect((await s().listFiles!({ conversationId: conv.id, limit: 100 })).total).toBe(names.length);
+        // a short plain extension is kept
+        const pdf = await s().saveFile({ name: "report.pdf", mimeType: "application/pdf", content: Buffer.from("x") });
+        expect(pdf.storageKey).toMatch(/\.pdf$/);
+      });
+
       it("answers null for a file that does not exist, and ignores deleting it", async () => {
         expect(await s().getFile("file_nope")).toBeNull();
         expect(await s().getFileContent("file_nope")).toBeNull();
@@ -1109,6 +1139,31 @@ export function runStorageContract(
         for (const result of results) {
           for (let i = 1; i < result.length; i++) expect(result[i]!.seq).toBe(result[i - 1]!.seq + 1);
         }
+      });
+
+      it("never summarises a sequence number the log cannot list yet, while an appender is running", async () => {
+        const conv = await newConversation();
+        let done = false;
+        const writer = (async () => {
+          for (let i = 0; i < 120; i++) await events().append(conv.id, Array.from({ length: 4 }, (_, k) => event("agent.tool_use", { i, k })));
+          done = true;
+        })();
+        let polls = 0;
+        const behind: string[] = [];
+        const poller = (async () => {
+          while (!done) {
+            // what the summary reports, then what the log holds a moment later: the log is never behind the summary
+            const summary = (await events().summary!([conv.id]))[conv.id];
+            if (!summary) continue;
+            const newest = (await events().list(conv.id, { limit: 1, order: "desc" })).events[0]?.seq ?? 0;
+            polls++;
+            if (newest < summary.lastSeq) behind.push(`summary ${summary.lastSeq}, log ${newest}`);
+          }
+        })();
+        await Promise.all([writer, poller]);
+        expect(polls).toBeGreaterThan(0);
+        expect(behind).toEqual([]);
+        expect((await events().summary!([conv.id]))[conv.id]!.lastSeq).toBe(480);
       });
 
       it("summarises the last sequence number and the stop reason of the last finished turn", async () => {

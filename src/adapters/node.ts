@@ -9,7 +9,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AgentServer, RouteResult } from "../server.js";
 import type { AuthUser } from "../types.js";
-import { isRawUploadRequest } from "../files/config.js";
+import { isRawUploadRequest, isUnsupportedUploadRequest } from "../files/config.js";
 
 export interface NodeHandlerOptions {
   /**
@@ -246,7 +246,10 @@ export function createNodeHandler(server: AgentServer, options: NodeHandlerOptio
       let body: unknown;
       // A file uploaded as itself (its own Content-Type, `?name=`) is a body of bytes, not JSON
       const rawUpload = isRawUploadRequest(req.method ?? "GET", routePath, req.headers["content-type"]);
-      if ("body" in overrides) {
+      if (isUnsupportedUploadRequest(req.method ?? "GET", routePath, req.headers["content-type"])) {
+        // (a form or multipart upload is turned away by the server with a 415; its body is not read)
+        body = undefined;
+      } else if ("body" in overrides) {
         // (a framework that already read it hands the bytes, or - for text/plain - a string)
         body = rawUpload && (Buffer.isBuffer(overrides.body) || typeof overrides.body === "string")
           ? Buffer.from(overrides.body as Buffer | string)

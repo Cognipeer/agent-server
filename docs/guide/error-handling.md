@@ -67,6 +67,7 @@ Every `error.code` the server answers with. Besides `400` / `401` / `404`, the o
 | 413 | `PAYLOAD_TOO_LARGE` | The request body is over the body limit |
 | 413 | `STORAGE_LIMIT_EXCEEDED` | The storage provider cannot hold this much |
 | 415 | `unsupported_file_type` | The file's type is not one the agent accepts |
+| 415 | `unsupported_media_type` | An upload sent as multipart/form-data or a form (send the raw bytes with ?name=, or the JSON form) |
 | 500 | `INTERNAL_ERROR` | Anything unexpected (the text is generic with maskServerErrors) |
 | 500 | `budget_misconfigured` | The agent has a budget but no pricing |
 | 500 | `invalid_host_result` | A host agent returned something the server cannot use |

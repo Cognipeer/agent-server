@@ -48,6 +48,17 @@ Rules:
 - Token auth (`auth.enabled`) still runs first; its user is available as `req.user`
   and is the fallback when the resolver returns no `user`.
 
+## Which identity counts
+
+When a request carries more than one idea of who is asking, the server's own wins, in this order:
+
+1. with `resolveContext`: `context.user` (nothing the client sends changes it);
+2. the token user (`auth.enabled`), then `auth.resolveUserId`;
+3. only when the request carries **no** identity at all (an open demo server, `allowAnonymousList`): the `userId` the client names in a create-conversation body or a list query.
+
+So with token auth, `?userId=other` on a list and `userId: "other"` in a create body are ignored: the token user's own conversations are listed, and a conversation is created for the token user.
+Without any identity a client names itself, which is all an anonymous server can offer - do not rely on it to keep users apart.
+
 ## Who may list
 
 `GET /conversations` and `GET /tasks` return the records of **one user**: the resolved one. A request that names nobody - no token user, no `context.user`, no `resolveUserId` result and, without

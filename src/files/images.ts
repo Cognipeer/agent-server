@@ -342,9 +342,11 @@ export function withSessionImages<T extends object>(input: T, options: WithSessi
   return new Proxy(model, {
     get(target, prop) {
       if (prop === SESSION_IMAGES_MARK) return true;
-      if (typeof prop === "string" && prop in overrides) return overrides[prop];
+      // (own keys only: `constructor`, `toString` and the like belong to the wrapped model, not to the object the overrides are kept in)
+      if (typeof prop === "string" && Object.prototype.hasOwnProperty.call(overrides, prop)) return overrides[prop];
       const value = Reflect.get(target, prop, target);
-      return typeof value === "function" ? value.bind(target) : value;
+      // (the class itself is not a method: bound, it would lose its name, which providers are recognised by)
+      return typeof value === "function" && prop !== "constructor" ? value.bind(target) : value;
     },
     has(target, prop) {
       return prop === SESSION_IMAGES_MARK || Reflect.has(target, prop);
