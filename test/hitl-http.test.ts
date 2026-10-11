@@ -109,10 +109,13 @@ for (const [name, boot] of [["Node handler", node], ["Fastify", fastify]] as con
 
       const raised = await post(`${url}/conversations/${id}`, { budget: { maxCostUsd: 10 } }, "PATCH");
       expect(raised.status).toBe(200);
-      expect(((await raised.json()) as any).runtime.status).toBe("idle");
+      // the raise only made room: the turn that was cut short still waits to be carried on
+      expect(await raised.json()).toMatchObject({ runtime: { status: "budget_paused", stopReason: "budget_reached" }, continuable: true });
       const resumed = await post(`${url}/conversations/${id}/continue`, {});
       expect(resumed.status).toBe(200);
       expect(((await resumed.json()) as any).response.content).toBe("finished after 5 steps");
+      const done = (await (await fetch(`${url}/conversations/${id}`)).json()) as any;
+      expect(done.conversation).toMatchObject({ continuable: false, runtime: { status: "idle", stopReason: "end_turn" } });
       const again = await post(`${url}/conversations/${id}/continue`);
       expect(again.status).toBe(409);
       expect(((await again.json()) as any).error.code).toBe("nothing_to_continue");

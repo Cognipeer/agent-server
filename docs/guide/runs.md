@@ -32,7 +32,7 @@ What a run gives you:
 
 | Field | |
 | --- | --- |
-| `status` | `idle`, `running` (a turn is executing, here or on another node), `requires_action` (waiting for a [human](./human-in-the-loop.md)), `budget_paused` (the last turn stopped on the conversation's [budget](./budgets.md) and it is still used up) |
+| `status` | `idle`, `running` (a turn is executing, here or on another node), `requires_action` (waiting for a [human](./human-in-the-loop.md)), `budget_paused` (the last turn stopped on the conversation's [budget](./budgets.md) and it is still used up, or the turn was cut short in the middle and waits to be continued - which it keeps doing after the budget is raised, until `POST /conversations/:id/continue` carries it on or a new message gives it up) |
 | `stopReason` | Why the last turn stopped: `end_turn`, `requires_action`, `cancelled`, `max_turns`, `limit`, `budget_reached`, `error`. Absent while a turn is running. |
 | `lastEventSeq` | `seq` of the newest event (0 when there is none): follow from here with `?after=` |
 | `pendingActionIds` | The actions the conversation waits on |

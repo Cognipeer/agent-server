@@ -2024,11 +2024,22 @@ export class AgentServer {
     return {
       ...visible,
       ...(hidden ? { state: publicState(conversation.state) } : {}),
-      ...(runtime ? { runtime } : {}),
+      ...(runtime ? { runtime, continuable: this.continuableOf(conversation, runtime) } : {}),
       ...(budget ? { budget } : {}),
       ...(budget || spent > 0 ? { spentUsd: spent } : {}),
       ...(remembered?.length ? { rememberedTools: [...remembered] } : {}),
     } as T;
+  }
+
+  /**
+   * Whether a turn the budget cut short waits to be carried on (`POST .../continue`): its state is kept, and nothing
+   * is running or waiting on a person. It stays so after the budget is raised or removed - the raise only makes room -
+   * until the turn is continued or a new message gives it up. A turn that finished its answer as it crossed the limit
+   * kept nothing to carry on from: raising the budget only reopens the conversation.
+   */
+  private continuableOf(conversation: Pick<Conversation, "state">, runtime: ConversationRuntime): boolean {
+    if (runtime.status === "running" || runtime.status === "requires_action") return false;
+    return !!readHitl(conversation.state)?.budgetPause;
   }
 
   /** The event data of a decision on `action` (`action.resolved`). */
@@ -2625,6 +2636,17 @@ export class AgentServer {
     };
   }
 
+  /** Forgets the state a budget-stopped turn was to be carried on from: a new message supersedes it. Writes nothing when there is none. */
+  private async abandonBudgetPause(conversation: Pick<Conversation, "id" | "state">, ctx: RouteContext): Promise<void> {
+    if (!readHitl(conversation.state)?.budgetPause) return;
+    await this.mutateConversation(conversation.id, ctx.context, (fresh) => {
+      const store = readHitl(fresh.state);
+      if (!store?.budgetPause) return null;
+      const { budgetPause: _given, ...rest } = store;
+      return { state: writeHitl(fresh.state, rest) };
+    });
+  }
+
   /** One message turn: stores the user message, runs the agent, stores the answer (and what it waits on). */
   private async executeMessage(
     run: ActiveRun,
@@ -2673,6 +2695,10 @@ export class AgentServer {
 
     // (a follower that joins from here on is shown the message even if it reads the stored history before the message was in it)
     run.userMessage = { id: userMessage.id, content: body.message, files };
+
+    // A message goes on from the conversation as it is: a turn the budget cut short is given up, not left to be
+    // continued behind the person's back if this turn fails
+    await this.abandonBudgetPause(conversation, ctx);
 
     run.emit({
       events: [
@@ -4602,11 +4628,16 @@ export class AgentServer {
       const activeRunId = active?.id ?? (lease?.data?.runId as string | undefined);
       const running = !!active || !!lease;
       const stop = summary?.stopReason as StopReason | undefined;
-      // Paused on its budget: the last turn stopped on it, the conversation is set to wait, and the budget is still used up
-      // (raising or removing it makes the conversation idle again, ready to continue)
+      // Paused on its budget: the last turn stopped on it and either
+      //  - the turn was cut short, and its state is kept to carry on from (`budgetPause`): it stays paused after the budget is
+      //    raised or removed, until `POST .../continue` carries it on or a new message gives it up; or
+      //  - the turn finished its answer as it crossed the limit, the conversation is set to wait, and the budget is still used up
+      //    (raising or removing it makes the conversation idle again: there is nothing to carry on).
       const budget = this.effectiveBudget(conversation);
       const budgetPaused =
-        stop === "budget_reached" && budget?.onReach === "pause" && this.spentOf(conversation) >= budget.maxCostUsd;
+        stop === "budget_reached" &&
+        (!!readHitl(conversation.state)?.budgetPause ||
+          (budget?.onReach === "pause" && this.spentOf(conversation) >= budget.maxCostUsd));
       const status: ConversationRuntime["status"] = running
         ? "running"
         : pendingActionIds.length > 0

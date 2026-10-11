@@ -188,6 +188,7 @@ interface Conversation {
   updatedAt: Date;
   // in API responses: where the conversation is in its run lifecycle, and its budget
   runtime?: { status: 'idle' | 'running' | 'requires_action' | 'budget_paused'; stopReason?: string; lastEventSeq: number; pendingActionIds: string[] };
+  continuable?: boolean;   // a turn the budget cut short waits for POST /conversations/:id/continue
   budget?: { maxCostUsd: number; onReach: 'pause' | 'stop' } | null;
   spentUsd?: number;
 }

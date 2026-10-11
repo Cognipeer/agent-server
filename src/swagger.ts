@@ -155,6 +155,14 @@ function generateSchemas(): Record<string, unknown> {
         metadata: { type: "object", additionalProperties: true },
         state: { type: "object", additionalProperties: true },
         runtime: { $ref: "#/components/schemas/ConversationRuntime" },
+        continuable: {
+          type: "boolean",
+          description:
+            "Whether POST .../continue has a turn to carry on: the budget cut a turn short in the middle and its state is kept. Present wherever runtime is. " +
+            "It stays true after the budget is raised or removed (the raise only makes room) until the turn is continued or a new message gives it up; " +
+            "false for a turn that finished its answer before the limit (raising the budget then only reopens the conversation), and while a turn runs or waits on a person. " +
+            "While the budget is still used up, continue answers 402 budget_reached.",
+        },
         budget: {
           $ref: "#/components/schemas/SessionBudget",
           description: "The conversation's spend limit, when it has one (its own, or the agent's default).",
@@ -185,7 +193,7 @@ function generateSchemas(): Record<string, unknown> {
           enum: ["pause", "stop"],
           default: "pause",
           description:
-            "pause: the conversation waits (runtime.status budget_paused); raise the budget and POST .../continue carries the stopped turn on. " +
+            "pause: the conversation waits (runtime.status budget_paused); raise the budget and POST .../continue carries the stopped turn on (the conversation's continuable says there is one; a turn that finished its answer before the limit is not continuable, the raise only reopens). " +
             "stop: it ends (runtime.status idle) and nothing is kept to carry on from.",
         },
       },
@@ -250,7 +258,10 @@ function generateSchemas(): Record<string, unknown> {
         status: {
           type: "string",
           enum: ["idle", "running", "requires_action", "budget_paused"],
-          description: "running: a turn is executing (on this or another node). requires_action: it waits on pendingActionIds.",
+          description:
+            "running: a turn is executing (on this or another node). requires_action: it waits on pendingActionIds. " +
+            "budget_paused: the last turn stopped on the budget - the budget is still used up, or the turn was cut short and waits for POST .../continue " +
+            "(it stays budget_paused after a raise until it is continued or a new message gives it up; see the conversation's continuable).",
         },
         stopReason: {
           $ref: "#/components/schemas/StopReason",
@@ -1251,7 +1262,8 @@ function generatePaths(
         },
         responses: {
           200: {
-            description: "Conversation updated (with its runtime when the budget was changed)",
+            description:
+              "Conversation updated (with its runtime and continuable when the budget was changed: continuable true means a stopped turn waits for POST .../continue)",
             content: {
               "application/json": {
                 schema: { $ref: "#/components/schemas/Conversation" },
@@ -1466,7 +1478,7 @@ function generatePaths(
         summary: "Carry on a turn the conversation's budget stopped",
         description:
           "Resumes the agent from the state the budget stopped it in, with no new message (JSON, or SSE when stream is true). Raise the budget " +
-          "first (PATCH /conversations/{id}). 402 budget_reached while it is still used up; 409 action_pending while the conversation waits on a " +
+          "first (PATCH /conversations/{id}; the conversation's continuable says a stopped turn waits). 402 budget_reached while it is still used up; 409 action_pending while the conversation waits on a " +
           "person; 409 nothing_to_continue when no turn was stopped by the budget (onReach: stop keeps nothing to carry on from, and a turn that " +
           "only crossed the budget finished its answer).",
         operationId: "continueConversation",

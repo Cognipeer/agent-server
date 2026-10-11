@@ -920,6 +920,8 @@ function suite(harness: ProviderHarness) {
 
       const conv = (await t.get()).conversation;
       expect(conv.runtime).toMatchObject({ status: "budget_paused", stopReason: "budget_reached" });
+      // cut short: there is a stopped turn to carry on once the budget allows
+      expect(conv.continuable).toBe(true);
       const log = await t.events();
       const reached = log.find((e) => e.type === "budget.reached")!;
       expect(reached.data).toMatchObject({ max_cost_usd: 0.5, on_reach: "pause" });
@@ -964,8 +966,10 @@ function suite(harness: ProviderHarness) {
       expect(authorize.mock.calls[0]![1]).toMatchObject({ current: { maxCostUsd: 0.5, onReach: "pause" }, requested: { maxCostUsd: 5, onReach: "pause" } });
       expect(authorize.mock.calls[0]![1].spentUsd).toBeCloseTo(0.6, 8);
       expect((raised.body as any).budget).toEqual({ maxCostUsd: 5, onReach: "pause" });
-      // no longer paused, but there is something to carry on
-      expect((raised.body as any).runtime).toMatchObject({ status: "idle", stopReason: "budget_reached" });
+      // the raise only made room: the cut-short turn is still waiting to be carried on
+      expect((raised.body as any).runtime).toMatchObject({ status: "budget_paused", stopReason: "budget_reached" });
+      expect((raised.body as any).continuable).toBe(true);
+      expect((await t.get()).conversation).toMatchObject({ continuable: true, runtime: { status: "budget_paused" } });
 
       const resumed = await t.cont();
       expect(resumed.status).toBe(200);
@@ -982,13 +986,119 @@ function suite(harness: ProviderHarness) {
       expect(carried.input.ctx?.__limitBreached).toBeUndefined();
       expect(carried.config.limits.maxCostUsd).toBeCloseTo(5 - 0.6 + 0.6, 8);
       expect(((await t.get()).messages as any[]).map((m) => m.role)).toEqual(["user", "assistant", "assistant"]);
-      expect((await t.get()).conversation.runtime.status).toBe("idle");
+      expect((await t.get()).conversation).toMatchObject({ continuable: false, runtime: { status: "idle", stopReason: "end_turn" } });
 
       // done: nothing left to carry on
       const again = await t.cont();
       expect(again.status).toBe(409);
       expect((again.body as any).error.code).toBe("nothing_to_continue");
       expect((await t.raw())!.state && JSON.stringify((await t.raw())!.state)).not.toContain("budgetPause");
+    });
+
+    it("a turn the budget cut short stays resumable after a raise: budget_paused and continuable on the read, the list and the PATCH answer", async () => {
+      const { agent, config } = budgeted({ authorizeBudget: () => true });
+      const original = agent.invoke;
+      const hold = gate();
+      // (a carried state has an iteration: only the continuation waits)
+      agent.invoke = async (input: any, cfg: any) => {
+        if (typeof input.iteration === "number") await hold.promise;
+        return original(input, cfg);
+      };
+      const t = await boot(agent, config);
+      const listed = async () => ((await t.call("GET", "/conversations")).body as any).conversations.find((c: any) => c.id === t.id);
+
+      // nothing stopped yet
+      expect((await t.get()).conversation).toMatchObject({ continuable: false, runtime: { status: "idle" } });
+
+      await t.send("work");
+      const stopped = { continuable: true, runtime: { status: "budget_paused", stopReason: "budget_reached" } };
+      expect((await t.get()).conversation).toMatchObject(stopped);
+      expect(await listed()).toMatchObject(stopped);
+      // a PATCH that leaves the budget alone does not compute the runtime, so it says nothing about continuing
+      const renamed = (await t.patch({ title: "renamed" })).body as any;
+      expect(renamed.runtime).toBeUndefined();
+      expect(renamed.continuable).toBeUndefined();
+
+      // a raise that is not enough leaves it as it was; a raise that is enough only makes room
+      const raised = (await t.patch({ budget: { maxCostUsd: 5 } })).body as any;
+      expect(raised).toMatchObject({ budget: { maxCostUsd: 5, onReach: "pause" }, ...stopped });
+      expect((await t.get()).conversation).toMatchObject(stopped);
+      expect(await listed()).toMatchObject(stopped);
+      // asking for the same budget again is no change and says the same
+      expect(((await t.patch({ budget: { maxCostUsd: 5 } })).body as any)).toMatchObject(stopped);
+
+      // while the continuation runs, nothing is left to start
+      const running = t.cont();
+      await eventually(async () => (await t.get()).conversation.runtime?.status === "running", 4000, "the continuation to run");
+      expect((await t.get()).conversation).toMatchObject({ continuable: false, runtime: { status: "running" } });
+      hold.open(undefined);
+      expect((await running).status).toBe(200);
+      expect((await t.get()).conversation).toMatchObject({ continuable: false, runtime: { status: "idle", stopReason: "end_turn" } });
+      expect(await listed()).toMatchObject({ continuable: false, runtime: { status: "idle" } });
+    });
+
+    it("removing the budget keeps a cut-short turn resumable too", async () => {
+      const { agent, config } = budgeted({ authorizeBudget: () => true });
+      const t = await boot(agent, config);
+      await t.send("work");
+      const removed = await t.patch({ budget: null });
+      expect(removed.status).toBe(200);
+      expect((removed.body as any).budget).toBeUndefined();
+      expect(removed.body).toMatchObject({ continuable: true, runtime: { status: "budget_paused", stopReason: "budget_reached" } });
+      const resumed = await t.cont();
+      expect(resumed.status).toBe(200);
+      expect((resumed.body as any).response.content).toBe("finished after 5 steps");
+      expect((await t.get()).conversation).toMatchObject({ continuable: false, runtime: { status: "idle", stopReason: "end_turn" } });
+    });
+
+    it("a new message gives up the stopped turn", async () => {
+      const { agent, config } = budgeted({ authorizeBudget: () => true });
+      const t = await boot(agent, config);
+      await t.send("work");
+      await t.patch({ budget: { maxCostUsd: 5 } });
+      expect(JSON.stringify((await t.raw())!.state)).toContain("budgetPause");
+      expect((await t.get()).conversation).toMatchObject({ continuable: true, runtime: { status: "budget_paused" } });
+
+      expect((await t.send("something else")).status).toBe(200);
+      expect((await t.get()).conversation).toMatchObject({ continuable: false, runtime: { status: "idle", stopReason: "end_turn" } });
+      const gone = await t.cont();
+      expect(gone.status).toBe(409);
+      expect((gone.body as any).error.code).toBe("nothing_to_continue");
+      expect(JSON.stringify((await t.raw())!.state)).not.toContain("budgetPause");
+    });
+
+    it("a new message gives up the stopped turn even when the turn it starts fails", async () => {
+      const { agent, config } = budgeted({ authorizeBudget: () => true });
+      const original = agent.invoke;
+      let fail = false;
+      agent.invoke = async (input: any, cfg: any) => {
+        // (a carried state has an iteration; a new turn starts from messages)
+        if (fail && typeof input.iteration !== "number") throw new Error("model down");
+        return original(input, cfg);
+      };
+      const t = await boot(agent, config);
+      await t.send("work");
+      await t.patch({ budget: { maxCostUsd: 5 } });
+      expect((await t.get()).conversation).toMatchObject({ continuable: true, runtime: { status: "budget_paused" } });
+
+      fail = true;
+      expect((await t.send("and this one fails")).status).toBeGreaterThanOrEqual(500);
+      expect((await t.get()).conversation).toMatchObject({ continuable: false, runtime: { status: "idle", stopReason: "error" } });
+      // the old turn does not come back behind the newer message
+      const none = await t.cont();
+      expect(none.status).toBe(409);
+      expect((none.body as any).error.code).toBe("nothing_to_continue");
+      expect(JSON.stringify((await t.raw())!.state)).not.toContain("budgetPause");
+    });
+
+    it("a refused message (budget still used up) does not give the stopped turn up", async () => {
+      const { agent, config } = budgeted({ authorizeBudget: () => true });
+      const t = await boot(agent, config);
+      await t.send("work");
+      expect((await t.send("more")).status).toBe(402);
+      expect((await t.get()).conversation).toMatchObject({ continuable: true, runtime: { status: "budget_paused" } });
+      await t.patch({ budget: { maxCostUsd: 5 } });
+      expect((await t.cont()).status).toBe(200);
     });
 
     it("streams a continuation", async () => {
@@ -1090,8 +1200,10 @@ function suite(harness: ProviderHarness) {
       expect(body.stopReason).toBe("budget_reached");
       const conv = (await t.get()).conversation;
       expect(conv.runtime).toMatchObject({ status: "idle", stopReason: "budget_reached" });
+      expect(conv.continuable).toBe(false);
       expect((await t.send("more")).status).toBe(402);
-      await t.patch({ budget: { maxCostUsd: 5, onReach: "stop" } });
+      const raised = await t.patch({ budget: { maxCostUsd: 5, onReach: "stop" } });
+      expect((raised.body as any).continuable).toBe(false);
       // no state was kept to carry on from
       const none = await t.cont();
       expect(none.status).toBe(409);
@@ -1104,17 +1216,27 @@ function suite(harness: ProviderHarness) {
       const agent = steppingStub({ steps: 3 });
       const original = agent.invoke;
       agent.invoke = (input: any, config: any) => original(input, { ...config, limits: undefined });
-      const t = await boot(agent, { pricing: testPricing, budget: { maxCostUsd: 0.5, onReach: "pause" } });
+      const t = await boot(agent, { pricing: testPricing, budget: { maxCostUsd: 0.5, onReach: "pause" }, authorizeBudget: () => true });
       const res = (await t.send("work")).body as any;
       expect(res.response.content).toBe("finished after 3 steps");
       expect(res.response.status).toBe("completed");
       expect(res.stopReason).toBe("budget_reached");
       expect(res.status).toBeUndefined();
-      expect((await t.get()).conversation.runtime.status).toBe("budget_paused");
+      expect((await t.get()).conversation).toMatchObject({ continuable: false, runtime: { status: "budget_paused", stopReason: "budget_reached" } });
       // nothing was cut short, so there is nothing to carry on
       const cont = await t.cont();
       expect([402, 409]).toContain(cont.status);
       expect((await t.send("more")).status).toBe(402);
+
+      // a raise only reopens the conversation: idle, still nothing to continue
+      const raised = await t.patch({ budget: { maxCostUsd: 5, onReach: "pause" } });
+      expect(raised.status).toBe(200);
+      expect((raised.body as any).runtime).toMatchObject({ status: "idle", stopReason: "budget_reached" });
+      expect((raised.body as any).continuable).toBe(false);
+      const none = await t.cont();
+      expect(none.status).toBe(409);
+      expect((none.body as any).error.code).toBe("nothing_to_continue");
+      expect((await t.send("more")).status).toBe(200);
     });
 
     it("counts the cost of a cancelled turn", async () => {
@@ -1245,9 +1367,11 @@ function restartSuite(handle: () => OpenedProvider) {
       });
       const get = async () => (await next.handleRoute("GET", `/conversations/${t.id}`, { query: {} })).body as any;
       const before = (await get()).conversation;
-      expect(before).toMatchObject({ runtime: { status: "budget_paused" }, budget: { maxCostUsd: 0.5 } });
+      expect(before).toMatchObject({ runtime: { status: "budget_paused" }, continuable: true, budget: { maxCostUsd: 0.5 } });
       expect(before.spentUsd).toBeCloseTo(0.6, 8);
-      await next.handleRoute("PATCH", `/conversations/${t.id}`, { query: {}, body: { budget: { maxCostUsd: 5 } } });
+      const raised = await next.handleRoute("PATCH", `/conversations/${t.id}`, { query: {}, body: { budget: { maxCostUsd: 5 } } });
+      expect(raised.body).toMatchObject({ runtime: { status: "budget_paused" }, continuable: true });
+      expect((await get()).conversation).toMatchObject({ runtime: { status: "budget_paused" }, continuable: true });
       const resumed = await next.handleRoute("POST", `/conversations/${t.id}/continue`, { query: {}, body: {} });
       expect(resumed.status).toBe(200);
       expect((resumed.body as any).response.content).toBe("finished after 5 steps");

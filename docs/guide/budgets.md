@@ -61,7 +61,7 @@ A budget needs prices: a budget on an agent nothing can price is refused when th
 
 | `onReach` | When the limit is reached |
 |-----------|---------------------------|
-| `pause` (default) | the conversation waits. `runtime.status` is `budget_paused`. Raise the budget, then `POST /conversations/:id/continue` carries the stopped turn on. |
+| `pause` (default) | the conversation waits. `runtime.status` is `budget_paused`. Raise the budget, then `POST /conversations/:id/continue` carries the stopped turn on (when the turn was cut short; see `continuable` below). |
 | `stop` | the conversation ends: `runtime.status` is `idle`, nothing is kept to carry on from, and every further message is refused until the budget is raised. |
 
 ### What happens when it is reached
@@ -104,6 +104,17 @@ POST /conversations/conv_1/continue                          # { "stream": true 
   `402 budget_reached` while the budget is still used up, `409 action_pending` while the conversation waits on a person, `409 nothing_to_continue` when there is nothing to carry on (`onReach: "stop"`,
   a turn that only crossed the line, or the turn was already carried on). Only agent-sdk agents can be continued: the stopped state is kept next to the conversation's pause state and counts against `limits.maxStateBytes`.
 - A new message instead of `continue` discards the stopped state and starts a fresh turn.
+
+**`continuable`** tells a client whether there is a stopped turn to carry on. `GET /conversations/:id`, the conversations list and the `PATCH` answer carry it next to `runtime`:
+
+| The last turn | `runtime.status` | `continuable` | After a raise |
+|---------------|------------------|---------------|---------------|
+| was cut short by the budget (`incomplete`, `onReach: "pause"`) | `budget_paused` | `true` | still `budget_paused` and `true`: `POST .../continue` resumes it, or a new message gives it up |
+| finished its answer, and crossed the limit | `budget_paused` while the budget is used up | `false` | `idle`, `false`: the raise only reopens the conversation, there is nothing to carry on |
+| was carried on, or superseded by a new message | `idle` | `false` | |
+
+A client's "Increase and continue" is therefore: `PATCH` the budget, call `continue` only if the answer says `continuable: true`, then read the conversation again (`spentUsd`, `runtime`). Before `continuable` existed a client had
+to guess from `runtime.status`, and a raise turned a cut-short turn's `budget_paused` into `idle`, which looked like nothing to continue.
 
 Every conversation shows `budget` and `spentUsd` (`GET /conversations`, `GET /conversations/:id`), and `runtime.status` is `budget_paused` while it waits on its budget.
 

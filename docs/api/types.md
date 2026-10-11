@@ -74,6 +74,12 @@ interface Conversation {
   updatedAt: Date;
   /** Computed by the API on GET /conversations and GET /conversations/:id; never stored. */
   runtime?: ConversationRuntime;
+  /**
+   * Present with `runtime`. True when a turn the budget cut short in the middle waits for `POST /conversations/:id/continue`:
+   * it stays true after the budget is raised or removed, until the turn is continued or a new message gives it up.
+   * False for a turn that finished its answer before the limit (a raise only reopens the conversation).
+   */
+  continuable?: boolean;
   /** The spend limit of the conversation (its own, or its agent's default) and what it has spent. See guide/budgets. */
   budget?: SessionBudget | null;
   spentUsd?: number;
@@ -94,7 +100,7 @@ interface SessionBudget {
 
 ```typescript
 interface ConversationRuntime {
-  status: 'idle' | 'running' | 'requires_action' | 'budget_paused';
+  status: 'idle' | 'running' | 'requires_action' | 'budget_paused';   // budget_paused: stopped on the budget, still used up - or cut short and not yet continued
   stopReason?: StopReason;      // why the last turn stopped; absent while one runs
   lastEventSeq: number;         // seq of the newest event (0: none)
   pendingActionIds: string[];

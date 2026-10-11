@@ -98,7 +98,7 @@ GET /conversations
 }
 ```
 
-`runtime` says whether the conversation is running, waiting for a human or idle, and why its last turn stopped - see [Runs, Cancel & Reattach](../guide/runs).
+`runtime` says whether the conversation is running, waiting for a human or idle, and why its last turn stopped - see [Runs, Cancel & Reattach](../guide/runs). `continuable` (next to it, in `GET /conversations/:id` too) says whether a turn the [budget](../guide/budgets) cut short waits for `POST /conversations/:id/continue`.
 
 The list is **one user's**: `context.user` from `resolveContext`, else the token user (or `auth.resolveUserId`), else - only when the request carries no identity at all - `?userId=`. An identity the server
 established always wins: with token auth or `resolveContext`, `userId` in the query is ignored (see [Request Context](../guide/request-context#which-identity-counts)). A request that names nobody would list
@@ -213,7 +213,7 @@ PATCH /conversations/:id
 Every field is optional. `budget` sets the conversation's spend limit (`null` removes it); lowering it is the owner's to do, raising or removing it goes through the
 `authorizeBudget` option (`403 budget_forbidden` without it), and it has to be above what the conversation has spent (`400 invalid_budget`). See [Usage & Budgets](../guide/budgets).
 
-**Response:** the conversation (with its `runtime` when `budget` was changed, so a client sees `budget_paused` become `idle`).
+**Response:** the conversation, with its `runtime` and `continuable` when `budget` was changed. A turn the budget cut short in the middle stays `budget_paused` after a raise and `continuable` is `true`: `POST /conversations/:id/continue` carries it on. A turn that finished its answer before the limit has nothing to carry on: the raise only reopens the conversation (`runtime.status` becomes `idle`, `continuable` is `false`).
 
 ```json
 {

@@ -86,6 +86,13 @@ export interface Conversation {
   spentUsd?: number;
   /** Tools the person asked not to be asked about again in this conversation (API only). */
   rememberedTools?: string[];
+  /**
+   * Whether `POST /conversations/:id/continue` has a turn to carry on: the budget cut a turn short in the middle and its
+   * state is kept (API only; present where `runtime` is). It stays `true` after the budget is raised or removed - until the
+   * turn is continued, or a new message gives it up - and is `false` for a turn that finished its answer before the limit
+   * (raising the budget then only reopens the conversation). While the budget is still used up, `continue` answers 402.
+   */
+  continuable?: boolean;
 }
 
 /** Why a turn stopped. Stored on the assistant message (`metadata.stopReason`) and in `session.status_idle` events. */
