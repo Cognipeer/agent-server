@@ -80,6 +80,12 @@ import type {
   UpdateConversationRequest,
   ContinueConversationRequest,
   RememberedToolsResponse,
+  HostAgent,
+  HostAgentDefinition,
+  HostCancelInput,
+  HostCancelReason,
+  HostFiles,
+  HostRunIo,
 } from "./types.js";
 import {
   BUDGET_STATE_KEY,
@@ -116,6 +122,7 @@ import {
   snapshotLedger,
 } from "./usage.js";
 import { findToolSchema, validateAgainstSchema } from "./schema.js";
+import { hostAgentRegistration, readHostEvent, readHostResult, type HostCollected } from "./host.js";
 import { generateOpenAPISpec, generateSwaggerHTML } from "./swagger.js";
 import {
   invokeChatCompletions,
@@ -387,6 +394,24 @@ interface AgentStep {
 
 const cancelledStep = (content: string): AgentStep => ({ content, pending: [], cancelled: true });
 
+/** The same request, whatever deadline the server stamped on it. */
+const sameRequest = (a: PendingAction, b: PendingAction): boolean => {
+  const { expiresAt: _a, ...left } = a;
+  const { expiresAt: _b, ...right } = b;
+  return isDeepStrictEqual(left, right);
+};
+
+/**
+ * A step that says nothing but "I still wait on the rest": no answer, files, usage or stop of its own, and exactly the
+ * open requests of the pause, unchanged. Such an answer is only recorded; it does not start a new message.
+ */
+function stillWaiting(step: AgentStep, remaining: PendingAction[]): boolean {
+  if (step.cancelled || step.content !== "" || step.files?.length || step.usage || step.warnings?.length) return false;
+  if (step.stopReason !== undefined && step.stopReason !== "requires_action") return false;
+  if (remaining.length === 0 || step.pending.length !== remaining.length) return false;
+  return remaining.every((old) => step.pending.some((p) => p.id === old.id && sameRequest(p, old)));
+}
+
 /** What a turn needs to know about money (see `planTurnBudget`). */
 interface TurnBudget {
   pricing?: PricingFn;
@@ -526,6 +551,8 @@ type RouteHandler<T = unknown> = (ctx: RouteContext) => Promise<RouteResult<T>>;
 
 interface Route {
   method: "GET" | "POST" | "PATCH" | "DELETE";
+  /** The path as it was declared (`/conversations/:conversationId`), relative to the base path. */
+  path: string;
   pattern: RegExp;
   paramNames: string[];
   handler: RouteHandler;
@@ -949,6 +976,23 @@ export class AgentServer {
   }
 
   /**
+   * Whose records a list request may return. A request with no resolved user would list the data of EVERYONE, so it is
+   * refused (401 `identity_required`) unless the host said the server is single-user by design (`allowAnonymousList`).
+   */
+  private async listOwner(ctx: RouteContext, requested?: string): Promise<string | undefined> {
+    const userId = (await this.effectiveUserId(ctx, requested)) || undefined;
+    if (userId === undefined && !this.config.allowAnonymousList) {
+      throw {
+        statusCode: 401,
+        code: "identity_required",
+        message:
+          "Listing needs to know who is asking: sign in. (Operators: resolve a user for the request, or set allowAnonymousList on a single-user server.)",
+      };
+    }
+    return userId;
+  }
+
+  /**
    * Verify that the current user has access to the conversation
    */
   private async verifyConversationAccess(
@@ -1104,6 +1148,30 @@ export class AgentServer {
       handler,
       ...registrationExtras(options),
     });
+  }
+
+  /**
+   * Register a host-backed agent: an agent whose work runs in the host's own backend. `invoke` gets the message and
+   * `{ emit, signal, files }`: it reports progress with typed events (text, tool use / result, usage) and returns a
+   * typed result (`content`, `status`, `stopReason`, `pendingActions`, `usage`). The server stores the messages, the
+   * pending actions, the events and the runtime status itself - the host fakes no agent state and writes none of the
+   * server's. `resolveAction` continues a turn that paused; `cancel` hears about runs and open requests the server lets
+   * go of. Hosts that resolve their agents per request return `hostAgentRegistration(definition)` from `config.agents`.
+   *
+   * @example
+   * ```ts
+   * server.registerHostAgent({
+   *   info: { id: 'support', name: 'Support' },
+   *   async invoke({ message }, { emit, signal }) {
+   *     for await (const chunk of backend.stream(message, { signal })) emit({ type: 'text', text: chunk });
+   *     return { content: '' };
+   *   },
+   * });
+   * ```
+   */
+  registerHostAgent(definition: HostAgentDefinition): void {
+    const registration = hostAgentRegistration(definition);
+    this.addAgent(registration.info.id, registration);
   }
 
   /**
@@ -1328,7 +1396,7 @@ export class AgentServer {
     });
     const pattern = new RegExp(`^${patternStr}$`);
 
-    this.routes.push({ method, pattern, paramNames, handler, public: isPublic });
+    this.routes.push({ method, path, pattern, paramNames, handler, public: isPublic });
   }
 
   // ============================================================================
@@ -1582,7 +1650,7 @@ export class AgentServer {
     const { limit, offset } = parsePaging(ctx.query, 20, this.maxPageSize);
 
     // Resolve userId: from query param, ctx.user (token), or resolveUserId callback
-    const resolvedUserId = await this.effectiveUserId(ctx, userId);
+    const resolvedUserId = await this.listOwner(ctx, userId);
     const registry = await this.resolveRegistry(ctx.context!);
 
     // Newest created first by default; `orderBy=updatedAt` lists by last activity, `order=asc` reverses
@@ -1863,6 +1931,13 @@ export class AgentServer {
       if (lease) throw this.busyError(lease.data?.runId as string | undefined);
     }
 
+    // A host agent that holds open requests of this conversation is told they are gone (a run that was stopped was told already)
+    const open = active ? undefined : readHitl(existing.state)?.pending?.actions;
+    if (open?.length) {
+      const agent = await this.getAgentFor(existing.agentId, ctx.context).catch(() => undefined);
+      await this.notifyHost(agent, { conversationId, reason: "deleted", actions: open, context: ctx.context! });
+    }
+
     await this.config.storage.deleteConversation(conversationId, ctx.context);
     this.fallbackEvents?.deleteConversation(conversationId);
     this.bus.publish(conversationId, { kind: "closed" });
@@ -2121,11 +2196,13 @@ export class AgentServer {
   ): Promise<{ actions: PendingAction[]; messageId?: string }> {
     let closed: PendingAction[] = [];
     let messageId: string | undefined;
+    let agentId: string | undefined;
     await this.mutateConversation(conversationId, rc, (fresh) => {
       const store = readHitl(fresh.state);
       closed = [];
       if (!store?.pending) return null;
       messageId = store.pending.messageId;
+      agentId = fresh.agentId;
       closed = store.pending.actions.filter((action) => !how.only || how.only(action));
       if (closed.length === 0) return null;
       const closedIds = new Set(closed.map((action) => action.id));
@@ -2162,6 +2239,17 @@ export class AgentServer {
     ];
     if (how.emit) await how.emit(events);
     else await this.appendEvents(conversationId, events, rc);
+
+    // A host agent may hold the requests itself: tell it they are gone
+    const agent = agentId ? await this.getAgentFor(agentId, rc).catch(() => undefined) : undefined;
+    if (agent?.host?.cancel) {
+      await this.notifyHost(agent, {
+        conversationId,
+        reason: how.channel === "timeout" ? "expired" : "withdrawn",
+        actions: closed,
+        context: rc ?? this.systemContext(),
+      });
+    }
     return { actions: closed, messageId };
   }
 
@@ -2650,7 +2738,7 @@ export class AgentServer {
       const turn = this.turnFilesFor(conversationId, agent, ctx.context);
       let attached = new Map<string, AssembledAttachments>();
       let warnings: TurnWarning[] = [];
-      if (!agent.handler && history.some((m) => m.role === "user" && m.files?.length)) {
+      if (!agent.handler && !agent.host && history.some((m) => m.role === "user" && m.files?.length)) {
         const assembled = await assembleHistory(history, {
           currentMessageId: x.currentMessageId,
           source: this.attachmentSource(turn),
@@ -2761,6 +2849,30 @@ export class AgentServer {
         });
       }
 
+      if (agent.host) {
+        // Host-backed agent: it reports its progress with events and returns a typed result
+        return await this.runHostStep(run, {
+          ctx,
+          agent,
+          partial,
+          turn,
+          budget: x.budget,
+          call: (host, io) =>
+            host.invoke(
+              {
+                conversationId,
+                runId: run.id,
+                message: body.message,
+                history,
+                files: files ?? [],
+                metadata: x.handlerMetadata ?? body.metadata,
+                context: ctx.context!,
+              },
+              io
+            ),
+        });
+      }
+
       if (agent.handler) {
         // Custom handler (not streaming; a streamed request gets a progress frame and the whole answer at once)
         if (run.streaming) {
@@ -2815,6 +2927,162 @@ export class AgentServer {
       code: "INTERNAL_ERROR",
       message: "Agent has no handler",
     };
+  }
+
+  /** The conversation's files as a host agent reads them (`io.files`). */
+  private hostFiles(turn: TurnFiles): HostFiles {
+    const readers = this.handlerFileReaders(turn);
+    return {
+      list: async () => (await turn.list()).map(attachmentOf),
+      read: async (fileId) => (await readers.getFileContent!(fileId)) ?? null,
+      text: async (fileId) => (await readers.getFileText!(fileId)) ?? null,
+    };
+  }
+
+  /**
+   * Tells a host agent that the server lets go of something. A failing hook is logged; it never fails the request, and one
+   * that does not answer within `runs.cancelGraceMs` is given up on (the conversation is not held for a hook).
+   */
+  private async notifyHost(agent: AgentRegistration | undefined, input: HostCancelInput): Promise<void> {
+    const cancel = agent?.host?.cancel;
+    if (!cancel) return;
+    const limit = this.runCfg.cancelGraceMs;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.resolve().then(() => cancel(input)),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`it did not answer within ${limit} ms`)), limit);
+          timer.unref?.();
+        }),
+      ]);
+    } catch (error) {
+      console.error(`[AgentServer] The cancel hook of host agent ${agent!.info.id} failed:`, error);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * The agent's side of a turn for a host-backed agent (a message or an answer). What it emits becomes the run's
+   * stored events and live output - the same ones an agent-sdk agent produces - and what it returns is checked and
+   * reduced to a step. Cancelling the run aborts `io.signal` and calls the agent's `cancel` hook.
+   */
+  private async runHostStep(
+    run: ActiveRun,
+    x: {
+      ctx: RouteContext;
+      agent: AgentRegistration;
+      partial: { text: string };
+      turn: TurnFiles;
+      budget: TurnBudget;
+      /** Calls `invoke` or `resolveAction`. */
+      call: (host: HostAgent, io: HostRunIo) => Promise<unknown> | unknown;
+    }
+  ): Promise<AgentStep> {
+    const { agent, partial } = x;
+    const host = agent.host!;
+    // Cancelled before it started: nothing to run
+    if (run.cancelled) return cancelledStep(partial.text);
+
+    const collected: HostCollected = { actions: [], usage: [] };
+    const bridge = createSdkBridge(run, partial);
+    const toolNames = new Map<string, string>();
+    let open = true;
+    let warned = false;
+    const io: HostRunIo = {
+      signal: run.signal,
+      files: this.hostFiles(x.turn),
+      emit: (raw) => {
+        // (an agent that was abandoned after a cancellation, or that kept a handle past its turn, may still report)
+        if (!open) return;
+        const read = readHostEvent(raw);
+        if (!read.ok) {
+          if (!warned) {
+            warned = true;
+            console.warn(`[AgentServer] Host agent ${agent.info.id} reported an event the server ignored: ${read.message}`);
+          }
+          return;
+        }
+        const event = read.value;
+        switch (event.type) {
+          case "text":
+            if (event.text !== "") bridge.onStream({ text: event.text });
+            break;
+          case "tool_use":
+            toolNames.set(event.id, event.name);
+            bridge.onEvent({ type: "tool_call", phase: "start", id: event.id, name: event.name, args: event.args ?? {} });
+            break;
+          case "tool_result":
+            bridge.onEvent({
+              type: "tool_call",
+              phase: event.error !== undefined ? "error" : "success",
+              id: event.id,
+              name: event.name ?? toolNames.get(event.id),
+              result: event.result,
+              ...(event.error !== undefined ? { error: { message: event.error } } : {}),
+            });
+            break;
+          case "action_required": {
+            // (stored and announced when the turn ends: the pause is persisted before anyone is told about it)
+            const known = new Set(collected.actions.map((a) => a.id));
+            collected.actions.push(...event.actions.filter((a) => !known.has(a.id)));
+            break;
+          }
+          case "usage":
+            collected.usage.push(event.usage);
+            break;
+          case "stop":
+            collected.stopReason = event.stopReason;
+            collected.detail = event.detail;
+            break;
+        }
+      },
+    };
+
+    const onAbort = () => {
+      void this.notifyHost(agent, {
+        conversationId: run.conversationId,
+        runId: run.id,
+        reason: (run.cancelReason ?? "user") as HostCancelReason,
+        context: x.ctx.context!,
+      });
+    };
+    run.signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      const raced = await run.raceCancel(
+        Promise.resolve().then(() => x.call(host, io)),
+        this.runCfg.cancelGraceMs
+      );
+      if ("abandoned" in raced) return cancelledStep(partial.text);
+      const step = readHostResult(agent.info.id, raced.value, collected, { pricing: x.budget.pricing });
+      // A turn that streamed its answer and returned no text of its own: what was streamed is the answer
+      const content = step.content !== "" ? step.content : partial.text;
+      // Nothing was streamed but the request asked for a stream: the whole answer goes out once, so no bubble stays empty
+      if (run.streaming && !bridge.streamedAnyText && content) {
+        run.emit({
+          delta: content,
+          frame: (seq) => ({ type: "stream.text", timestamp: Date.now(), text: content, isFinal: true, seq } satisfies StreamTextEvent),
+        });
+      }
+      return {
+        content,
+        files: step.files,
+        usage: step.usage,
+        pending: step.pending,
+        handlerMetadata: step.metadata,
+        cancelled: run.cancelled,
+        stopReason: step.stopReason,
+        handlerStatus: normalizeTurnStatus(step.status, step.pending),
+        detail: step.detail,
+      };
+    } catch (error) {
+      if (run.cancelled) return cancelledStep(partial.text);
+      throw error;
+    } finally {
+      open = false;
+      run.signal.removeEventListener("abort", onAbort);
+    }
   }
 
   /** The input of a model call written by the server (Chat Completions, Responses) with its image references read from storage. */
@@ -3353,7 +3621,11 @@ export class AgentServer {
       throw { statusCode: 404, code: "NOT_FOUND", message: `Agent not found: ${initial.agentId}` } as NotFoundError;
     }
     const useSdk = !!agent.sdkAgent;
-    const supported = useSdk ? supportsSdkPause(agent.sdkAgent) : typeof agent.handler?.resolveAction === "function";
+    const supported = useSdk
+      ? supportsSdkPause(agent.sdkAgent)
+      : agent.host
+        ? typeof agent.host.resolveAction === "function"
+        : typeof agent.handler?.resolveAction === "function";
     if (!supported) {
       throw { statusCode: 404, code: "NOT_FOUND", message: "This agent does not support resolving actions" } as NotFoundError;
     }
@@ -3476,6 +3748,62 @@ export class AgentServer {
   }
 
   /**
+   * The end of an answer that left other actions of the pause open: the answer is recorded on the message that asked, and the
+   * connection hears what is still open. No turn ran, so there is no new message.
+   */
+  private async partialOutcome(
+    run: ActiveRun,
+    ctx: RouteContext,
+    x: {
+      conversationId: string;
+      pending: NonNullable<HitlStore["pending"]>;
+      action: PendingAction;
+      answered: SettledAction;
+      remaining: PendingAction[];
+    }
+  ): Promise<TurnOutcome> {
+    const { conversationId, pending, action, answered, remaining } = x;
+    await this.settleOnMessage(pending.messageId, new Map([[action.id, answered]]), ctx.context);
+
+    const paused = await this.config.storage.getMessage(pending.messageId, ctx.context);
+    const now = new Date();
+    const assistant: Message =
+      paused ?? { id: pending.messageId, conversationId, role: "assistant", content: "", createdAt: now, updatedAt: now };
+    run.emit({
+      frame: (seq) => ({
+        type: "stream.action_required",
+        timestamp: Date.now(),
+        conversationId,
+        messageId: assistant.id,
+        actions: remaining,
+        seq,
+      } satisfies StreamActionRequiredEvent),
+    });
+    run.emit({
+      frame: (seq) => ({
+        type: "stream.done",
+        timestamp: Date.now(),
+        conversationId,
+        messageId: assistant.id,
+        content: typeof assistant.content === "string" ? assistant.content : JSON.stringify(assistant.content),
+        status: "requires_action",
+        pendingActions: remaining,
+        stopReason: "requires_action",
+        runId: run.id,
+        seq,
+      } satisfies StreamDoneEvent),
+    });
+    return {
+      assistant,
+      content: typeof assistant.content === "string" ? assistant.content : "",
+      pendingActions: remaining,
+      status: "requires_action",
+      stopReason: "requires_action",
+      partial: true,
+    };
+  }
+
+  /**
    * Records one answer and, when it was the last open action of the pause, continues the turn. An answer that leaves
    * other actions open is written with a compare-and-set against the conversation as it is now (the decision applied
    * to the stored state, never to a copy read earlier), so answers to the actions of one pause lose none of each other.
@@ -3526,6 +3854,8 @@ export class AgentServer {
     const rememberAdd: string[] = [];
     const partial = { text: "" };
     let step: AgentStep;
+    /** Actions of this pause that the turn did not carry on (a host agent that stopped asking for them). */
+    const withdrawn = new Map<string, SettledAction>();
 
     if (sdk) {
       if (resolution.type === "tool_approval" && resolution.decision === "allow" && resolution.rememberForSession
@@ -3566,44 +3896,7 @@ export class AgentServer {
           };
           return { state: writeHitl(fresh.state, hitl), actionDueAt: earliestDeadline(left) ?? (fresh.actionDueAt ? null : undefined) };
         });
-        await this.settleOnMessage(pending.messageId, new Map([[action.id, answered]]), ctx.context);
-
-        const paused = await this.config.storage.getMessage(pending.messageId, ctx.context);
-        const now = new Date();
-        const assistant: Message =
-          paused ?? { id: pending.messageId, conversationId, role: "assistant", content: "", createdAt: now, updatedAt: now };
-        run.emit({
-          frame: (seq) => ({
-            type: "stream.action_required",
-            timestamp: Date.now(),
-            conversationId,
-            messageId: assistant.id,
-            actions: remaining,
-            seq,
-          } satisfies StreamActionRequiredEvent),
-        });
-        run.emit({
-          frame: (seq) => ({
-            type: "stream.done",
-            timestamp: Date.now(),
-            conversationId,
-            messageId: assistant.id,
-            content: typeof assistant.content === "string" ? assistant.content : JSON.stringify(assistant.content),
-            status: "requires_action",
-            pendingActions: remaining,
-            stopReason: "requires_action",
-            runId: run.id,
-            seq,
-          } satisfies StreamDoneEvent),
-        });
-        return {
-          assistant,
-          content: typeof assistant.content === "string" ? assistant.content : "",
-          pendingActions: remaining,
-          status: "requires_action",
-          stopReason: "requires_action",
-          partial: true,
-        };
+        return this.partialOutcome(run, ctx, { conversationId, pending, action, answered, remaining });
       }
 
       run.emit({ events: [{ type: EVENT_TYPES.statusRunning, data: { trigger: run.trigger } }] });
@@ -3612,6 +3905,73 @@ export class AgentServer {
       } catch (error) {
         if (run.cancelled) step = cancelledStep(partial.text);
         else throw error;
+      }
+    } else if (agent.host) {
+      run.emit({ events: [{ type: EVENT_TYPES.statusRunning, data: { trigger: run.trigger } }] });
+      try {
+        step = await this.runHostStep(run, {
+          ctx,
+          agent,
+          partial,
+          turn: this.turnFilesFor(conversationId, agent, ctx.context),
+          budget: budget!,
+          call: (host, io) =>
+            host.resolveAction!(
+              {
+                conversationId,
+                runId: run.id,
+                actionId: action.id,
+                action,
+                resolution,
+                pendingActions: remaining,
+                actor,
+                channel: resolveRun.channel,
+                ...(resolveRun.expired && { expired: true }),
+                metadata: resolveRun.metadata,
+                context: ctx.context!,
+              },
+              io
+            ),
+        });
+      } catch (error) {
+        if (run.cancelled) step = cancelledStep(partial.text);
+        else throw error;
+      }
+
+      if (stillWaiting(step, remaining)) {
+        // The agent answered "I still wait on the rest": nothing happened but this answer, so there is no new message.
+        // The answer is recorded on the message that asked, the others stay open there.
+        await this.mutateConversation(conversationId, ctx.context, (fresh) => {
+          const freshStore = readHitl(fresh.state);
+          const freshPending = freshStore?.pending;
+          if (!freshPending?.actions.some((a) => a.id === action.id)) {
+            throw { statusCode: 409, code: "action_not_pending", message: `Action is not pending: ${action.id}` };
+          }
+          const left = freshPending.actions.filter((a) => a.id !== action.id);
+          if (left.length === 0) {
+            throw { statusCode: 409, code: "conversation_conflict", message: "The conversation changed while the answer was recorded. Try again." };
+          }
+          const hitl: HitlStore = { ...freshStore, pending: { ...freshPending, actions: left } };
+          return { state: writeHitl(fresh.state, hitl), actionDueAt: earliestDeadline(left) ?? (fresh.actionDueAt ? null : undefined) };
+        });
+        run.emit({
+          events: [
+            {
+              type: EVENT_TYPES.statusIdle,
+              data: { stop_reason: "requires_action", pending_action_ids: remaining.map((a) => a.id) },
+            },
+          ],
+        });
+        return this.partialOutcome(run, ctx, { conversationId, pending, action, answered, remaining });
+      }
+
+      // Open actions the agent no longer reports (or asks again, changed, on its reply) are withdrawn from the message that asked
+      for (const old of remaining) {
+        if (step.pending.some((p) => p.id === old.id && sameRequest(p, old))) continue;
+        withdrawn.set(old.id, { status: "cancelled", resolvedBy: "system", resolvedAt: new Date() });
+        run.emit({
+          events: [{ type: EVENT_TYPES.actionResolved, data: this.actionResolvedData(old, undefined, "system", "system", { cancelled: true }) }],
+        });
       }
     } else {
       run.emit({ events: [{ type: EVENT_TYPES.statusRunning, data: { trigger: run.trigger } }] });
@@ -3671,7 +4031,7 @@ export class AgentServer {
       step,
       budget: budget!,
       rememberAdd,
-      settled: { messageId: pending.messageId, entries: new Map([[action.id, answered]]) },
+      settled: { messageId: pending.messageId, entries: new Map([[action.id, answered], ...withdrawn]) },
     });
   }
 
@@ -4324,7 +4684,9 @@ export class AgentServer {
       let canDeny =
         policy === "deny" &&
         !!agent &&
-        (sdkAgent ? supportsSdkPause(sdkAgent) && store.pending.sdkState !== undefined : typeof agent.handler?.resolveAction === "function");
+        (sdkAgent
+          ? supportsSdkPause(sdkAgent) && store.pending.sdkState !== undefined
+          : typeof (agent.host ?? agent.handler)?.resolveAction === "function");
       if (canDeny) {
         // (the continuation needs a budget with something left)
         try {
@@ -5094,7 +5456,7 @@ export class AgentServer {
     const { limit, offset } = parsePaging(ctx.query, 20, this.maxPageSize);
 
     // Resolve userId
-    const userId = await this.effectiveUserId(ctx);
+    const userId = await this.listOwner(ctx);
 
     const result = await this.config.storage.getTasks({
       agentId,
@@ -5566,6 +5928,15 @@ export class AgentServer {
   // ============================================================================
   // Getters
   // ============================================================================
+
+  /**
+   * Every route this server answers, as declared: the method and the path relative to the base path, with `:param`
+   * placeholders (`:tool*` takes the rest of the path). For tooling - a gateway's allow-list, a check that the docs and
+   * the OpenAPI spec cover the API.
+   */
+  getRoutes(): Array<{ method: "GET" | "POST" | "PATCH" | "DELETE"; path: string }> {
+    return this.routes.map(({ method, path }) => ({ method, path }));
+  }
 
   getBasePath(): string {
     return this.basePath;

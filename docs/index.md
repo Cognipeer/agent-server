@@ -23,12 +23,21 @@ features:
   - icon: 🔧
     title: Custom Handler Support
     details: Integrate agents from any library with a simple handler interface.
+  - icon: 🏠
+    title: Host-backed Agents
+    details: Serve an agent that runs in your own backend - it streams, pauses for approvals and is cancelled like any other.
   - icon: 💾
     title: Multiple Storage Backends
-    details: Built-in PostgreSQL and MongoDB providers with auto-migration support.
+    details: PostgreSQL, MongoDB, SQLite and in-memory providers, tested against one contract, with auto-migration.
+  - icon: ⏯️
+    title: Runs That Outlive the Connection
+    details: A turn keeps running when the client leaves; cancel it, follow it from another client, one turn at a time per conversation.
+  - icon: ✅
+    title: Approvals and Budgets
+    details: Tool approvals and questions that lapse, who may answer, edited arguments, per-conversation spend limits.
   - icon: 🔐
     title: Authentication
-    details: Token-based and JWT authentication with customizable providers.
+    details: Token providers, or your own identity per request; conversations belong to their user.
   - icon: 📡
     title: SSE Streaming
     details: Real-time response streaming with Server-Sent Events.
@@ -81,6 +90,7 @@ const storage = createPostgresProvider({
 const agentServer = createAgentServer({
   basePath: '/api/agents',
   storage,
+  allowAnonymousList: true, // a quick start with no sign-in: see "Who may list" in Request Context
   swagger: {
     enabled: true,
     path: '/docs',

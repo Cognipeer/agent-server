@@ -30,6 +30,12 @@ interface AgentServerConfig {
   // Agents: array, or resolved per request
   agents?: AgentRegistration[] | ((ctx: RequestContext) => AgentRegistration[] | Promise<AgentRegistration[]>);
 
+  // Generate a conversation title with an OpenAI-compatible model after the first exchange
+  titleGeneration?: { baseUrl: string; apiKey: string; model: string; path?: string };
+
+  // Reserved for a separate file store; files are kept by the storage provider and this is not used
+  fileStorage?: FileStorageProvider;
+
   // Swagger UI configuration
   swagger?: {
     enabled: boolean;
@@ -46,7 +52,7 @@ interface AgentServerConfig {
     headerName?: string;  // Default: 'Authorization'
     tokenPrefix?: string; // Default: 'Bearer '
     excludeRoutes?: string[];
-    resolveUserId?: (ctx: ResolveContext) => Promise<string | undefined>;
+    resolveUserId?: (ctx: { headers?, query?, body?, context? }) => string | undefined | Promise<string | undefined>;
   };
 
   // CORS configuration
@@ -60,8 +66,17 @@ interface AgentServerConfig {
   // Request limits (file size, page sizes, the largest state a pause may store)
   limits?: RequestLimits;
 
+  // Only errors the host authored (4xx, or `expose: true`) show their text; the rest says "An unexpected error occurred"
+  maskServerErrors?: boolean;
+
   // What a message does while the conversation waits on an approval: 'reject' (409, default) or 'cancel'
   pendingActionPolicy?: 'reject' | 'cancel';
+
+  // Honour `rememberForSession` on tool approvals (default true)
+  allowRememberApproval?: boolean;
+
+  // Who may list: a request that names no user is refused (401 identity_required) unless this is true
+  allowAnonymousList?: boolean;
 
   // Leases, cancellation, the event stream and recovery - see guide/runs
   runs?: RunsConfig;
@@ -78,6 +93,15 @@ interface AgentServerConfig {
   authorizeBudget?: (ctx: RequestContext, change: BudgetChange) => boolean | Promise<boolean>;
 }
 ```
+
+`allowAnonymousList` (default `false`): `GET /conversations` and `GET /tasks` answer only for a request that **names a user** - a token user, `context.user` from
+`resolveContext`, a `resolveUserId` result, or (without `resolveContext`) a `userId` query parameter. A request that names nobody would list the conversations of everyone, so it is
+refused with `401 identity_required`. Set the option on a server that is single-user by design (a local tool, a demo). The built-in storage providers keep every user's data in one namespace and
+do not separate tenants: a multi-tenant host resolves a user for each request, see [Request Context](../guide/request-context#who-may-list).
+
+`maskServerErrors` keeps internal error text away from the client; use it whenever the audience is not the operator (see [Error Handling](../guide/error-handling)).
+`allowRememberApproval: false` always asks again, whatever the person ticked ("don't ask again", see [Approvals & Questions](../guide/human-in-the-loop#remembered-tools)).
+`titleGeneration` asks an OpenAI-compatible endpoint (`baseUrl` + `path`, default `/v1/chat/completions`) for a three- or four-word title after the first exchange; a failure leaves the conversation untitled.
 
 `HitlConfig` (every field optional; an agent overrides `timeoutMinutes`, `onTimeout` and `validateApprovedArgs`, see [Approvals & Questions](../guide/human-in-the-loop)):
 
@@ -179,14 +203,14 @@ agentServer.registerSDKAgent('assistant', assistant, {
 Register a custom agent handler.
 
 ```typescript
-agentServer.registerCustomAgent(id, handler, info?, options?);
+agentServer.registerCustomAgent(id, handler, info, options?);
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | id | `string` | Unique agent identifier |
 | handler | `AgentHandler` | Custom handler object |
-| info | `Partial<AgentInfo>` | Optional agent metadata |
+| info | `Omit<AgentInfo, 'id'>` | Agent metadata (`name` is required) |
 
 ```typescript
 agentServer.registerCustomAgent('echo', {
@@ -199,25 +223,49 @@ agentServer.registerCustomAgent('echo', {
 });
 ```
 
-#### getAgent
+#### registerHostAgent
 
-Get a registered agent by ID.
-
-```typescript
-const agent = agentServer.getAgent(id);
-```
-
-Returns `AgentRegistration | undefined`.
-
-#### listAgents
-
-List all registered agents.
+Register an agent whose work runs in your own backend. It reports progress with typed events and returns a typed result; the server stores the messages, the pending
+actions, the events and the runtime status. See [Host-backed agents](../guide/host-agents).
 
 ```typescript
-const agents = agentServer.listAgents();
+agentServer.registerHostAgent({
+  info: { id: 'support', name: 'Support' },
+  async invoke({ message, history, files, context }, { emit, signal, files: reader }) {
+    emit({ type: 'text', text: 'Looking it up... ' });
+    return { content: 'Found it.', usage: { inputTokens: 120, outputTokens: 30 } };
+  },
+  async resolveAction({ action, resolution }, { emit, signal }) { /* optional: continue after an approval or an answer */ return { content: 'Done.' }; },
+  async cancel({ reason, runId, actions }) { /* optional: the server lets go of a run or of open requests */ },
+});
 ```
 
-Returns `AgentInfo[]`.
+| Field | Type | Description |
+|-------|------|-------------|
+| `info` | `AgentInfo` | `id` and `name` are required |
+| `invoke(input, io)` | `HostInvokeInput, HostRunIo => HostTurnResult` | Runs one user message |
+| `resolveAction(input, io)` | `HostResolveInput, HostRunIo => HostTurnResult` | Optional. Called once per answered action; without it the agent's actions answer 404 |
+| `cancel(input)` | `HostCancelInput => void` | Optional. A run was cancelled while the agent worked, or open requests were withdrawn / lapsed / deleted |
+| `files`, `hitl`, `budget`, `pricing` | | The same per-agent settings as the other `register*` methods |
+
+An agent that is resolved per request (`config.agents`) returns `hostAgentRegistration(definition)` instead - the same definition, as an `AgentRegistration`.
+A definition that cannot work (no `info.id`, no `invoke`) throws at registration.
+
+#### registerChatCompletionsAgent / registerResponsesAgent
+
+An OpenAI-compatible Chat Completions or Responses endpoint as an agent (`baseUrl`, `apiKey`, `model`, ...). See [Custom Agents](../guide/custom-agents).
+
+```typescript
+agentServer.registerChatCompletionsAgent('gpt', { baseUrl: 'https://api.openai.com', apiKey: process.env.OPENAI_API_KEY!, model: 'gpt-4o' }, { name: 'GPT' });
+agentServer.registerResponsesAgent('resp', { baseUrl: 'https://api.openai.com', apiKey: process.env.OPENAI_API_KEY!, model: 'gpt-4o' }, { name: 'Responses' });
+```
+
+#### getAgent / getAgents
+
+```typescript
+const agent = agentServer.getAgent(id);   // AgentRegistration | undefined - a statically registered agent
+const agents = agentServer.getAgents();   // AgentInfo[] - every statically registered agent (use getAgentsFor for a request)
+```
 
 #### handleRequest
 
@@ -230,10 +278,19 @@ const result = await agentServer.handleRequest(method, path, context);
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | method | `string` | HTTP method |
-| path | `string` | Request path |
-| context | `RouteContext` | Request context |
+| path | `string` | Request path, including the base path |
+| context | `RouteRequest` | `{ query, body, headers, user, ... }` |
 
-Returns `Promise<RouteResult>`.
+Returns `Promise<RouteResult>`. `handleRoute(method, routePath, request)` is the same for a path that is already relative to the server.
+
+#### getRoutes
+
+```typescript
+agentServer.getRoutes(); // [{ method: 'GET', path: '/conversations/:conversationId' }, ...]
+```
+
+Every route the server answers, with `:param` placeholders (`:tool*` takes the rest of the path), relative to the base path. For tooling: a gateway's allow-list, a check that your
+documentation covers the API.
 
 #### recoverStaleRuns
 
@@ -261,6 +318,12 @@ const deleted = await server.purgeExpiredFiles(); // deletes files past files.re
 const bytes = server.maxUploadBytes();            // the largest upload any agent accepts: what an HTTP adapter has to let through
 ```
 
+#### authenticate
+
+```typescript
+const user = await server.authenticate(token); // AuthUser | null (null when token auth is off); throws 401 for a missing or bad token
+```
+
 #### close
 
 ```typescript
@@ -269,33 +332,14 @@ await server.close({ abort: true });
 
 Stops the periodic sweep. With `abort: true` it also cancels the running turns and waits for them.
 
-#### getOpenAPISpec
-
-Get the OpenAPI specification.
+#### getConfig / getBasePath
 
 ```typescript
-const spec = agentServer.getOpenAPISpec();
+const config = agentServer.getConfig();     // the AgentServerConfig it was created with
+const basePath = agentServer.getBasePath(); // without a trailing slash
 ```
 
-Returns the OpenAPI 3.0 specification object.
-
-### Properties
-
-#### storage
-
-Access the storage provider.
-
-```typescript
-const storage = agentServer.storage;
-```
-
-#### config
-
-Access the server configuration.
-
-```typescript
-const config = agentServer.config;
-```
+The OpenAPI document is `generateOpenAPISpec(config, agents)` (exported), and it is served at `<basePath>/docs/openapi.json` when `swagger.enabled` is set.
 
 ## AgentInfo
 
@@ -317,16 +361,28 @@ interface AgentInfo {
 
   // Custom metadata
   metadata?: Record<string, unknown>;
+
+  // What the agent can do: pause for approvals / questions, and what it takes as attachments.
+  // For an SDK agent the first two are derived from the instance; `attachments` is filled from the `files` settings
+  capabilities?: {
+    toolApproval?: boolean;
+    askUser?: boolean;
+    attachments?: { enabled?: boolean; maxFiles?: number; maxFileSize?: number; allowedMimeTypes?: string[]; acceptsImages?: boolean };
+  };
 }
 ```
 
 ## AgentHandler
 
-Custom agent handler interface.
+Custom agent handler interface. It cannot stream: a streamed request gets the whole answer at once. For an agent that streams and reports tool calls, use
+a [host-backed agent](../guide/host-agents).
 
 ```typescript
 interface AgentHandler {
   processMessage(params: ProcessMessageParams): Promise<ProcessMessageResult>;
+
+  // Optional: continue a turn that paused (status 'requires_action'), once per answered action
+  resolveAction?(params: ResolveActionParams): Promise<ProcessMessageResult>;
 }
 ```
 
@@ -337,10 +393,10 @@ interface ProcessMessageParams {
   // Conversation ID
   conversationId: string;
 
-  // User message
+  // What the person typed (the files are not in it)
   message: string;
 
-  // Attached files
+  // Attached files (stored; every entry has a real id)
   files?: FileAttachment[];
 
   // Conversation state
@@ -354,6 +410,10 @@ interface ProcessMessageParams {
 
   // Aborted when the run is cancelled (POST /conversations/:id/cancel): stop and return what you have
   signal?: AbortSignal;
+
+  // Read a file of this conversation (null for any other id, or an expired file)
+  getFileContent?: (fileId: string) => Promise<Buffer | null>;
+  getFileText?: (fileId: string) => Promise<string | null>;
 }
 ```
 
@@ -389,6 +449,24 @@ interface ProcessMessageResult {
 
   // Why the turn stopped when it was not simply 'end_turn': 'max_turns' | 'limit' ('budget_reached' is the server's own, see guide/budgets)
   stopReason?: StopReason;
+}
+```
+
+## HostAgent
+
+The behaviour of a [host-backed agent](../guide/host-agents). Types: [Types](./types#host-backed-agents).
+
+```typescript
+interface HostAgent {
+  invoke(input: HostInvokeInput, io: HostRunIo): Promise<HostTurnResult> | HostTurnResult;
+  resolveAction?(input: HostResolveInput, io: HostRunIo): Promise<HostTurnResult> | HostTurnResult;
+  cancel?(input: HostCancelInput): Promise<void> | void;
+}
+
+interface HostRunIo {
+  emit(event: HostEvent): void; // text | tool_use | tool_result | action_required | usage | stop
+  signal: AbortSignal;          // aborted when the run is cancelled
+  files: HostFiles;             // list() / read(id) / text(id), scoped to the conversation
 }
 ```
 

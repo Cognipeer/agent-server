@@ -21,6 +21,7 @@ async function boot(agent: unknown, config: Partial<AgentServerConfig> = {}, ove
     basePath: "/api",
     storage: over ?? storage(),
     agents: [{ info: { id: "a", name: "A" }, sdkAgent: agent }],
+    allowAnonymousList: true,
     ...config,
   });
   const created = await server.handleRoute("POST", "/conversations", { query: {}, body: { agentId: "a" } });
@@ -174,6 +175,7 @@ for (const name of PROVIDER_NAMES) {
         const server = createAgentServer({
           basePath: "/api",
           storage: storage(),
+          allowAnonymousList: true,
           agents: [{ info: { id: agentId, name: "A" }, sdkAgent: fakeSdkAgent(async () => ({ content: "ok" })) }],
         });
         const make = async () =>

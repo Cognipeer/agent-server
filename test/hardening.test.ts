@@ -79,7 +79,7 @@ describe("paging is clamped before storage", () => {
         return typeof v === "function" ? v.bind(t) : v;
       },
     }) as StorageProvider;
-    const server = createAgentServer({ basePath: "/api", storage });
+    const server = createAgentServer({ basePath: "/api", storage, allowAnonymousList: true });
     await server.handleRoute("GET", "/conversations", { query: { limit: "999999", offset: "-5" } });
     await server.handleRoute("GET", "/conversations", { query: { limit: "-3", offset: "abc" } });
     expect(seen[0]).toMatchObject({ limit: 200, offset: 0 });

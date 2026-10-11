@@ -12,7 +12,7 @@ export default defineConfig({
       { text: 'API Reference', link: '/api/server' },
       { text: 'Examples', link: '/examples/' },
       {
-        text: 'v0.2.0',
+        text: 'v0.3.0',
         items: [
           { text: 'Changelog', link: '/changelog' },
           { text: 'Contributing', link: '/contributing' },
@@ -46,6 +46,7 @@ export default defineConfig({
             { text: 'Streaming', link: '/guide/streaming' },
             { text: 'Runs, Cancel & Reattach', link: '/guide/runs' },
             { text: 'Approvals & Questions', link: '/guide/human-in-the-loop' },
+            { text: 'Host-backed Agents', link: '/guide/host-agents' },
             { text: 'Usage & Budgets', link: '/guide/budgets' },
             { text: 'Swagger UI', link: '/guide/swagger' },
           ],
@@ -55,6 +56,7 @@ export default defineConfig({
           items: [
             { text: 'Request Context & Dynamic Agents', link: '/guide/request-context' },
             { text: 'Custom Agents', link: '/guide/custom-agents' },
+            { text: 'Tasks', link: '/tasks' },
             { text: 'Custom Storage', link: '/guide/custom-storage' },
             { text: 'Error Handling', link: '/guide/error-handling' },
           ],
@@ -78,11 +80,6 @@ export default defineConfig({
           text: 'Examples',
           items: [
             { text: 'Overview', link: '/examples/' },
-            { text: 'Express Basic', link: '/examples/express-basic' },
-            { text: 'Express with PostgreSQL', link: '/examples/express-postgres' },
-            { text: 'Next.js App Router', link: '/examples/nextjs-app' },
-            { text: 'Custom Agent', link: '/examples/custom-agent' },
-            { text: 'JWT Authentication', link: '/examples/jwt-auth' },
           ],
         },
       ],

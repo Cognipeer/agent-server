@@ -10,7 +10,7 @@ What a run gives you:
 | | |
 | --- | --- |
 | **Detached** | A streamed request is a *subscriber* of its run. Disconnecting unsubscribes; the run goes on. |
-| **Cancellable** | `POST /conversations/:id/cancel` aborts the run: agent-sdk agents see it as their `cancellationToken`, custom handlers as `signal`. |
+| **Cancellable** | `POST /conversations/:id/cancel` aborts the run: agent-sdk agents see it as their `cancellationToken`, custom handlers and [host-backed agents](./host-agents.md) as `signal` (host agents also get a `cancel` hook). |
 | **One at a time** | A conversation runs one turn at a time, across all server instances sharing the storage: a second one is `409 conversation_busy`. |
 | **Logged** | Everything that happens is appended to the conversation's event log, readable and followable (`GET .../events`, `.../events/stream`). |
 | **Observable** | `conversation.runtime` says whether a conversation is running, waiting for a human, or idle, and why the last turn stopped. |
@@ -39,7 +39,7 @@ What a run gives you:
 | `activeRunId` | The running run (the `runId` of the message response, the `run_id` of its events) |
 
 The assistant message of every turn records how it ended: `message.status` (`completed`, `requires_action`, `incomplete`, `cancelled`) and
-`message.metadata.stopReason`. A custom handler can report `max_turns` or `limit` itself with `stopReason` in its result; `budget_reached` is the server's, when the conversation's [budget](./budgets.md) ends a turn.
+`message.metadata.stopReason`. A custom handler or a host agent can report `max_turns` or `limit` itself with `stopReason` in its result; `budget_reached` is the server's, when the conversation's [budget](./budgets.md) ends a turn.
 
 ## One turn at a time
 
@@ -79,7 +79,7 @@ POST /api/conversations/conv_1/cancel
 
 Deleting a conversation that is running cancels its run first.
 
-### In an SDK agent or a handler
+### In an SDK agent, a handler or a host agent
 
 ```typescript
 agentServer.registerCustomAgent('slow', {
@@ -90,6 +90,7 @@ agentServer.registerCustomAgent('slow', {
 });
 ```
 
+A host-backed agent gets the same `signal` in `io.signal` and may implement `cancel` for a backend that runs elsewhere ([Host-backed agents](./host-agents.md#cancel)).
 For agent-sdk agents nothing is needed: the signal is passed as `cancellationToken` (an `AbortSignal` is a valid token, and tools receive it).
 An SDK result with `state.ctx.__cancelled` is a cancelled turn; `state.ctx.__limitBreached` ends the turn with `stopReason: "limit"`.
 

@@ -10,15 +10,16 @@ Example projects and code snippets for `@cognipeer/agent-server`.
 import express from 'express';
 import {
   createAgentServer,
-  createMemoryProvider,
+  createInMemoryProvider,
   createExpressMiddleware,
 } from '@cognipeer/agent-server';
 
-const storage = createMemoryProvider();
+const storage = createInMemoryProvider();
 
 const agentServer = createAgentServer({
   basePath: '/api/agents',
   storage,
+  allowAnonymousList: true, // a quick start with no sign-in: see "Who may list" in Request Context
   swagger: { enabled: true },
 });
 
@@ -45,15 +46,16 @@ app.listen(3000, () => {
 // app/api/agents/[...path]/route.ts
 import {
   createAgentServer,
-  createMemoryProvider,
+  createInMemoryProvider,
   createNextRouteHandlers,
 } from '@cognipeer/agent-server';
 
-const storage = createMemoryProvider();
+const storage = createInMemoryProvider();
 
 const agentServer = createAgentServer({
   basePath: '/api/agents',
   storage,
+  allowAnonymousList: true, // a quick start with no sign-in: see "Who may list" in Request Context
 });
 
 agentServer.registerCustomAgent('echo', {
@@ -67,15 +69,23 @@ await storage.connect();
 export const { GET, POST, PATCH, DELETE, OPTIONS } = createNextRouteHandlers(agentServer);
 ```
 
-## Full Examples
+## Standalone server
 
-Explore complete example projects:
+[`examples/standalone`](https://github.com/Cognipeer/agent-server/tree/main/examples/standalone) in this repository is a complete server as its own process, on SQLite or MongoDB: an agent-sdk agent
+(approvals, questions, files, cancel), a host-backed agent, CORS and Swagger. It runs with a scripted model, so no API key is needed:
 
-- [Express Basic](/examples/express-basic) - Simple Express.js setup
-- [Express with PostgreSQL](/examples/express-postgres) - Production-ready Express
-- [Next.js App Router](/examples/nextjs-app) - Next.js integration
-- [Custom Agent](/examples/custom-agent) - Custom AI backend
-- [JWT Authentication](/examples/jwt-auth) - Secure your API
+```bash
+cd examples/standalone && npm install
+npm run start:sqlite      # or: npm run start:mongodb
+```
+
+## More examples
+
+In this repository's [`examples/`](https://github.com/Cognipeer/agent-server/tree/main/examples) folder:
+
+- [`standalone`](https://github.com/Cognipeer/agent-server/tree/main/examples/standalone) - a complete server on SQLite or MongoDB (above)
+- [`express-postgres.ts`](https://github.com/Cognipeer/agent-server/blob/main/examples/express-postgres.ts) - Express with PostgreSQL and token authentication
+- [`tasks-demo.ts`](https://github.com/Cognipeer/agent-server/blob/main/examples/tasks-demo.ts) - background tasks with a callback server
 
 ## Example Repository
 

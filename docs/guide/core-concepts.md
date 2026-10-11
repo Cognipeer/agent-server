@@ -25,7 +25,7 @@ Understanding the core concepts of `@cognipeer/agent-server` will help you build
 │  ┌─────────────────────────────────────────────────────────┐ │
 │  │                    Agent Registry                        │ │
 │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐  │ │
-│  │  │  SDK Agent  │  │ SDK Agent   │  │  Custom Agent   │  │ │
+│  │  │  SDK Agent  │  │ Host Agent  │  │  Custom Agent   │  │ │
 │  │  └─────────────┘  └─────────────┘  └─────────────────┘  │ │
 │  └─────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
@@ -34,7 +34,7 @@ Understanding the core concepts of `@cognipeer/agent-server` will help you build
 ┌─────────────────────────────────────────────────────────────┐
 │                    Storage Provider                          │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │  PostgreSQL │  │   MongoDB   │  │      Memory         │  │
+│  │  PostgreSQL │  │   MongoDB   │  │  SQLite / Memory    │  │
 │  └─────────────┘  └─────────────┘  └─────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -57,11 +57,11 @@ const agentServer = createAgentServer({
 
 ### Agents
 
-Agents are the AI components that process messages. There are two types:
+Agents are the AI components that process messages. There are four ways to bring one:
 
 #### SDK Agents
 
-Created with `@cognipeer/agent-sdk`:
+Created with `@cognipeer/agent-sdk`; they can use tools that need approval, ask the user questions, and read the conversation's files:
 
 ```typescript
 import { createSmartAgent } from '@cognipeer/agent-sdk';
@@ -77,7 +77,7 @@ agentServer.registerSDKAgent('assistant', assistant);
 
 #### Custom Agents
 
-Simple handler interface for any AI backend:
+Simple handler interface for any AI backend; it answers once per message:
 
 ```typescript
 agentServer.registerCustomAgent('my-agent', {
@@ -88,12 +88,31 @@ agentServer.registerCustomAgent('my-agent', {
       state: { lastInteraction: Date.now() },
     };
   },
+}, { name: 'My agent' });
+```
+
+#### Host-backed Agents
+
+An agent whose work runs in your own backend. It streams with typed events, pauses by returning `pendingActions`, and the server keeps the messages, the events and the pause
+([Host-backed agents](./host-agents.md)):
+
+```typescript
+agentServer.registerHostAgent({
+  info: { id: 'support', name: 'Support' },
+  async invoke({ message }, { emit, signal }) {
+    for await (const chunk of backend.stream(message, { signal })) emit({ type: 'text', text: chunk });
+    return {};
+  },
 });
 ```
 
+#### OpenAI-compatible endpoints
+
+`registerChatCompletionsAgent` and `registerResponsesAgent` serve a Chat Completions or Responses API endpoint as an agent ([Custom Agents](./custom-agents.md)).
+
 ### Storage Providers
 
-Storage providers handle persistence of conversations, messages, and files.
+Storage providers handle persistence of conversations, messages, files, tasks and the event log. All four behave the same ([Storage Providers](./storage.md)):
 
 ```typescript
 // PostgreSQL
@@ -106,13 +125,17 @@ const storage = createMongoDBProvider({
   connectionString: 'mongodb://...',
 });
 
+// SQLite (one process)
+const storage = createSQLiteProvider({ filename: './data/agent-server.db' });
+
 // Memory (for development)
-const storage = createMemoryProvider();
+const storage = createInMemoryProvider();
 ```
 
-### Auth Providers
+### Auth
 
-Authentication providers validate requests and identify users.
+Token providers validate requests and identify users; `resolveContext` is the way to bring your own identity (a session cookie) and per-request data ([Request Context](./request-context.md)).
+Conversations belong to the user who created them, and the lists return one user's.
 
 ```typescript
 // Token-based
@@ -120,7 +143,7 @@ const auth = createTokenAuthProvider({
   tokens: { 'api-key-1': 'user-1' },
 });
 
-// JWT
+// JWT (reads the claims; see Authentication for what it checks)
 const auth = createJWTAuthProvider({
   secret: 'your-secret',
 });
@@ -141,12 +164,13 @@ export const { GET, POST, PATCH, DELETE } = createNextRouteHandlers(agentServer)
 ## Request Flow
 
 1. **Client Request** - HTTP request from client
-2. **Adapter** - Framework adapter parses request
-3. **Authentication** - Auth provider validates token
+2. **Adapter** - Framework adapter parses request (and validates the token)
+3. **Context** - `resolveContext` names the user and carries your data
 4. **Router** - Routes to appropriate handler
-5. **Agent** - Processes message with AI
-6. **Storage** - Saves conversation/messages
-7. **Response** - Returns result (or streams)
+5. **Run** - A message becomes a run: one per conversation, detached from the connection
+6. **Agent** - Processes the message (and may pause for an approval)
+7. **Storage** - Saves the messages, the pause and the event log
+8. **Response** - Returns the result (or streams it)
 
 ## Data Model
 
@@ -162,6 +186,10 @@ interface Conversation {
   state?: Record<string, unknown>;
   createdAt: Date;
   updatedAt: Date;
+  // in API responses: where the conversation is in its run lifecycle, and its budget
+  runtime?: { status: 'idle' | 'running' | 'requires_action' | 'budget_paused'; stopReason?: string; lastEventSeq: number; pendingActionIds: string[] };
+  budget?: { maxCostUsd: number; onReach: 'pause' | 'stop' } | null;
+  spentUsd?: number;
 }
 ```
 
@@ -197,27 +225,22 @@ interface FileAttachment {
 
 The server supports Server-Sent Events (SSE) for real-time streaming:
 
-```typescript
-// Client sends message with streaming enabled
-POST /conversations/:id/messages
-{
-  "message": "Hello",
-  "streaming": true
-}
-
-// Server responds with SSE stream
-event: stream.start
-data: {"conversationId":"...","messageId":"..."}
-
-event: stream.text
-data: {"text":"Hello","isFinal":false}
-
-event: stream.text
-data: {"text":" there!","isFinal":false}
-
-event: stream.done
-data: {"message":{...}}
 ```
+// Client sends a message with streaming enabled
+POST /conversations/:id/messages
+{ "message": "Hello", "stream": true }
+
+// Server responds with SSE: one JSON object per `data:` line
+data: {"type":"stream.start","conversationId":"...","messageId":"...","seq":2}
+
+data: {"type":"stream.text","text":"Hello","isFinal":false,"seq":2}
+
+data: {"type":"stream.text","text":" there!","isFinal":false,"seq":2}
+
+data: {"type":"stream.done","conversationId":"...","messageId":"...","content":"Hello there!","stopReason":"end_turn","runId":"run_x1","seq":5}
+```
+
+Closing the connection does not stop the turn; pick it up again with the event stream ([Streaming](./streaming.md), [Runs, Cancel & Reattach](./runs.md)).
 
 ## Next Steps
 

@@ -89,7 +89,7 @@ async function boot(agent: unknown | { handler: AgentHandler }, config: Partial<
     agent && typeof agent === "object" && "handler" in (agent as object)
       ? { info: { id: "a", name: "A" }, handler: (agent as { handler: AgentHandler }).handler }
       : { info: { id: "a", name: "A" }, sdkAgent: agent };
-  const server = createAgentServer({ basePath: "/api", storage, agents: [registration as any], ...config });
+  const server = createAgentServer({ basePath: "/api", storage, agents: [registration as any], allowAnonymousList: true, ...config });
   const call = (method: string, path: string, extra: { body?: unknown; query?: Record<string, string>; headers?: Record<string, string> } = {}) =>
     server.handleRoute(method, path, { query: extra.query ?? {}, body: extra.body, headers: extra.headers });
   const id = ((await call("POST", "/conversations", { body: { agentId: "a" } })).body as any).conversation.id as string;

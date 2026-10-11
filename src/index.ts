@@ -43,6 +43,18 @@ export type {
   ProcessMessageResult,
   AgentRegistration,
 
+  // Host-backed agents
+  HostAgent,
+  HostAgentDefinition,
+  HostEvent,
+  HostFiles,
+  HostRunIo,
+  HostInvokeInput,
+  HostResolveInput,
+  HostCancelInput,
+  HostCancelReason,
+  HostTurnResult,
+
   // Storage provider types
   StorageProvider,
   StorageCapabilities,
@@ -191,6 +203,9 @@ export { defaultExtractText } from "./files/extract.js";
 
 // Usage and budgets
 export { costEstimatorFromPricing } from "./usage.js";
+
+// Host-backed agents (for hosts that resolve their agents per request: return this from `config.agents`)
+export { hostAgentRegistration } from "./host.js";
 
 // Run lifecycle and the event log
 export { EVENT_TYPES, MemoryEventLog, nextStopReason } from "./events.js";

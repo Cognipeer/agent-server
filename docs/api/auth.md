@@ -83,62 +83,58 @@ const authProvider = createJWTAuthProvider(config);
 
 ```typescript
 interface JWTAuthConfig {
-  // Secret for HMAC algorithms (HS256, HS384, HS512)
-  secret?: string;
-
-  // Public key for RSA/EC algorithms
-  publicKey?: string;
-
-  // JWKS URI for key rotation
-  jwksUri?: string;
+  // Secret for HS256, or the public key for RS256
+  secret: string;
 
   // Algorithm (default: 'HS256')
-  algorithm?: 'HS256' | 'HS384' | 'HS512' | 'RS256' | 'RS384' | 'RS512' | 'ES256' | 'ES384' | 'ES512';
+  algorithm?: 'HS256' | 'RS256';
 
-  // Expected issuer (validates 'iss' claim)
+  // Expected issuer (checks the 'iss' claim)
   issuer?: string;
 
-  // Expected audience (validates 'aud' claim)
+  // Expected audience (checks the 'aud' claim)
   audience?: string;
 
-  // Extract userId from JWT payload
-  extractUserId: (payload: JWTPayload) => string;
+  // Extract the user id from the payload (default: sub, then userId, then user_id)
+  extractUserId?: (payload: Record<string, unknown>) => string | undefined;
 }
 ```
 
-### Example with Secret
+::: warning A basic provider
+`createJWTAuthProvider` reads the token's claims and checks expiry (`exp`), `issuer` and `audience`. It is a basic implementation: it does **not** verify the token's signature, and it does not
+fetch keys (no JWKS). Put signature verification in front of the server (a gateway or an identity-aware proxy), or write an `AuthProvider` that verifies with a JWT library (`jose`, `jsonwebtoken`) -
+see below.
+:::
+
+### Example
 
 ```typescript
 const authProvider = createJWTAuthProvider({
-  secret: process.env.JWT_SECRET,
+  secret: process.env.JWT_SECRET!,
   algorithm: 'HS256',
-  extractUserId: (payload) => payload.sub as string,
-});
-```
-
-### Example with RSA
-
-```typescript
-import { readFileSync } from 'fs';
-
-const authProvider = createJWTAuthProvider({
-  publicKey: readFileSync('./public.pem', 'utf-8'),
-  algorithm: 'RS256',
-  issuer: 'https://auth.example.com',
+  issuer: 'my-app',
   audience: 'my-api',
-  extractUserId: (payload) => payload.userId as string,
+  extractUserId: (payload) => payload.sub as string,
 });
 ```
 
-### Example with JWKS
+### Verifying with a JWT library
 
 ```typescript
-const authProvider = createJWTAuthProvider({
-  jwksUri: 'https://auth.example.com/.well-known/jwks.json',
-  algorithm: 'RS256',
-  issuer: 'https://auth.example.com',
-  extractUserId: (payload) => payload.sub as string,
-});
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+
+const keys = createRemoteJWKSet(new URL('https://auth.example.com/.well-known/jwks.json'));
+
+const authProvider: AuthProvider = {
+  async validateToken(token) {
+    try {
+      const { payload } = await jwtVerify(token, keys, { issuer: 'https://auth.example.com', audience: 'my-api' });
+      return { valid: true, userId: String(payload.sub), metadata: payload };
+    } catch {
+      return { valid: false, error: 'Invalid token' };
+    }
+  },
+};
 ```
 
 ## AuthProvider Interface
@@ -147,12 +143,15 @@ All auth providers implement this interface:
 
 ```typescript
 interface AuthProvider {
-  validate(token: string): Promise<AuthResult>;
+  validateToken(token: string): Promise<AuthResult>;
+  generateToken?(userId: string, metadata?: Record<string, unknown>): Promise<string>;
+  revokeToken?(token: string): Promise<void>;
 }
 
 interface AuthResult {
   valid: boolean;
   userId?: string;
+  metadata?: Record<string, unknown>;
   error?: string;
 }
 ```
@@ -163,7 +162,7 @@ Create your own authentication provider:
 
 ```typescript
 class MyAuthProvider implements AuthProvider {
-  async validate(token: string): Promise<AuthResult> {
+  async validateToken(token: string): Promise<AuthResult> {
     try {
       // Validate with your auth service
       const response = await fetch('https://auth.example.com/validate', {
@@ -216,8 +215,8 @@ const agentServer = createAgentServer({
     
     // Custom userId resolver (for non-token auth)
     resolveUserId: async (ctx) => {
-      // Get userId from query param or body
-      return ctx.query.userId || ctx.body?.userId;
+      // Get userId from a header or query param
+      return (ctx.headers?.['x-user-id'] as string | undefined) ?? (ctx.query?.userId as string | undefined);
     },
   },
 });
@@ -268,28 +267,24 @@ const response = await axios.get('/api/agents/conversations', {
 
 ## Error Responses
 
+The body is always `{ "error": { "code", "message" } }`; see [Error Handling](../guide/error-handling).
+
 ### 401 Unauthorized
 
-When authentication fails:
-
 ```json
-{
-  "error": "Authentication required"
-}
+{ "error": { "code": "AUTHENTICATION_ERROR", "message": "Authentication required" } }
 ```
 
 ```json
-{
-  "error": "Invalid token"
-}
+{ "error": { "code": "AUTHENTICATION_ERROR", "message": "Invalid token" } }
 ```
+
+A request that names no user is also a `401` when it asks for a list: `identity_required` (see [Request Context](../guide/request-context#who-may-list)).
 
 ### 403 Forbidden
 
-When user doesn't have access:
+When the user is signed in but the conversation, task or file is somebody else's:
 
 ```json
-{
-  "error": "Access denied"
-}
+{ "error": { "code": "FORBIDDEN", "message": "You do not have access to this conversation" } }
 ```

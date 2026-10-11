@@ -2,101 +2,77 @@
 
 Proper error handling in your agent server application.
 
-## Error Types
+## What an error looks like
 
-The agent server includes several error types:
-
-```typescript
-// Authentication error (401)
-class AuthenticationError extends Error {
-  statusCode = 401;
-}
-
-// Not found error (404)
-class NotFoundError extends Error {
-  statusCode = 404;
-}
-
-// Validation error (400)
-class ValidationError extends Error {
-  statusCode = 400;
-}
-
-// Server error (500)
-class ServerError extends Error {
-  statusCode = 500;
-}
-```
-
-## Codes worth handling
-
-Besides `400` / `401` / `404`, these have a meaning of their own (the code is `error.code` of the response):
-
-| Status | Code | Meaning |
-|--------|------|---------|
-| 402 | `budget_reached` | The conversation's [budget](./budgets.md) is used up (`details`: `spentUsd`, `maxCostUsd`, `onReach`); raise it to carry on |
-| 403 | `action_forbidden` | `hitl.authorizeResolve` says you may not answer this request |
-| 403 | `budget_forbidden` | Raising or removing a budget needs `authorizeBudget` |
-| 400 | `invalid_approved_args` | The edited arguments are not accepted by the tool's schema |
-| 400 | `invalid_budget` / `budget_unavailable` | Not a budget / the agent has no pricing to count a budget against |
-| 409 | `action_pending` / `action_not_pending` | A message while a request is open / an answer to a request that is gone |
-| 409 | `conversation_busy` | A turn is already running in the conversation |
-| 409 | `nothing_to_continue` | No turn was stopped by the budget |
-| 410 | `action_expired` | The approval or question lapsed |
-
-## Error Responses
-
-All errors are returned as JSON:
+Every error the server answers is JSON in one shape:
 
 ```json
 {
-  "error": "Error message here",
-  "code": "ERROR_CODE",
-  "details": {}
-}
-```
-
-### Common Error Responses
-
-#### 400 Bad Request
-
-```json
-{
-  "error": "Invalid request body",
-  "code": "VALIDATION_ERROR",
-  "details": {
-    "field": "message",
-    "issue": "Required field missing"
+  "error": {
+    "code": "action_pending",
+    "message": "The conversation is waiting for a pending action to be resolved",
+    "details": { "pendingActionIds": ["ap1"] }
   }
 }
 ```
 
-#### 401 Unauthorized
+`code` is for programs (switch on it), `message` is for people, `details` is optional extra data. A streamed turn that fails sends the same thing as a `stream.error` event
+(`{ type: 'stream.error', error: <message>, code }`), and the event log records it as `session.error`.
 
-```json
-{
-  "error": "Authentication required",
-  "code": "AUTH_REQUIRED"
-}
+With `maskServerErrors: true` only errors the host authored for the caller show their text - a 4xx, or an error with `expose: true`. Everything else (a driver error, a bug, any 5xx)
+answers `{ code: 'INTERNAL_ERROR', message: 'An unexpected error occurred' }` and the original is logged on the server. Turn it on whenever the audience is not the operator.
+
+## Error Types
+
+The package exports the classes it throws, and treats any object with a `statusCode`, a `code` and a `message` the same way - throw one from a handler to answer with that status.
+
+```typescript
+import { AgentServerError, AuthenticationError, AuthorizationError, NotFoundError, ValidationError, StorageLimitError } from '@cognipeer/agent-server';
+
+throw new ValidationError('Rate limit exceeded', { retryAfter: 30 });        // 400 VALIDATION_ERROR
+throw new AgentServerError('Quota used up', 'quota_exceeded', 429);          // your own code and status
+throw { statusCode: 403, code: 'tenant_suspended', message: 'This tenant is suspended' }; // a plain object works too
 ```
 
-#### 404 Not Found
+## Codes
 
-```json
-{
-  "error": "Conversation not found",
-  "code": "NOT_FOUND"
-}
-```
+Every `error.code` the server answers with. Besides `400` / `401` / `404`, the ones with a meaning of their own are what a client should handle:
 
-#### 500 Internal Server Error
+| Status | Code | Meaning |
+|--------|------|---------|
+| 400 | `VALIDATION_ERROR` | The request is malformed or breaks a limit (details.reason says which, e.g. file_too_large) |
+| 400 | `INVALID_REQUEST` | A task comment that is not valid |
+| 400 | `invalid_budget` | Not a budget, or one at or below what the conversation has already spent |
+| 400 | `budget_unavailable` | The agent has no pricing, so a budget cannot be counted against |
+| 400 | `invalid_approved_args` | The edited arguments are not accepted by the tool's schema |
+| 401 | `AUTHENTICATION_ERROR` | Missing or invalid credentials |
+| 401 | `identity_required` | Listing needs to know who is asking (see allowAnonymousList) |
+| 402 | `budget_reached` | The conversation's budget is used up; raise it to carry on |
+| 403 | `FORBIDDEN` | The conversation, task or file belongs to someone else |
+| 403 | `AUTHORIZATION_ERROR` | A host's own AuthorizationError (access denied) |
+| 403 | `action_forbidden` | hitl.authorizeResolve says you may not answer this request |
+| 403 | `budget_forbidden` | Raising or removing a budget needs the authorizeBudget option |
+| 403 | `attachments_disabled` | The agent does not take attachments |
+| 404 | `NOT_FOUND` | The agent, conversation, message, task, file or tool does not exist (or is not yours) |
+| 409 | `action_pending` | A message or continue while a request is open (details.pendingActionIds) |
+| 409 | `action_not_pending` | The action is unknown, already answered, or cannot be resumed |
+| 409 | `conversation_busy` | A turn is already running in the conversation (details.activeRunId) |
+| 409 | `conversation_conflict` | The conversation kept changing under the request; try again |
+| 409 | `lease_lost` | Another node took the conversation over while the turn ran |
+| 409 | `nothing_to_continue` | No turn was stopped by the budget |
+| 409 | `task_busy` | The task is running or waits on an action |
+| 409 | `task_finished` | The task has already completed or failed |
+| 409 | `too_many_files` | The conversation already holds as many files as the agent allows |
+| 410 | `action_expired` | The approval or question lapsed (expiresAt) |
+| 413 | `PAYLOAD_TOO_LARGE` | The request body is over the body limit |
+| 413 | `STORAGE_LIMIT_EXCEEDED` | The storage provider cannot hold this much |
+| 415 | `unsupported_file_type` | The file's type is not one the agent accepts |
+| 500 | `INTERNAL_ERROR` | Anything unexpected (the text is generic with maskServerErrors) |
+| 500 | `budget_misconfigured` | The agent has a budget but no pricing |
+| 500 | `invalid_host_result` | A host agent returned something the server cannot use |
 
-```json
-{
-  "error": "Internal server error",
-  "code": "SERVER_ERROR"
-}
-```
+A turn can also carry **warnings** that are not errors (`warnings` on the response, on `stream.done` and in the assistant message's `metadata`): `pause_state_too_large` (the turn finished instead of
+pausing, see [Storage](./storage.md)), `file_truncated`, `file_unreadable` and `images_not_supported` (see [Files](./file-management.md)). The event log has `run_interrupted` for a run whose server died (see [Runs](./runs.md#recovery)).
 
 ## Handling Errors in Custom Agents
 
@@ -116,7 +92,7 @@ agentServer.registerCustomAgent('my-agent', {
       }
       
       if (error instanceof ModelError) {
-        throw new ServerError('AI model error. Please try again.');
+        throw new AgentServerError('AI model error. Please try again.', 'model_unavailable', 502);
       }
       
       // Re-throw unknown errors
@@ -145,14 +121,13 @@ app.use((err, req, res, next) => {
   const status = err.statusCode || 500;
   
   // Build error response
-  const response = {
-    error: err.message || 'Internal Server Error',
-    code: err.code || 'SERVER_ERROR',
+  const response: Record<string, unknown> = {
+    error: { code: err.code || 'INTERNAL_ERROR', message: err.message || 'Internal Server Error' },
   };
   
   // Include stack in development
   if (process.env.NODE_ENV === 'development') {
-    response.stack = err.stack;
+    (response.error as Record<string, unknown>).stack = err.stack;
   }
   
   res.status(status).json(response);
@@ -176,7 +151,7 @@ export async function GET(request: Request, context: any) {
     
     const status = error.statusCode || 500;
     return NextResponse.json(
-      { error: error.message || 'Internal Server Error' },
+      { error: { code: error.code || 'INTERNAL_ERROR', message: error.message || 'Internal Server Error' } },
       { status }
     );
   }
@@ -190,7 +165,7 @@ export async function POST(request: Request, context: any) {
     
     const status = error.statusCode || 500;
     return NextResponse.json(
-      { error: error.message || 'Internal Server Error' },
+      { error: { code: error.code || 'INTERNAL_ERROR', message: error.message || 'Internal Server Error' } },
       { status }
     );
   }
@@ -261,7 +236,7 @@ app.use((err, req, res, next) => {
   });
   
   res.status(err.statusCode || 500).json({
-    error: err.message,
+    error: { code: err.code || 'INTERNAL_ERROR', message: err.message },
   });
 });
 ```
@@ -290,7 +265,7 @@ app.use((err, req, res, next) => {
   });
   
   res.status(err.statusCode || 500).json({
-    error: err.message,
+    error: { code: err.code || 'INTERNAL_ERROR', message: err.message },
   });
 });
 ```
@@ -359,7 +334,7 @@ try {
   
   if (!response.ok) {
     const error = await response.json();
-    throw new Error(error.error || 'Request failed');
+    throw Object.assign(new Error(error.error?.message || 'Request failed'), { code: error.error?.code });
   }
   
   const data = await response.json();

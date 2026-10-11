@@ -161,6 +161,8 @@ server.registerCustomAgent('analyst', {
 
 `resolveAction` gets the same two readers.
 
+**Host-backed agents** are handed the files (`input.files`) and read them through `io.files`: `list()`, `read(fileId)` and `text(fileId)`, scoped to the conversation ([Host-backed agents](./host-agents.md#files)).
+
 ## Images
 
 An image is shown to the model when the agent's `files.vision` is `true` and the picture is a PNG, JPEG, GIF or WebP; an SVG is a text document. Without `vision` the agent is only told *"[Image "cat.png" (id ...) is attached, but this agent cannot read images.]"*, the response carries an `images_not_supported` warning, and `capabilities.attachments.acceptsImages` is `false` so a client can say so before the person sends.

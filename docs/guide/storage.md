@@ -131,7 +131,7 @@ With `autoMigrate: true` the provider creates (and upgrades) these tables, all n
 
 | Table | Holds |
 | --- | --- |
-| `conversations` | `id`, `agent_id`, `user_id`, `title`, `metadata` / `state` (JSONB), `created_at`, `updated_at`, `seq` |
+| `conversations` | `id`, `agent_id`, `user_id`, `title`, `metadata` / `state` (JSONB), `created_at`, `updated_at`, `seq`, `version` (bumped by every update: the compare-and-set), `action_due_at` (when the earliest open approval lapses) |
 | `messages` | `id`, `conversation_id` (cascade), `role`, `content` (JSONB), `name`, `tool_calls`, `tool_call_id`, `files`, `metadata`, times, `seq` |
 | `files` | the file record: `name`, `mime_type`, `size`, `storage_key`, `conversation_id`, `message_id`, `user_id` (who uploaded it), `agent_id`, `expires_at`, `metadata`, `seq` |
 | `file_contents` | `storage_key`, `content` (BYTEA) |
@@ -147,7 +147,7 @@ With `autoMigrate: true` the provider creates (and upgrades) these tables, all n
 Indexes are named `idx_<prefix>...`, so several prefixes can share a schema:
 
 ```sql
--- conversations: (agent_id, created_at, seq), (user_id, created_at, seq), (created_at, seq), (updated_at, seq)
+-- conversations: (agent_id, created_at, seq), (user_id, created_at, seq), (created_at, seq), (updated_at, seq), (action_due_at) WHERE action_due_at IS NOT NULL
 -- messages:      (conversation_id, created_at, seq)
 -- files:         (conversation_id, created_at, seq), (message_id), (expires_at) WHERE expires_at IS NOT NULL
 -- tasks:         (agent_id, created_at, seq), (user_id, created_at, seq), (status, created_at, seq), (created_at, seq), (conversation_id)
@@ -164,6 +164,7 @@ several, adds the indexes above and drops the old unprefixed ones **if they belo
 besides the duplicate results. Schema version 3 adds the `events`, `event_streams` and `leases` tables and `tasks.conversation_id`.
 Schema version 4 adds `files.user_id`, `files.agent_id`, `files.expires_at` (and, on PostgreSQL, the `files.seq` ordering column) with their indexes; files
 uploaded before it have no owner and no expiry, so they follow their conversation and never expire.
+Schema version 5 adds `conversations.version` (the compare-and-set that keeps two writers of one conversation from overwriting each other) and `conversations.action_due_at` with its partial index.
 
 ### Things to know
 
@@ -202,7 +203,7 @@ Content written by older versions in `<prefix>file_contents` is still read and d
 
 ```javascript
 // conversations
-{ agentId: 1, createdAt: -1, seq: -1 }, { userId: 1, createdAt: -1, seq: -1 }, { createdAt: -1, seq: -1 }, { updatedAt: -1, seq: -1 }
+{ agentId: 1, createdAt: -1, seq: -1 }, { userId: 1, createdAt: -1, seq: -1 }, { createdAt: -1, seq: -1 }, { updatedAt: -1, seq: -1 }, { actionDueAt: 1 } /* only conversations that wait on an approval */
 // messages
 { conversationId: 1, createdAt: 1, seq: 1 }
 // files

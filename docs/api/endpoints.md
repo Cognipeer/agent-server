@@ -100,6 +100,9 @@ GET /conversations
 
 `runtime` says whether the conversation is running, waiting for a human or idle, and why its last turn stopped - see [Runs, Cancel & Reattach](../guide/runs).
 
+The list is **one user's**: the token user, `context.user` from `resolveContext`, or - without `resolveContext` - `?userId=`. A request that names nobody would list everyone's conversations and is
+refused with `401 identity_required`, unless the server sets `allowAnonymousList` (see [Request Context](../guide/request-context#who-may-list)). With `resolveContext`, `userId` in the query is ignored.
+
 ### Create Conversation
 
 ```
@@ -240,8 +243,9 @@ GET /conversations/:id/messages
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| limit | number | Max results (default: 100) |
-| before | string | ISO date - get messages before this time |
+| limit | number | Max results (default: 100, at most 200) |
+| offset | number | Messages to skip (default: 0) |
+| order | string | `asc` (default, oldest first) or `desc` |
 
 **Response:**
 
@@ -256,9 +260,15 @@ GET /conversations/:id/messages
       "createdAt": "2025-01-01T00:00:00.000Z",
       "updatedAt": "2025-01-01T00:00:00.000Z"
     }
-  ]
+  ],
+  "total": 2,
+  "limit": 100,
+  "offset": 0,
+  "hasMore": false
 }
 ```
+
+To page a long conversation by message id (`before` / `after`), use [Get Conversation](#get-conversation).
 
 ### Send Message
 
@@ -553,6 +563,59 @@ DELETE /files/:fileId
 
 `204`. Files also go with their conversation and when `files.retentionDays` have passed.
 
+## Tasks
+
+Background jobs, each run in a conversation of its own. See [Tasks](../tasks).
+
+### Create Task
+
+```
+POST /tasks
+```
+
+```json
+{ "agentId": "assistant", "input": "Summarise the attached report", "files": [{ "name": "report.txt", "content": "<base64>", "mimeType": "text/plain" }], "callbackUrl": "https://example.com/hook", "metadata": {} }
+```
+
+`201 { task }` with `status: "pending"`; the work starts at once. `400` without `agentId` or `input` (or for a bad file), `404` for an unknown agent, and the file errors of [Upload File](#upload-file).
+
+### List Tasks
+
+```
+GET /tasks?agentId=&status=&conversationId=&limit=&offset=
+```
+
+One user's tasks (the same identity rule as [List Conversations](#list-conversations): `401 identity_required` for a request that names nobody). `status` is `pending`, `running`, `completed`,
+`failed`, `waiting_for_input` or `cancelled`. Response: `{ tasks, total, limit, offset, hasMore }`.
+
+### Get Task
+
+```
+GET /tasks/:id
+GET /tasks/:id/status
+GET /tasks/:id/result
+```
+
+`GET /tasks/:id` is `{ task, result?, pendingActions? }` (`pendingActions` while the task waits on an approval or a question; answer them on the task's conversation). `/status` is
+`{ taskId, status, conversationId, createdAt, updatedAt, startedAt?, completedAt?, error? }` and `/result` is `{ result }`, `404` until the task has one.
+
+### Cancel Task
+
+```
+POST /tasks/:id/cancel
+```
+
+`200 { task }` (`202` while the run is winding down), `409 task_finished` for a task that completed or failed.
+
+### Comments
+
+```
+POST /tasks/:id/comments      { "content": "...", "metadata": {} }
+GET  /tasks/:id/comments
+```
+
+`POST` answers `201 { comment, task }` and runs the task again; `409 task_busy` while it runs, `409 action_pending` while it waits on an approval. `GET` is `{ comments, total }`.
+
 ## Documentation
 
 ### Swagger UI
@@ -573,38 +636,18 @@ Returns the OpenAPI 3.0 specification.
 
 ## Error Responses
 
-### 400 Bad Request
+Every error has one shape, and a `code` to switch on (the full list is in [Error Handling](../guide/error-handling)):
 
 ```json
-{
-  "error": "Invalid request body",
-  "code": "VALIDATION_ERROR"
-}
+{ "error": { "code": "VALIDATION_ERROR", "message": "message is required", "details": {} } }
 ```
 
-### 401 Unauthorized
-
-```json
-{
-  "error": "Authentication required",
-  "code": "AUTH_REQUIRED"
-}
-```
-
-### 404 Not Found
-
-```json
-{
-  "error": "Conversation not found",
-  "code": "NOT_FOUND"
-}
-```
-
-### 500 Internal Server Error
-
-```json
-{
-  "error": "Internal server error",
-  "code": "SERVER_ERROR"
-}
-```
+| Status | Code | When |
+|--------|------|------|
+| 400 | `VALIDATION_ERROR` | The request is malformed |
+| 401 | `AUTHENTICATION_ERROR` | Missing or invalid credentials |
+| 401 | `identity_required` | A list request that names no user |
+| 403 | `FORBIDDEN` | The conversation, task or file is somebody else's |
+| 404 | `NOT_FOUND` | It does not exist (or is not yours) |
+| 409 | `conversation_busy`, `action_pending`, ... | The state does not allow it right now |
+| 500 | `INTERNAL_ERROR` | Anything unexpected |

@@ -21,6 +21,8 @@ const deny = { type: "tool_approval", decision: "deny" } as const;
 
 /** A server that does its sweeping only when the test says so. */
 const quiet = (extra: Partial<AgentServerConfig> = {}): Partial<AgentServerConfig> => ({
+  // (single-user tests: the conversations list is theirs)
+  allowAnonymousList: true,
   ...extra,
   runs: { sweepIntervalMs: 0, recoverOnStart: false, ...(extra.runs ?? {}) },
 });

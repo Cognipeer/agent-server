@@ -219,23 +219,47 @@ agentServer.registerCustomAgent('stateful-assistant', {
 });
 ```
 
-## Streaming Custom Agents
+## Streaming
 
-For streaming responses, use an async generator:
+A handler answers once: a streamed request (`stream: true`) gets a progress frame and then the whole answer as one `stream.text`. An agent that streams its answer, reports its tool calls and
+is cancelled through a signal is a **host-backed agent**: `registerHostAgent({ info, invoke })`, where `invoke` calls `emit({ type: 'text', text })` as it goes. See [Host-backed agents](./host-agents.md).
 
 ```typescript
-agentServer.registerCustomAgent('streaming-agent', {
-  processMessage: async function* ({ message }) {
-    // Stream text chunks
-    const chunks = ['Hello', ' there!', ' How', ' can', ' I', ' help?'];
-    
-    for (const chunk of chunks) {
-      yield { type: 'text', text: chunk };
+agentServer.registerHostAgent({
+  info: { id: 'streaming-agent', name: 'Streaming agent' },
+  async invoke({ message }, { emit, signal }) {
+    for (const chunk of ['Hello', ' there!', ' How', ' can', ' I', ' help?']) {
+      if (signal.aborted) break;
+      emit({ type: 'text', text: chunk });
       await delay(100); // Simulate processing
     }
+    return {}; // the streamed text is the answer
   },
 });
 ```
+
+## OpenAI-compatible endpoints
+
+An endpoint that speaks the Chat Completions or Responses API needs no handler:
+
+```typescript
+agentServer.registerChatCompletionsAgent('gpt', {
+  baseUrl: 'https://api.openai.com',
+  apiKey: process.env.OPENAI_API_KEY!,
+  model: 'gpt-4o',
+  systemPrompt: 'You are a helpful assistant.',
+}, { name: 'GPT-4o' });
+
+agentServer.registerResponsesAgent('resp', {
+  baseUrl: 'https://api.openai.com',
+  apiKey: process.env.OPENAI_API_KEY!,
+  model: 'gpt-4o',
+  instructions: 'You are a helpful assistant.',
+  tools: [{ type: 'web_search_preview' }],
+}, { name: 'GPT-4o Responses' });
+```
+
+They stream, accept attachments (text inline, pictures as `image_url` / `input_image` parts), are cancelled by aborting the upstream request, and count their usage; they never pause for an approval.
 
 ## With External APIs
 

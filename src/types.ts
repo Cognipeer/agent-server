@@ -362,8 +362,163 @@ export interface ProcessMessageResult {
   stopReason?: StopReason;
 }
 
+// ============================================================================
+// Host-backed agents
+// ============================================================================
+
 /**
- * Agent registration - can be SDK agent, custom handler, or AI API provider
+ * What a host agent reports while a turn runs (`io.emit`). The server turns each event into the same stored events
+ * and `stream.*` frames an agent-sdk agent produces, so clients cannot tell the difference.
+ *
+ *  - `text`: a chunk of the answer. The chunks are the answer when `content` is left empty.
+ *  - `tool_use` / `tool_result`: a tool call started / ended. Pair them by `id`.
+ *  - `action_required`: the turn waits on these. Same as returning them as `pendingActions` (the result wins when it
+ *    has any); the pause is stored first and announced when the turn ends.
+ *  - `usage`: what one model call used. Added up, unless the result carries `usage` of its own.
+ *  - `stop`: why the turn stopped, when it is known before the host returns (the result's `stopReason` wins).
+ */
+export type HostEvent =
+  | { type: "text"; text: string }
+  | { type: "tool_use"; id: string; name: string; args?: Record<string, unknown> }
+  | { type: "tool_result"; id: string; name?: string; result?: unknown; error?: string }
+  | { type: "action_required"; actions: PendingAction[] }
+  | { type: "usage"; usage: UsageInfo & { model?: string } }
+  | { type: "stop"; stopReason: StopReason; detail?: string };
+
+/** The files of the conversation a host agent runs in. Only those: any other id answers `null`. */
+export interface HostFiles {
+  /** Every file the conversation holds, oldest first. */
+  list(): Promise<FileAttachment[]>;
+  /** The bytes of a file; `null` for a file that is not this conversation's or has expired. */
+  read(fileId: string): Promise<Buffer | null>;
+  /** The text of a file, extracted the way the server gives it to an agent (`files.extractText`); `null` when it has none. */
+  text(fileId: string): Promise<string | null>;
+}
+
+/** What the server hands a host agent next to its input. */
+export interface HostRunIo {
+  /** Reports progress. Late events (after the turn ended) are dropped; a malformed one is ignored with a warning. */
+  emit(event: HostEvent): void;
+  /**
+   * Aborted when the run is cancelled (`POST /conversations/:id/cancel`, a deleted conversation, shutdown). Stop work and
+   * return what you have; an agent that ignores it is abandoned after `runs.cancelGraceMs`.
+   */
+  signal: AbortSignal;
+  /** The conversation's files. */
+  files: HostFiles;
+}
+
+/** A user message for a host agent. */
+export interface HostInvokeInput {
+  conversationId: string;
+  /** The run this turn executes as (the `runId` of `session.status_running` events and of the response). */
+  runId: string;
+  /** What the person typed. The files are not in it: see `files` and `io.files`. */
+  message: string;
+  /** The conversation so far, oldest first, including this message. Hosts that keep their own transcript ignore it. */
+  history: Message[];
+  /** The files this message carries (every entry is a stored file with a real id). */
+  files: FileAttachment[];
+  /** What the request put in `metadata` (a task hands over its comments). */
+  metadata?: Record<string, unknown>;
+  /** Per-request context resolved by `config.resolveContext` (user + custom data). */
+  context: RequestContext;
+}
+
+/** The answer to one pending action of a host agent. */
+export interface HostResolveInput {
+  conversationId: string;
+  runId: string;
+  actionId: string;
+  /** The action as it was asked. */
+  action: PendingAction;
+  /** The whole answer: the decision, edited arguments, `rememberForSession`, a question's answers. */
+  resolution: ActionResolution;
+  /** The other actions of the pause that are still open (the host decides what answering this one means for them). */
+  pendingActions: PendingAction[];
+  /** Who answered: the user id, or `system:timeout` for a request that lapsed under `hitl.onTimeout: "deny"`. */
+  actor: string;
+  /** Where the answer came from: `api`, or `timeout` (the server answered as a refusal). */
+  channel: "api" | "timeout";
+  /** The request lapsed and `hitl.onTimeout: "deny"` answered it. */
+  expired?: boolean;
+  /** What the request put in `metadata`. */
+  metadata?: Record<string, unknown>;
+  context: RequestContext;
+}
+
+/** Why the server tells a host agent to let go of something. */
+export type HostCancelReason =
+  | "user" // POST /conversations/:id/cancel
+  | "remote" // asked through another node
+  | "lease_lost" // another node took the conversation over
+  | "deleted" // the conversation is being deleted
+  | "shutdown" // server.close({ abort: true })
+  | "withdrawn" // open requests were withdrawn (a new message under pendingActionPolicy "cancel", or the cancel route)
+  | "expired"; // open requests lapsed under hitl.onTimeout: "cancel"
+
+export interface HostCancelInput {
+  conversationId: string;
+  /** The run that was stopped; absent when the conversation was not running and only its open requests were withdrawn. */
+  runId?: string;
+  reason: HostCancelReason;
+  /** The open requests that were withdrawn (`withdrawn`, `expired`, `deleted`). */
+  actions?: PendingAction[];
+  context: RequestContext;
+}
+
+/**
+ * How a host agent's turn ended. The server stores the message, the pending actions, the events and the runtime
+ * status itself: the host returns facts, never state.
+ */
+export interface HostTurnResult {
+  /** The answer. May be empty when `text` events carried it (or when the turn only paused). */
+  content?: string;
+  /** `requires_action` is implied by `pendingActions`; `incomplete` / `cancelled` say the turn did not finish. */
+  status?: MessageStatus;
+  /** Why the turn stopped (default: `requires_action` for a pause, `end_turn` otherwise). */
+  stopReason?: StopReason;
+  /**
+   * Everything the turn waits on. Replaces the pause: an empty list says nothing is open any more. After an answer
+   * (`resolveAction`), the still-open actions returned unchanged and nothing else (no `content`, `usage` or files) only
+   * records that answer on the message that asked; open actions left out or changed are withdrawn from it.
+   */
+  pendingActions?: PendingAction[];
+  /** What the turn used; `costUsd` (or `model`, to price it with `pricing`) lets it take part in budgets. */
+  usage?: UsageInfo & { model?: string };
+  /** Files the answer produced (already stored with `POST /files`). */
+  files?: FileAttachment[];
+  /** Reported with the turn. A task reads `waitingForInput` from it. */
+  metadata?: Record<string, unknown>;
+  /** What the agent says about the stop (reported as the `detail` of `session.status_idle`). */
+  detail?: string;
+}
+
+/** The behaviour of a host-backed agent: an agent whose work runs in the host's own backend, not in this process. */
+export interface HostAgent {
+  /** Runs one user message. */
+  invoke(input: HostInvokeInput, io: HostRunIo): Promise<HostTurnResult> | HostTurnResult;
+  /**
+   * Continues a turn that paused with `pendingActions`, once per answered action. What it returns replaces the pause
+   * (the actions it still waits on). Without it the agent cannot pause: its actions answer 404.
+   */
+  resolveAction?(input: HostResolveInput, io: HostRunIo): Promise<HostTurnResult> | HostTurnResult;
+  /**
+   * Called when the server lets go of something the host may still hold: a run that was cancelled while `invoke` or
+   * `resolveAction` was working, or open requests that were withdrawn or lapsed. The `AbortSignal` already stopped the
+   * work in this process; this is for backends that run elsewhere. A failure is logged and never fails the request; a hook that
+   * does not answer within `runs.cancelGraceMs` is given up on.
+   */
+  cancel?(input: HostCancelInput): Promise<void> | void;
+}
+
+/** `registerHostAgent` takes the agent's description and behaviour, and the same per-agent settings as `AgentRegistration`. */
+export interface HostAgentDefinition extends HostAgent, Pick<AgentRegistration, "files" | "hitl" | "budget" | "pricing"> {
+  info: AgentInfo;
+}
+
+/**
+ * Agent registration - can be SDK agent, custom handler, host-backed agent, or AI API provider
  */
 export interface AgentRegistration {
   info: AgentInfo;
@@ -371,6 +526,8 @@ export interface AgentRegistration {
   sdkAgent?: unknown;
   // Custom handler (optional)
   handler?: AgentHandler;
+  // Host-backed agent (optional): see `registerHostAgent`
+  host?: HostAgent;
   // Chat Completions API config (optional)
   chatCompletions?: import("./providers/ai/chat-completions.js").ChatCompletionsConfig;
   // Responses API config (optional)
@@ -878,7 +1035,8 @@ export interface AgentServerConfig {
   titleGeneration?: TitleGenerationConfig;
 
   /**
-   * Optional file storage provider (defaults to database storage)
+   * Reserved for a separate file store. Not used yet: files are kept by `storage` (the built-in providers hold them
+   * next to the conversations; a custom provider implements `saveFile` / `getFileContent`).
    */
   fileStorage?: FileStorageProvider;
 
@@ -964,6 +1122,15 @@ export interface AgentServerConfig {
    * conversation's owner). Default: deny - nobody but the host's code can lift a limit.
    */
   authorizeBudget?: (ctx: RequestContext, change: BudgetChange) => boolean | Promise<boolean>;
+
+  /**
+   * Whether `GET /conversations` and `GET /tasks` may answer a request that has no resolved user (no token user,
+   * no `context.user`, no `userId` the server trusts) - which lists the conversations of EVERYONE. Default `false`:
+   * such a request is refused with 401 `identity_required`. Turn it on only for a server that is single-user by design
+   * (a local tool, a demo). The built-in storage providers hold every user's data in one namespace; they do not
+   * separate tenants, so a multi-tenant host resolves a user (`resolveContext`) for every request.
+   */
+  allowAnonymousList?: boolean;
 }
 
 /** Approval and question settings. */

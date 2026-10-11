@@ -238,6 +238,12 @@ agentServer.registerCustomAgent('payments', {
 
 `pendingActions` is the complete set still waiting after the call: return the remaining ones from `resolveAction` if you paused on several, or nothing when the turn is done. A handler without `resolveAction` cannot be resolved (404).
 
+## Host-backed agents
+
+An agent whose work runs in your own backend returns `pendingActions` from `invoke` (or emits `action_required`) and implements `resolveAction`, which is called once per answered action with the whole
+answer. The server stores the pause, applies the timeouts and `authorizeResolve`, records who decided what on the message, and writes the same events. What it leaves to the host: remembering a tool for
+the session (`rememberForSession` arrives in the resolution) and checking `approvedArgs` against a schema. See [Host-backed agents](./host-agents.md#approvals-and-questions).
+
 ## Not covered
 
 Chat Completions and Responses API agents never pause. A pause that has a deadline needs the expiry sweep to be running (the default) or `server.expirePendingActions()` called from your own scheduler; without

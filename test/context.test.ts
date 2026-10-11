@@ -318,6 +318,7 @@ describe("dynamic agents", () => {
     const server = createAgentServer({
       basePath: "/api",
       storage: await memoryStorage(),
+      allowAnonymousList: true,
       agents: () => {
         calls++;
         return [echoHandler("a")];

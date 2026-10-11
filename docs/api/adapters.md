@@ -154,51 +154,46 @@ return new Response(
 Create your own adapter for other frameworks:
 
 ```typescript
-import { AgentServer, RouteContext, RouteResult } from '@cognipeer/agent-server';
+import type { AgentServer } from '@cognipeer/agent-server';
 
 function createCustomAdapter(agentServer: AgentServer) {
   return async function handleRequest(req: CustomRequest, res: CustomResponse) {
     // 1. Extract request info
     const method = req.method;
-    const path = req.path.replace(agentServer.config.basePath, '');
-    
-    // 2. Build route context
-    const context: RouteContext = {
-      params: {},
-      query: req.query,
-      body: req.body,
-    };
-    
-    // 3. Handle authentication
-    if (agentServer.config.auth?.enabled) {
-      const token = extractToken(req.headers);
-      if (token) {
-        const result = await agentServer.config.auth.provider.validate(token);
-        if (result.valid) {
-          context.user = { id: result.userId! };
-        } else {
-          return res.status(401).json({ error: 'Unauthorized' });
-        }
-      }
+    const path = req.path;                 // handleRequest strips the base path itself
+
+    // 2. Authenticate (a no-op returning null when token auth is off)
+    let user;
+    try {
+      user = (await agentServer.authenticate(extractToken(req.headers))) ?? undefined;
+    } catch (error) {
+      const { statusCode = 401, code = 'AUTHENTICATION_ERROR', message } = error as { statusCode?: number; code?: string; message?: string };
+      return res.status(statusCode).json({ error: { code, message } });
     }
-    
-    // 4. Handle request
-    const result = await agentServer.handleRequest(method, path, context);
-    
-    // 5. Send response
+
+    // 3. Handle the request
+    const result = await agentServer.handleRequest(method, path, {
+      query: req.query,
+      body: req.body,       // a file uploaded as itself: pass its bytes as a Buffer
+      headers: req.headers,
+      user,
+    });
+
+    // 4. Send the response
     if (result.stream) {
-      // Handle streaming
+      // Server-Sent Events: stop reading when the client goes away (the run it was watching goes on)
       res.setHeader('Content-Type', 'text/event-stream');
+      res.on('close', () => result.close?.());
       for await (const chunk of result.stream) {
         res.write(chunk);
       }
       res.end();
     } else if (result.raw) {
-      // Handle binary response
+      // Binary response
       res.setHeader('Content-Type', result.headers?.['Content-Type'] || 'application/octet-stream');
       res.send(result.raw);
     } else {
-      // Handle JSON response
+      // JSON response
       res.status(result.status).json(result.body);
     }
   };

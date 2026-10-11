@@ -75,8 +75,18 @@ Human-in-the-loop: agents can pause for a tool approval or a question, and a cli
 - **Storage**: optional `updateConversationIf` / `Conversation.version`, `updateMessage`, `UpdateConversationParams.actionDueAt` and `GetConversationsParams.actionDueBefore` on memory, SQLite, MongoDB and PostgreSQL, all passing the provider contract suite (a new `compare-and-set`, `action deadlines` and `updating a message` section). SQLite and PostgreSQL schema version 5 (`conversations.version`, `conversations.action_due_at` and its partial index); MongoDB gets the partial index `actionDueAt`.
 - Exports: `costEstimatorFromPricing`, `HitlConfig`, `AgentHitlConfig`, `SessionBudget`, `ModelPricing`, `PricingFn`, `BudgetChange`, `UsageInfo`, `ActionSnapshot`, `ActionStatus`, `UpdateMessageParams`, `UpdateConversationRequest`, `ContinueConversationRequest`, `RememberedToolsResponse`. OpenAPI: the new routes, fields and error codes.
 
+- **Host-backed agents** ([guide](docs/guide/host-agents.md)): `server.registerHostAgent({ info, invoke, resolveAction?, cancel? })` serves an agent whose work runs in the host's own backend as a first-class agent - no agent-sdk look-alike, no fabricated pause state, nothing written into the server's own state keys.
+  `invoke(input, { emit, signal, files })` reports progress with typed events (`text`, `tool_use`, `tool_result`, `action_required`, `usage`, `stop`) that become the same stored events and `stream.*` frames an agent-sdk agent produces, and returns a typed result (`content`, `status`, `stopReason`, `pendingActions`, `usage`, `files`, `metadata`);
+  the server stores the messages, the pending actions, the events and the runtime status itself. `resolveAction(input, io)` is called once per answered action with the whole answer (`decision`, `approvedArgs`, `rememberForSession`, a question's `answers`), the actions still open, and who answered (`system:timeout` for a request that lapsed under `hitl.onTimeout: "deny"`).
+  `io.signal` is aborted when the run is cancelled (an agent that ignores it is abandoned after `runs.cancelGraceMs`); the optional `cancel(input)` hook hears about a cancelled run and about open requests that were withdrawn, lapsed or deleted with their conversation. `io.files` reads the conversation's files only (`list`, `read`, `text`).
+  A result the server cannot use is a `500 invalid_host_result` (nothing half-made is stored); a malformed event is ignored with one warning per turn. `hostAgentRegistration(definition)` builds the registration for hosts that resolve their agents per request (`config.agents`); `AgentRegistration.host`, and the types `HostAgent`, `HostAgentDefinition`, `HostEvent`, `HostFiles`, `HostRunIo`, `HostInvokeInput`, `HostResolveInput`, `HostCancelInput`, `HostCancelReason`, `HostTurnResult`, are exported. Old registrations are unchanged.
+- **`allowAnonymousList`** (default `false`): `GET /conversations` and `GET /tasks` answer one user's records, and a request that names no user - no token user, no `context.user`, no `resolveUserId` result, no trusted `?userId=` - is refused with `401 identity_required` instead of listing everyone's. See Changed.
+- **`server.getRoutes()`**: every route as `{ method, path }`, for tooling. The OpenAPI document now lists every route and the machine-readable `error.code`s of the `Error` schema (`ERROR_CODES`); `test/docs.test.ts` holds the routes, the spec, the error codes, the server options and the documentation to each other.
+- **`examples/standalone`**: a runnable server (SQLite or MongoDB, an agent-sdk agent with approvals, questions, files and cancel, a host-backed agent, CORS, Swagger) with a scripted model, so it needs no API key; `test/example.test.ts` runs it over HTTP on both databases.
+
 ### Changed
 
+- **Listing needs a user.** `GET /conversations` and `GET /tasks` used to return every user's records to a request that named nobody (single reads were already refused). They now answer `401 identity_required` unless the server sets `allowAnonymousList: true` - a server that has no sign-in (a local tool, a demo) sets it. A request that names a user (a token, `resolveContext` with a `user`, `resolveUserId`, or without `resolveContext` a `?userId=`) is unaffected.
 - `FileRecord.mimeType` is stored without parameters (`text/plain; charset=utf-8` becomes `text/plain`), and `application/octet-stream` (or a value that is not a MIME type) is guessed from the extension.
 - A file can only be attached to a message of the conversation it was uploaded to, by the person who uploaded it. A file uploaded without `conversationId` is stored but cannot be attached (it used to be attachable to any conversation).
 - `GET /files/:id/content` sanitises the file name and type before they reach a header and adds `X-Content-Type-Options: nosniff` and `Cache-Control: private, no-store`; `?disposition=inline` shows a picture, PDF or plain text in place (the default is still a download).
@@ -114,6 +124,7 @@ Human-in-the-loop: agents can pause for a tool approval or a question, and a cli
 - **PostgreSQL** returned message text that is valid JSON as a number, boolean, object or `null` (`"42"` came back as `42`), refused NUL characters with a 500, dropped task comments, and answered an over-long title or name with a 500.
 - **History**: the agent and `GET /conversations/:id` saw only the first 100 messages of a conversation, so after about 50 turns the model never received the newest message. The agent now gets the whole conversation.
 - Pending actions and conversation state kept `undefined` values in memory and `null` in MongoDB; every provider now stores the same JSON.
+- **Documentation** brought in line with the code: the file guide, the storage guides and API reference (`createInMemoryProvider`, `getConversations` / `PaginatedResult`, SQLite, the real tables and indexes), the getting-started and framework guides (no more `createMemoryProvider`), core concepts and architecture, the SSE examples (plain `data:` frames, `stream: true`), the error shape (`{ error: { code, message, details } }`), the task routes (comments were undocumented), the authentication guides (`validateToken`, the options the JWT provider has) and the human-in-the-loop caveats about restarts and several instances. `fileStorage` is documented as not used yet.
 
 ## [0.2.0] - 2026-10-09
 
@@ -132,7 +143,7 @@ All changes are additive; existing configurations keep working unchanged.
 
 ### Fixed
 
-- **Trusted identity is fail-closed**: with `resolveContext`, a conversation or task that carries no `userId` is refused (403) instead of being open to every authenticated caller.
+- **Trusted identity is fail-closed**: with `resolveContext`, a conversation or task that carries no `userId` is refused (403) instead of being open to every authenticated caller. (Single reads only: the lists answered everyone's records to a request without a user until 0.3.0, see `allowAnonymousList`.)
 - **Paging**: `limit` is capped at 200 and a negative or non-numeric `offset` becomes 0 before reaching the storage provider (list conversations, messages, tasks).
 - **Empty answer bubble**: when an SDK agent returned its answer without streaming any text (tool agents running non-streaming), the SSE stream ended with `stream.done` only. The final content is now emitted once as `stream.text` (`isFinal: true`) before `stream.done`; the SDK's `isFinal` chunk is used when the result carries no content.
 - **Streaming SDK agent that throws**: a rejected `invoke` used to leave the SSE stream waiting forever and surface as an `unhandledRejection` (which terminates a host process). It now ends the stream with a `stream.error` event (text already sent stays sent; no assistant message is stored).
@@ -146,3 +157,72 @@ All changes are additive; existing configurations keep working unchanged.
 
 - Added Node 24 CI and npm Trusted Publishing release workflows.
 - Added an entrypoint smoke test for server and in-memory storage construction.
+
+## [0.1.5] - 2026-03-24
+
+### Fixed
+
+- Prevented duplication of the final text chunk in Agent SDK streams
+- Made the `onEvent` handler phase-aware to stop duplicate SSE `tool_call` events: `start` now emits `stream.tool_call`, `success`/`error` emit `stream.tool_result`, and `skipped` (tool limit reached) is suppressed — previously every tool call produced two `stream.tool_call` events, causing duplicate rendering in the chat UI
+
+## [0.1.4] - 2026-03-06
+
+### Added
+
+- Chat Completions and Responses API providers for OpenAI-compatible endpoints and multi-turn conversations with built-in tools
+- SQLite storage provider (via `better-sqlite3`), with migration logic for conversations, messages, files, tasks, and task results
+- Automatic conversation title generation using LLM configuration
+
+## [0.1.3] - 2026-02-25
+
+### Fixed
+
+- Ensured message content is always stringified in `PostgresStorageProvider`
+
+### Changed
+
+- Enabled code splitting in the `tsup` build configuration
+
+## [0.1.2] - 2026-02-25
+
+No distinct changes — published the same day as 0.1.0, 0.1.1, and 0.1.3 during the initial release's rapid-iteration burst. Git history jumps directly from the 0.1.1 to the 0.1.3 version bump, so no separate 0.1.2 commits could be identified; the fix and build change above are the actual delta.
+
+## [0.1.1] - 2026-02-25
+
+### Added
+
+- Full Task system: types, storage-provider implementations (in-memory, MongoDB, PostgreSQL), API endpoints, execution logic, and Swagger/OpenAPI documentation
+- Task comments feature with dedicated API endpoints and Swagger documentation
+- Comprehensive Task system documentation
+
+### Changed
+
+- Preserved tool-call information in message structure — SDK agent invocation now includes optional `tool_calls`, `tool_call_id`, and `name` fields, correctly mapped from prior messages
+- Refactored event handling to use a shared helper for extracting tool event properties, with improved error logging
+- Translated README to English and clarified installation instructions
+- Added repository, homepage, and bugs metadata to `package.json`
+
+### Fixed
+
+- Fixed a syntax error in the base storage provider
+- Fixed callback status consistency (`completed` instead of `complete`)
+
+## [0.1.0] - 2025-01-01
+
+### Added
+
+- Initial release
+- `createAgentServer` factory function
+- Express adapter with `createExpressMiddleware`
+- Next.js adapter with `createNextRouteHandlers`
+- PostgreSQL storage provider
+- MongoDB storage provider
+- In-memory storage provider
+- Token-based authentication
+- JWT authentication
+- SSE streaming support
+- File upload/download support
+- Swagger UI integration
+- OpenAPI spec generation
+- SDK agent registration
+- Custom agent handler support

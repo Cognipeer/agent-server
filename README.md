@@ -4,12 +4,14 @@ REST API server infrastructure - a ready-made API layer for AI agents.
 
 
 Documentation: <https://docs.cognipeer.com/agent-server/guide/getting-started>
+
 ## Features
 
 - 🤖 **Agent SDK Integration**: Directly register agents built with `@cognipeer/agent-sdk`
 - 🔧 **Custom Handler Support**: Integrate agents built with other libraries
+- 🏠 **Host-backed agents**: serve an agent that runs in your own backend - it streams with typed events, pauses for approvals by returning `pendingActions`, is cancelled through a signal and a hook, and the server keeps the messages, the events and the pause (`registerHostAgent`)
 - 💾 **Multiple Storage**: PostgreSQL, MongoDB (GridFS for files), SQLite and in-memory, all tested against one provider contract
-- 🔐 **Authentication**: Token-based and JWT authentication
+- 🔐 **Authentication & tenancy**: token and JWT providers, or your own identity per request; conversations belong to their user, and a list that names no user is refused (`allowAnonymousList` opts out)
 - 📚 **Swagger UI**: Automatic OpenAPI documentation
 - 🌐 **Framework Agnostic**: Works with Express, Next.js, Fastify, and raw Node HTTP
 - 🧩 **Request Context & Dynamic Agents**: Resolve user/tenant per request, serve a different agent list and storage scope per request
@@ -33,9 +35,14 @@ npm install pg
 # For MongoDB
 npm install mongodb
 
+# For SQLite (one process, one file)
+npm install better-sqlite3
+
 # For Express
 npm install express
 ```
+
+A complete runnable server - SQLite or MongoDB, an agent-sdk agent with approvals and files, a host-backed agent - is in [`examples/standalone`](examples/standalone).
 
 ## Quick Start
 
@@ -59,6 +66,7 @@ const storage = createPostgresProvider({
 const agentServer = createAgentServer({
   basePath: '/api/agents',
   storage,
+  allowAnonymousList: true, // a quick start with no sign-in: see "Who may list" in Request Context
   swagger: {
     enabled: true,
     path: '/docs',
@@ -120,6 +128,7 @@ const storage = createMongoDBProvider({
 const agentServer = createAgentServer({
   basePath: "/api/agents",
   storage,
+  allowAnonymousList: true, // a quick start with no sign-in: see "Who may list" in Request Context
   swagger: { enabled: true },
 });
 
@@ -159,6 +168,16 @@ export const { GET, POST, PATCH, DELETE, OPTIONS } =
 | GET    | /files/:fileId              | File metadata                     |
 | GET    | /files/:fileId/content      | Download file                     |
 | DELETE | /files/:fileId              | Delete file                       |
+| POST   | /tasks                      | Create a background task          |
+| GET    | /tasks                      | List tasks                        |
+| GET    | /tasks/:taskId              | Task details (and result)         |
+| GET    | /tasks/:taskId/status       | Task status                       |
+| GET    | /tasks/:taskId/result       | Task result                       |
+| POST   | /tasks/:taskId/cancel       | Cancel a task                     |
+| GET / POST | /tasks/:taskId/comments | Read / add comments (continue the task) |
+
+`GET /conversations` and `GET /tasks` list one user's records and need a user (`401 identity_required` otherwise, unless `allowAnonymousList: true`).
+The full reference is in [docs/api/endpoints.md](docs/api/endpoints.md); the server serves its own OpenAPI document at `{basePath}/docs/openapi.json`.
 
 ## Storage Providers
 
@@ -205,6 +224,20 @@ const storage = createMongoDBProvider({
 
 await storage.connect();
 ```
+
+### SQLite
+
+```typescript
+import { createSQLiteProvider } from "@cognipeer/agent-server";
+
+const storage = createSQLiteProvider({
+  filename: "./data/agent-server.db", // ':memory:' for a throwaway database
+});
+
+await storage.connect();
+```
+
+One process owns the file; several server instances need PostgreSQL or MongoDB. See [docs/guide/storage.md](docs/guide/storage.md) for what each provider can hold.
 
 ## Authentication
 
@@ -256,6 +289,9 @@ const authProvider = createJWTAuthProvider({
 });
 ```
 
+The built-in JWT provider is a basic one: it reads the claims and checks expiry, issuer and audience. Verify the token's signature in front of the server, or in your own
+`AuthProvider` with a JWT library - see [docs/guide/authentication.md](docs/guide/authentication.md).
+
 ## Custom Agent Handler
 
 You can integrate your own agent without using the SDK:
@@ -294,6 +330,30 @@ agentServer.registerCustomAgent(
 );
 ```
 
+## Host-backed agents
+
+An agent that runs in your own backend streams with typed events and returns a typed result; the server stores the messages, the pending actions, the events and the runtime status:
+
+```typescript
+agentServer.registerHostAgent({
+  info: { id: "support", name: "Support", capabilities: { toolApproval: true } },
+
+  async invoke({ message, history, files, context }, { emit, signal }) {
+    for await (const chunk of backend.stream(message, { signal })) emit({ type: "text", text: chunk });
+    const run = await backend.finish();
+    return run.needsApproval
+      ? { pendingActions: [{ id: run.requestId, type: "tool_approval", toolName: run.tool, args: run.args }] }
+      : { usage: run.usage };
+  },
+  async resolveAction({ actionId, resolution }, { emit, signal }) {
+    return { content: (await backend.answer(actionId, resolution, { signal })).text };
+  },
+  async cancel({ runId, reason }) { await backend.cancel(runId); },
+});
+```
+
+See [docs/guide/host-agents.md](docs/guide/host-agents.md).
+
 ## Request Context & Dynamic Agents
 
 Resolve who is calling (and anything else your host knows, e.g. tenant) once per
@@ -313,7 +373,9 @@ const server = createAgentServer({
 ```
 
 With `resolveContext` set the resolved identity is authoritative: `userId` sent by
-the client is ignored, and conversations owned by another user answer 403.
+the client is ignored, and conversations owned by another user answer 403. The lists return the
+resolved user's own, and a request with no user cannot list (`401 identity_required`; a single-user
+server sets `allowAnonymousList: true`).
 Unknown agents (not served to this request) answer 404. See
 [docs/guide/request-context.md](docs/guide/request-context.md).
 
@@ -394,7 +456,6 @@ The OpenAPI spec is available at `{basePath}/docs/openapi.json`.
 
 ## Roadmap
 
-- [ ] HTTP Event Stream (SSE) support - real-time response streaming
 - [ ] WebSocket support
 - [ ] Rate limiting
 - [ ] Request logging

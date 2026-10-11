@@ -20,6 +20,46 @@ export interface OpenAPISpec {
   security?: Array<Record<string, string[]>>;
 }
 
+/**
+ * Every machine-readable `error.code` the server answers with, in the HTTP status it comes with. The `Error` schema
+ * lists them, and test/docs.test.ts holds this list, the code and docs/guide/error-handling.md to each other.
+ */
+export const ERROR_CODES: ReadonlyArray<{ code: string; status: number; meaning: string }> = [
+  { code: "VALIDATION_ERROR", status: 400, meaning: "The request is malformed or breaks a limit (details.reason says which, e.g. file_too_large)" },
+  { code: "INVALID_REQUEST", status: 400, meaning: "A task comment that is not valid" },
+  { code: "invalid_budget", status: 400, meaning: "Not a budget, or one at or below what the conversation has already spent" },
+  { code: "budget_unavailable", status: 400, meaning: "The agent has no pricing, so a budget cannot be counted against" },
+  { code: "invalid_approved_args", status: 400, meaning: "The edited arguments are not accepted by the tool's schema" },
+  { code: "AUTHENTICATION_ERROR", status: 401, meaning: "Missing or invalid credentials" },
+  { code: "identity_required", status: 401, meaning: "Listing needs to know who is asking (see allowAnonymousList)" },
+  { code: "budget_reached", status: 402, meaning: "The conversation's budget is used up; raise it to carry on" },
+  { code: "FORBIDDEN", status: 403, meaning: "The conversation, task or file belongs to someone else" },
+  { code: "AUTHORIZATION_ERROR", status: 403, meaning: "A host's own AuthorizationError (access denied)" },
+  { code: "action_forbidden", status: 403, meaning: "hitl.authorizeResolve says you may not answer this request" },
+  { code: "budget_forbidden", status: 403, meaning: "Raising or removing a budget needs the authorizeBudget option" },
+  { code: "attachments_disabled", status: 403, meaning: "The agent does not take attachments" },
+  { code: "NOT_FOUND", status: 404, meaning: "The agent, conversation, message, task, file or tool does not exist (or is not yours)" },
+  { code: "action_pending", status: 409, meaning: "A message or continue while a request is open (details.pendingActionIds)" },
+  { code: "action_not_pending", status: 409, meaning: "The action is unknown, already answered, or cannot be resumed" },
+  { code: "conversation_busy", status: 409, meaning: "A turn is already running in the conversation (details.activeRunId)" },
+  { code: "conversation_conflict", status: 409, meaning: "The conversation kept changing under the request; try again" },
+  { code: "lease_lost", status: 409, meaning: "Another node took the conversation over while the turn ran" },
+  { code: "nothing_to_continue", status: 409, meaning: "No turn was stopped by the budget" },
+  { code: "task_busy", status: 409, meaning: "The task is running or waits on an action" },
+  { code: "task_finished", status: 409, meaning: "The task has already completed or failed" },
+  { code: "too_many_files", status: 409, meaning: "The conversation already holds as many files as the agent allows" },
+  { code: "action_expired", status: 410, meaning: "The approval or question lapsed (expiresAt)" },
+  { code: "PAYLOAD_TOO_LARGE", status: 413, meaning: "The request body is over the body limit" },
+  { code: "STORAGE_LIMIT_EXCEEDED", status: 413, meaning: "The storage provider cannot hold this much" },
+  { code: "unsupported_file_type", status: 415, meaning: "The file's type is not one the agent accepts" },
+  { code: "INTERNAL_ERROR", status: 500, meaning: "Anything unexpected (the text is generic with maskServerErrors)" },
+  { code: "budget_misconfigured", status: 500, meaning: "The agent has a budget but no pricing" },
+  { code: "invalid_host_result", status: 500, meaning: "A host agent returned something the server cannot use" },
+];
+
+const errorCodeList = () =>
+  ERROR_CODES.map((entry) => `- \`${entry.code}\` (${entry.status}): ${entry.meaning}`).join("\n");
+
 export function generateOpenAPISpec(
   config: AgentServerConfig,
   agents: AgentInfo[]
@@ -575,7 +615,10 @@ function generateSchemas(): Record<string, unknown> {
         error: {
           type: "object",
           properties: {
-            code: { type: "string" },
+            code: {
+              type: "string",
+              description: `Machine-readable code. The ones the server answers with (a host can add its own):\n\n${errorCodeList()}`,
+            },
             message: { type: "string" },
             details: { type: "object", additionalProperties: true },
           },
@@ -998,7 +1041,8 @@ function generatePaths(
             name: "userId",
             in: "query",
             schema: { type: "string" },
-            description: "Filter by user ID. If not provided, uses the authenticated user ID.",
+            description:
+              "Filter by user ID. If not provided, uses the authenticated user ID. With resolveContext the resolved user is used and this is ignored. A request that names no user is refused (401 identity_required) unless the server sets allowAnonymousList.",
           },
           {
             name: "limit",
@@ -1031,6 +1075,11 @@ function generatePaths(
                 schema: { $ref: "#/components/schemas/PaginatedConversations" },
               },
             },
+          },
+          401: {
+            description:
+              "identity_required: the request names no user, and listing without one would list everyone's conversations (set allowAnonymousList on a single-user server). AUTHENTICATION_ERROR: missing or invalid credentials.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
         },
       },
@@ -1789,6 +1838,10 @@ function generatePaths(
                 schema: { $ref: "#/components/schemas/ListTasksResponse" },
               },
             },
+          },
+          401: {
+            description: "identity_required: the request names no user (see GET /conversations). AUTHENTICATION_ERROR: missing or invalid credentials.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
         },
       },

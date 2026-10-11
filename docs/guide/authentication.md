@@ -55,42 +55,39 @@ const authProvider = createTokenAuthProvider({
 
 ## JWT Authentication
 
-JSON Web Token authentication for user-facing applications.
-
 ```typescript
 import { createJWTAuthProvider } from '@cognipeer/agent-server';
 
 const authProvider = createJWTAuthProvider({
-  secret: process.env.JWT_SECRET,
-  algorithm: 'HS256',              // Default
-  issuer: 'my-app',                // Optional - validate issuer
-  audience: 'my-api',              // Optional - validate audience
-  extractUserId: (payload) => payload.sub as string,
+  secret: process.env.JWT_SECRET!,
+  algorithm: 'HS256',              // Default; 'RS256' with a public key as the secret
+  issuer: 'my-app',                // Optional - check the issuer
+  audience: 'my-api',              // Optional - check the audience
+  extractUserId: (payload) => payload.sub as string,   // Default: sub, then userId, then user_id
 });
 ```
 
-### RSA Keys
+::: warning A basic provider
+The built-in JWT provider reads a token's claims and checks `exp`, `issuer` and `audience`. It does **not** verify the signature and has no JWKS support. Verify the token in front of the
+server (a gateway, an identity-aware proxy), or write an `AuthProvider` that verifies it with a JWT library such as `jose`:
 
 ```typescript
-import { readFileSync } from 'fs';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 
-const authProvider = createJWTAuthProvider({
-  publicKey: readFileSync('./public.pem', 'utf-8'),
-  algorithm: 'RS256',
-  extractUserId: (payload) => payload.userId as string,
-});
+const keys = createRemoteJWKSet(new URL('https://auth.example.com/.well-known/jwks.json'));
+
+const authProvider: AuthProvider = {
+  async validateToken(token) {
+    try {
+      const { payload } = await jwtVerify(token, keys, { issuer: 'https://auth.example.com', audience: 'my-api' });
+      return { valid: true, userId: String(payload.sub), metadata: payload };
+    } catch {
+      return { valid: false, error: 'Invalid token' };
+    }
+  },
+};
 ```
-
-### JWKS Support
-
-```typescript
-const authProvider = createJWTAuthProvider({
-  jwksUri: 'https://auth.example.com/.well-known/jwks.json',
-  algorithm: 'RS256',
-  issuer: 'https://auth.example.com',
-  extractUserId: (payload) => payload.sub as string,
-});
-```
+:::
 
 ## Configuration Options
 
@@ -101,8 +98,8 @@ interface AuthConfig {
   // Enable authentication
   enabled: boolean;
   
-  // Auth provider instance
-  provider: AuthProvider;
+  // Auth provider instance (without one, token auth is off)
+  provider?: AuthProvider;
   
   // Header name for token (default: 'Authorization')
   headerName?: string;
@@ -170,17 +167,20 @@ Create your own authentication provider:
 
 ```typescript
 interface AuthProvider {
-  validate(token: string): Promise<AuthResult>;
+  validateToken(token: string): Promise<AuthResult>;
+  generateToken?(userId: string, metadata?: Record<string, unknown>): Promise<string>;
+  revokeToken?(token: string): Promise<void>;
 }
 
 interface AuthResult {
   valid: boolean;
   userId?: string;
+  metadata?: Record<string, unknown>;
   error?: string;
 }
 
 class MyAuthProvider implements AuthProvider {
-  async validate(token: string): Promise<AuthResult> {
+  async validateToken(token: string): Promise<AuthResult> {
     try {
       // Validate with your auth service
       const user = await myAuthService.validateToken(token);
@@ -222,7 +222,7 @@ const authProvider = createTokenAuthProvider({
 });
 ```
 
-### From Query/Body
+### From a header, the query or the body
 
 For unauthenticated scenarios, use `resolveUserId`:
 
@@ -230,25 +230,23 @@ For unauthenticated scenarios, use `resolveUserId`:
 auth: {
   enabled: false,  // No token auth
   resolveUserId: async (ctx) => {
-    // Get userId from query param
-    return ctx.query.userId as string;
-    
-    // Or from body
-    // return (ctx.body as any)?.userId;
+    // From a header (set by your gateway)
+    return ctx.headers?.['x-user-id'] as string | undefined;
+
+    // Or from the query: return ctx.query?.userId as string | undefined;
   },
 }
 ```
 
-## Multi-tenant Setup
+### Listing needs a user
+
+`GET /conversations` and `GET /tasks` return one user's records, so a request that names no user is refused with `401 identity_required` - unless the server sets `allowAnonymousList: true`
+(a single-user tool or demo). Token auth, `resolveContext` with a `user`, `resolveUserId` or - without `resolveContext` - a `?userId=` query parameter all name a user.
+See [Request Context](./request-context.md#who-may-list).
+
+## Several users
 
 ```typescript
-const authProvider = createJWTAuthProvider({
-  secret: process.env.JWT_SECRET,
-  extractUserId: (payload) => payload.sub as string,
-});
-
-// Conversations are automatically filtered by userId
-// when userId is set in the auth context
 const agentServer = createAgentServer({
   basePath: '/api/agents',
   storage,
@@ -258,9 +256,12 @@ const agentServer = createAgentServer({
   },
 });
 
-// User A can only see their own conversations
-// User B can only see their own conversations
+// A conversation belongs to the user who created it:
+// user A lists and opens only A's conversations, user B only B's (403 on someone else's)
 ```
+
+The built-in storage providers hold every user's data in one namespace; they separate users, not tenants. For tenants, run a server per tenant (own database or `tablePrefix`), or scope in your
+own storage provider using the request context ([Request Context](./request-context.md)).
 
 ## Security Best Practices
 
@@ -273,21 +274,20 @@ const agentServer = createAgentServer({
 
 ## Error Responses
 
+The body is always `{ "error": { "code", "message" } }` (see [Error Handling](./error-handling.md)):
+
 ```json
 // 401 Unauthorized
-{
-  "error": "Authentication required"
-}
+{ "error": { "code": "AUTHENTICATION_ERROR", "message": "Authentication required" } }
 
 // 401 Unauthorized (invalid token)
-{
-  "error": "Invalid token"
-}
+{ "error": { "code": "AUTHENTICATION_ERROR", "message": "Invalid token" } }
 
-// 403 Forbidden (valid token, no access)
-{
-  "error": "Access denied"
-}
+// 401 Unauthorized (a list that names no user)
+{ "error": { "code": "identity_required", "message": "Listing needs to know who is asking: sign in. ..." } }
+
+// 403 Forbidden (signed in, but it is someone else's)
+{ "error": { "code": "FORBIDDEN", "message": "You do not have access to this conversation" } }
 ```
 
 ## Next Steps

@@ -17,7 +17,8 @@ An agent-sdk agent reports its usage as a ledger: one entry per model call and t
 approval and was resumed hands back the ledger of the whole turn, the calls before the pause included. The server subtracts the ledger the run started from,
 so each run reports only what it used itself: the message that paused reports the calls up to the pause, the answer that carried the turn on reports the calls after it, and nothing is counted twice.
 Chat Completions and Responses API agents report their provider's usage; a [custom handler](./custom-agents.md) returns `usage: { inputTokens, outputTokens, totalTokens }` and may add
-`costUsd` (what the turn cost) or `model` (so the server can price the tokens).
+`costUsd` (what the turn cost) or `model` (so the server can price the tokens). A [host-backed agent](./host-agents.md#usage-and-budgets) does the same with `usage` events or the `usage` of its result.
+Neither a handler nor a host agent can be stopped in the middle of a turn by the budget (there is no cap to hand it): the turn that crosses the budget completes and the next message is refused.
 
 ## Prices
 

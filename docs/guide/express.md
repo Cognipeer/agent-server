@@ -28,6 +28,7 @@ async function main() {
   const agentServer = createAgentServer({
     basePath: '/api/agents',
     storage,
+    allowAnonymousList: true, // a quick start with no sign-in: see "Who may list" in Request Context
     swagger: {
       enabled: true,
       path: '/docs',
@@ -109,6 +110,7 @@ async function main() {
   const agentServer = createAgentServer({
     basePath: '/api/agents',
     storage,
+    allowAnonymousList: true, // a quick start with no sign-in: see "Who may list" in Request Context
     swagger: { enabled: true },
   });
 

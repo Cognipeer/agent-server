@@ -1,288 +1,170 @@
 # Architecture
 
-This page provides a detailed overview of the `@cognipeer/agent-server` architecture.
+This page is an overview of how `@cognipeer/agent-server` is put together.
 
-## Framework-Agnostic Core
+## Framework-agnostic core
 
-The agent server is designed to be framework-agnostic. The core `AgentServer` class handles all business logic, while framework adapters handle HTTP specifics.
+The `AgentServer` class does all the work: routing, agents, runs, storage calls. Framework adapters only translate an HTTP request into a call to it and its answer back into HTTP.
 
 ```typescript
-// Core handles routing and logic
-class AgentServer {
-  constructor(config: AgentServerConfig);
-  registerSDKAgent(id: string, agent: SmartAgent, info?: Partial<AgentInfo>): void;
-  registerCustomAgent(id: string, handler: AgentHandler, info?: Partial<AgentInfo>): void;
-  handleRequest(method: string, path: string, ctx: RouteContext): Promise<RouteResult>;
-}
+// The core: a request in, a result out
+const result = await server.handleRoute('POST', '/conversations/conv_1/messages', {
+  query: {}, body: { message: 'Hi' }, headers, user, context,
+});
+// result: { status, body?, headers?, raw?, stream?, close? }
 
-// Adapters translate HTTP
-createExpressMiddleware(server: AgentServer): RequestHandler;
-createNextRouteHandlers(server: AgentServer): NextRouteHandlers;
+// Adapters: Express, Next.js, Node http, Fastify
+app.use(createExpressMiddleware(server));
+export const { GET, POST, PATCH, DELETE, OPTIONS } = createNextRouteHandlers(server);
+const handle = createNodeHandler(server);            // (req, res) => Promise<boolean>
+app.register(createFastifyPlugin(server), { prefix: '/api/agents' });
 ```
 
-## Module Structure
+`server.getRoutes()` lists every route; `generateOpenAPISpec` describes them. The adapters handle what HTTP needs and the core does not know about: the body (JSON, or a file's raw bytes), CORS, token
+authentication, SSE with back-pressure, and `result.close()` when a client goes away.
+
+## Module structure
 
 ```
 @cognipeer/agent-server
-├── index.ts              # Main exports
-├── server.ts             # AgentServer class
-├── types.ts              # Type definitions
-├── swagger.ts            # OpenAPI generation
+├── index.ts              # Public exports
+├── server.ts             # AgentServer: routes, registrations, turns, sweeps
+├── types.ts              # Public types
+├── runs.ts               # A turn as a run: abort, ordered output, the lease keeper
+├── events.ts             # The event vocabulary, the in-memory event log
+├── hitl.ts               # Approvals and questions: pause detection, resolution, snapshots
+├── host.ts               # Host-backed agents: checking what a host reports
+├── usage.ts              # Usage, cost and budgets
+├── schema.ts             # Checking edited approval arguments against a tool's schema
+├── context.ts            # The request context (AsyncLocalStorage)
+├── swagger.ts            # OpenAPI generation and the error code catalogue
+├── files/                # How a conversation's files reach the agent: config, assembly,
+│                         #   text extraction, images, the session_files_* tools
 ├── adapters/
-│   ├── express.ts        # Express adapter
-│   └── next.ts           # Next.js adapter
+│   ├── node.ts           # node:http (the base of the others)
+│   ├── express.ts        # Express
+│   ├── fastify.ts        # Fastify
+│   └── next.ts           # Next.js App Router
 └── providers/
-    ├── auth/
-    │   ├── token.ts      # Token auth provider
-    │   └── jwt.ts        # JWT auth provider
+    ├── auth/token.ts     # Token and (basic) JWT providers
+    ├── ai/               # Chat Completions and Responses API clients
     └── storage/
-        ├── base.ts       # Base storage class
-        ├── memory.ts     # In-memory storage
-        ├── postgres.ts   # PostgreSQL storage
-        └── mongodb.ts    # MongoDB storage
+        ├── base.ts       # BaseStorageProvider
+        ├── memory.ts     # In memory
+        ├── sqlite.ts     # SQLite
+        ├── postgres.ts   # PostgreSQL
+        └── mongodb.ts    # MongoDB (GridFS for files)
 ```
 
-## Request Handling
+## Request handling
 
-### Route Registration
+### Routes
 
-Routes are registered during server initialization:
+Routes are declared once when the server is created (`getRoutes()` returns them) and matched in order; `:name` is one path segment and `:name*` takes the rest of the path.
+Each request then goes through the same steps:
 
-```typescript
-// Internal route structure
-interface Route {
-  method: 'GET' | 'POST' | 'PATCH' | 'DELETE';
-  pattern: RegExp;
-  paramNames: string[];
-  handler: RouteHandler;
-}
-
-// Routes are matched in order
-const routes: Route[] = [
-  { method: 'GET', pattern: /^\/agents$/, handler: listAgents },
-  { method: 'GET', pattern: /^\/agents\/([^/]+)$/, handler: getAgent },
-  // ...
-];
-```
-
-### Route Context
-
-Each request receives a context object:
-
-```typescript
-interface RouteContext {
-  user?: AuthUser;              // Authenticated user
-  params: Record<string, string>; // URL parameters
-  query: Record<string, string>;  // Query parameters
-  body?: unknown;                 // Request body
-}
-```
-
-### Route Result
-
-Handlers return a result object:
+1. **Context.** `resolveContext(req)` (when configured; `null` is `401`) produces the `RequestContext` - the user and your own data. Without it the context is built from the token user.
+2. **Handler.** The route runs with `runWithRequestContext(context, ...)`, so `getRequestContext()` works anywhere below it, including in streams.
+3. **Result.** A `RouteResult`: a status and a JSON `body`, raw `bytes` (a download), or a `stream` of SSE frames.
+4. **Errors.** Anything thrown becomes `{ error: { code, message, details } }` with the error's `statusCode` (`maskServerErrors` hides the text of everything that is not a 4xx the host authored).
+   See [Error Handling](./error-handling.md).
 
 ```typescript
 interface RouteResult<T = unknown> {
   status: number;
   body?: T;
   headers?: Record<string, string>;
-  raw?: Buffer;                   // For file downloads
-  stream?: AsyncGenerator<string>; // For SSE streaming
+  raw?: Buffer;                                  // for file downloads
+  stream?: AsyncGenerator<string, void, unknown>; // SSE frames
+  close?: () => void;                             // the adapter calls it when the client leaves
 }
 ```
 
-## Agent Registration
+## Agent registration
 
-### SDK Agents
+Four kinds of agent sit behind the same API:
 
-SDK agents are wrapped to work with the server:
+| Registration | The agent is | Streams | Pauses for approvals | Notes |
+| --- | --- | --- | --- | --- |
+| `registerSDKAgent` | an agent-sdk object in this process | yes | yes (the server keeps the paused SDK state) | tools, files, budgets as the SDK counts them |
+| `registerCustomAgent` | a handler: `processMessage` / `resolveAction` | no (one final chunk) | yes, by returning `pendingActions` | the simplest thing that works |
+| `registerHostAgent` | your own backend: `invoke` / `resolveAction` / `cancel` | yes (`emit`) | yes, by returning `pendingActions` | [Host-backed agents](./host-agents.md) |
+| `registerChatCompletionsAgent` / `registerResponsesAgent` | an OpenAI-compatible endpoint | yes | no | the server calls the endpoint |
 
-```typescript
-registerSDKAgent(id: string, agent: SmartAgent, info?: Partial<AgentInfo>): void {
-  this.agents.set(id, {
-    type: 'sdk',
-    agent,
-    info: {
-      id,
-      name: info?.name ?? agent.name,
-      description: info?.description,
-      ...info,
-    },
-  });
-}
+Every registration becomes an `AgentRegistration` (`info` plus the one of `sdkAgent`, `handler`, `host`, `chatCompletions`, `responsesApi`, and the per-agent `files`, `hitl`, `budget`,
+`pricing` settings). `config.agents` can also return registrations per request.
+
+## The life of a turn
+
+A message (or the answer to an approval) is a **run** that is independent of the HTTP request that started it:
+
+```
+request ──▶ authorize ──▶ take the conversation (in-process slot + storage lease)
+                              │          409 conversation_busy if it is taken
+                              ▼
+                          run.launch ──────────────▶ agent step (SDK / handler / host / HTTP)
+   stream subscribers ◀── ordered output ◀──────────        │  text, tool calls, usage
+   (the connection)       event log + followers             ▼
+                                                      finalize: assistant message, pending actions,
+                                                      money (usage, budget), events, stream.done
+                              │
+                              ▼
+                          release the lease
 ```
 
-### Custom Agents
+- The connection is a *subscriber*: closing it never stops the run. `POST /conversations/:id/cancel` does, by aborting the signal the agent was given.
+- One run per conversation, on one node: an in-process slot, and - when the storage provider has leases - a lease any other node respects.
+- Everything a run does is written to the conversation's [event log](./runs.md#the-event-log) in order, which is also what followers read to reattach.
+- A background sweep recovers runs whose process died, handles approvals that lapsed, prunes old events and purges expired files.
 
-Custom agents implement the `AgentHandler` interface:
+Details: [Runs, Cancel & Reattach](./runs.md), [Approvals & Questions](./human-in-the-loop.md), [Usage & Budgets](./budgets.md), [Files](./file-management.md).
 
-```typescript
-interface AgentHandler {
-  processMessage(params: ProcessMessageParams): Promise<ProcessMessageResult>;
-}
+## Storage architecture
 
-interface ProcessMessageParams {
-  conversationId: string;
-  message: string;
-  files?: FileAttachment[];
-  state?: Record<string, unknown>;
-}
+The server talks to storage only through the `StorageProvider` interface. A small required core (conversations, messages, files, tasks) is complemented by optional parts the built-in providers all
+have, each switched by `capabilities()`:
 
-interface ProcessMessageResult {
-  content: string;
-  files?: FileAttachment[];
-  state?: Record<string, unknown>;
-  usage?: TokenUsage;
-}
-```
+| Optional part | Without it |
+| --- | --- |
+| `events` (the durable event log) | a bounded log in memory: reattach works on one node and is lost on restart |
+| leases | runs are serialised in-process only: right for one node |
+| `updateConversationIf` (compare-and-set) | state writes are plain updates |
+| `updateMessage` | a history keeps showing an approval as it was asked |
+| `listFiles` / `purgeExpiredFiles` | the per-conversation file limit and retention do nothing |
+| action deadlines | lapsed approvals are refused with 410 but not swept |
 
-## Storage Architecture
+`BaseStorageProvider` implements the interface on top of a few `_` methods and adds the behaviour every provider shares. All four built-in providers pass one contract suite
+(`test/storage/contract.ts`, run against a real database each), so the application behaves the same on all of them. See [Storage Providers](./storage.md) and [Custom Storage](./custom-storage.md).
 
-### Base Provider
-
-All storage providers extend `BaseStorageProvider`:
-
-```typescript
-abstract class BaseStorageProvider {
-  protected _connected: boolean = false;
-
-  get isConnected(): boolean {
-    return this._connected;
-  }
-
-  abstract connect(): Promise<void>;
-  abstract disconnect(): Promise<void>;
-
-  // Conversations
-  abstract createConversation(...): Promise<Conversation>;
-  abstract getConversation(id: string): Promise<Conversation | null>;
-  abstract updateConversation(...): Promise<Conversation>;
-  abstract deleteConversation(id: string): Promise<void>;
-  abstract listConversations(...): Promise<ListResult<Conversation>>;
-
-  // Messages
-  abstract createMessage(...): Promise<Message>;
-  abstract getMessages(...): Promise<Message[]>;
-
-  // Files
-  abstract saveFile(...): Promise<FileRecord>;
-  abstract getFile(id: string): Promise<FileRecord | null>;
-  abstract getFileContent(id: string): Promise<Buffer | null>;
-  abstract deleteFile(id: string): Promise<void>;
-}
-```
-
-### Provider Implementations
-
-Each provider implements storage-specific logic:
-
-```typescript
-// PostgreSQL
-class PostgresProvider extends BaseStorageProvider {
-  private pool: Pool;
-
-  async connect() {
-    await this.pool.connect();
-    if (this.config.autoMigrate) {
-      await this.runMigrations();
-    }
-  }
-}
-
-// MongoDB
-class MongoDBProvider extends BaseStorageProvider {
-  private client: MongoClient;
-  private db: Db;
-
-  async connect() {
-    await this.client.connect();
-    this.db = this.client.db(this.config.database);
-  }
-}
-```
-
-## Authentication Flow
+## Authentication flow
 
 ```
 Request
    │
    ▼
 ┌──────────────────┐
-│ Extract Token    │
-│ from Header      │
+│ Token auth       │   auth.enabled: the token is validated by the AuthProvider
+│ (adapter)        │   ── invalid / missing ──▶ 401 AUTHENTICATION_ERROR
 └──────────────────┘
-   │
+   │ user
    ▼
 ┌──────────────────┐
-│ Auth Provider    │
-│ Validate Token   │
+│ resolveContext   │   your own identity: cookie, session, header
+│ (core)           │   ── null ──▶ 401 AUTHENTICATION_ERROR
 └──────────────────┘
-   │
-   ├──── Invalid ──────▶ 401 Unauthorized
-   │
+   │ RequestContext { user, data }
    ▼
-┌──────────────────┐
-│ Add User to      │
-│ Route Context    │
-└──────────────────┘
-   │
-   ▼
-Route Handler
+Route handler  ── a conversation, task or file owned by someone else ──▶ 403 FORBIDDEN
+               ── a list that names no user ──▶ 401 identity_required (unless allowAnonymousList)
 ```
 
-## Streaming Architecture
+## Streaming
 
-SSE streaming is implemented using async generators:
+Two kinds of SSE, both plain `data:` JSON (see [Streaming](./streaming.md)):
 
-```typescript
-async *streamResponse(params: StreamParams): AsyncGenerator<string> {
-  yield formatSSE('stream.start', { conversationId, messageId });
-
-  for await (const chunk of agent.streamResponse(message)) {
-    if (chunk.type === 'text') {
-      yield formatSSE('stream.text', { text: chunk.text });
-    }
-    if (chunk.type === 'tool_call') {
-      yield formatSSE('stream.tool_call', chunk.data);
-    }
-  }
-
-  yield formatSSE('stream.done', { message: finalMessage });
-}
-
-function formatSSE(event: string, data: unknown): string {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-}
-```
-
-## Error Handling
-
-Custom error types for proper HTTP responses:
-
-```typescript
-class AuthenticationError extends Error {
-  statusCode = 401;
-}
-
-class NotFoundError extends Error {
-  statusCode = 404;
-}
-
-class ValidationError extends Error {
-  statusCode = 400;
-}
-
-// Error handling in routes
-try {
-  // Handle request
-} catch (error) {
-  if (error instanceof AuthenticationError) {
-    return { status: 401, body: { error: error.message } };
-  }
-  // ...
-}
-```
+- the response to `POST .../messages` with `stream: true`: `stream.*` frames for the turn that request started;
+- `GET /conversations/:id/events/stream`: the event log, replayed from a cursor and followed live (`id:` and `Last-Event-ID`, a `: ping` every 15 s), for reattaching after a reload and for watching
+  a conversation from elsewhere.
 
 ## Next Steps
 

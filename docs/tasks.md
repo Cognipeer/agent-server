@@ -22,10 +22,8 @@ The Task system provides a comprehensive background job processing framework for
 - File metadata is included in task results
 
 ### 4. Storage Flexibility
-- Full support across all storage providers:
-  - In-Memory (for development/testing)
-  - PostgreSQL (production-ready with indexes)
-  - MongoDB (NoSQL option with indexes)
+- Every storage provider holds tasks (memory, SQLite, PostgreSQL, MongoDB), with the same behaviour - see [Storage Providers](/guide/storage). A task and its conversation are stored together, so a restarted
+  server finds them again (a task left `running` by a dead process is failed at the next start).
 
 ## API Endpoints
 
@@ -129,11 +127,14 @@ GET /tasks/:taskId/status
 {
   "taskId": "task_abc123",
   "status": "running",
+  "conversationId": "conv_def456",
   "createdAt": "2024-01-01T00:00:00.000Z",
   "updatedAt": "2024-01-01T00:00:02.000Z",
   "startedAt": "2024-01-01T00:00:01.000Z"
 }
 ```
+
+`completedAt` and `error` are added when the task has finished or failed.
 
 ### Get Task Result
 ```http
@@ -158,6 +159,28 @@ GET /tasks/:taskId/result
   }
 }
 ```
+
+### Comments
+```http
+POST /tasks/:taskId/comments
+GET  /tasks/:taskId/comments
+```
+
+A comment is the next user message of the task's conversation: the agent sees it together with everything before, and the task is processed again (`pending` -> `running` -> ...).
+Comment on a task that has finished or that asked for clarification the old way (see below); a `running` task is `409 task_busy` and one that waits on an approval or a question is `409 action_pending`.
+
+```json
+// POST body
+{ "content": "Use the production data instead.", "metadata": {} }
+
+// 201
+{ "comment": { "id": "comment_...", "taskId": "task_abc123", "role": "user", "content": "...", "createdAt": "..." }, "task": { "id": "task_abc123", "status": "pending" } }
+
+// GET 200
+{ "comments": [ { "id": "comment_...", "role": "agent", "content": "Which data?" }, { "role": "user", "content": "Use the production data instead." } ], "total": 2 }
+```
+
+`content` is required (`400 INVALID_REQUEST`).
 
 ### Cancel a Task
 ```http
@@ -200,7 +223,7 @@ When a task completes, the system sends an HTTP POST request to the callback URL
 }
 ```
 
-**On Failure**:
+**On Failure** (an `error` field is added):
 ```json
 {
   "taskId": "task_abc123",
@@ -269,38 +292,9 @@ console.log('Task result:', result.result.content);
 
 ### Storage Schema
 
-**PostgreSQL**:
-```sql
-CREATE TABLE agent_server_tasks (
-  id VARCHAR(64) PRIMARY KEY,
-  agent_id VARCHAR(255) NOT NULL,
-  user_id VARCHAR(255),
-  conversation_id VARCHAR(64),   -- the conversation the task runs in
-  status VARCHAR(50) NOT NULL DEFAULT 'pending',
-  callback_url VARCHAR(2000),
-  input TEXT NOT NULL,
-  files JSONB DEFAULT '[]',
-  metadata JSONB DEFAULT '{}',
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW(),
-  started_at TIMESTAMPTZ,
-  completed_at TIMESTAMPTZ,
-  error TEXT
-);
-
-CREATE TABLE agent_server_task_results (
-  id VARCHAR(64) PRIMARY KEY,
-  task_id VARCHAR(64) NOT NULL REFERENCES agent_server_tasks(id) ON DELETE CASCADE,
-  content TEXT NOT NULL,
-  files JSONB DEFAULT '[]',
-  metadata JSONB DEFAULT '{}',
-  usage JSONB,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-```
-
-**MongoDB**:
-Collections: `tasks` and `task_results` with appropriate indexes.
+Tasks are stored by the storage provider; the tables and collections, with their indexes, are listed in [Storage Providers](/guide/storage). A task holds `agentId`, `userId`,
+`conversationId`, `status`, `callbackUrl`, `input`, `files`, `comments`, `metadata`, its times and `error`; it has at most one result (`content`, `files`, `metadata`, `usage`) - a second
+result replaces the first (the `waiting_for_input` cycle writes a partial result, then the final one).
 
 ### Background Processing Flow
 
@@ -373,8 +367,8 @@ const checkStatus = async (taskId) => {
 
 ## Security Considerations
 
-1. **User Isolation**: Tasks are filtered by userId when auth is enabled
-2. **Callback URLs**: Validate callback URLs before creating tasks in production
+1. **User Isolation**: A task belongs to the user who created it; another user gets 403. `GET /tasks` lists one user's tasks and needs a resolved user (`401 identity_required` otherwise, unless `allowAnonymousList` is set, see [Request Context](/guide/request-context#who-may-list))
+2. **Callback URLs**: The server POSTs to whatever `callbackUrl` a task names, from the server's network. Validate it (https, an allow-list of hosts, no private addresses) before a task is created in production
 3. **Input Validation**: Always validate task input before processing
 4. **Rate Limiting**: Consider implementing rate limits for task creation
 5. **File Size Limits**: Use the `limits.maxFileSize` configuration

@@ -42,10 +42,27 @@ Rules:
 - Returning `null` answers 401. Throw `{ statusCode: 403, code, message }` to answer
   with another status.
 - **The resolved identity is authoritative.** `userId` in a create-conversation body
-  or `?userId=` in a list query is ignored; conversations and tasks owned by another
-  user (or by anyone, for an anonymous context) answer 403.
+  or `?userId=` in a list query is ignored; a single conversation or task owned by another
+  user (or by anyone, for an anonymous context) answers 403. The lists are covered in
+  [Who may list](#who-may-list).
 - Token auth (`auth.enabled`) still runs first; its user is available as `req.user`
   and is the fallback when the resolver returns no `user`.
+
+## Who may list
+
+`GET /conversations` and `GET /tasks` return the records of **one user**: the resolved one. A request that names nobody - no token user, no `context.user`, no `resolveUserId` result and, without
+`resolveContext`, no `?userId=` - would list the conversations of everyone, so the server refuses it: **`401 identity_required`**. That includes a context that carries only a tenant
+(`{ data: { tenantId } }`, no `user`): resolve a user for every request, even a service user per tenant.
+
+```typescript
+createAgentServer({ basePath: '/api', storage, resolveContext }); // lists need resolveContext to return a user
+createAgentServer({ basePath: '/api', storage, allowAnonymousList: true }); // a single-user tool or a demo: everybody is the same person
+```
+
+`allowAnonymousList: true` lets an anonymous request list everything. Use it only when that is the point of the server.
+
+The built-in storage providers keep every user's data in one namespace: they filter by user, not by tenant. A multi-tenant host either gives each tenant its own database / `tablePrefix`
+(a server per tenant), or scopes in its own storage provider using the context (`ctx.data.tenantId`) - see [Custom Storage](./custom-storage.md).
 
 ## Where the context goes
 
@@ -53,6 +70,7 @@ Rules:
 | --- | --- |
 | Dynamic `agents` function | first argument |
 | Custom `AgentHandler.processMessage` | `params.context` |
+| Host-backed agent | `input.context` of `invoke` and `resolveAction` ([Host-backed agents](./host-agents.md)) |
 | SDK agent | `agent.invoke(params, { context, ... })` (extra key, ignored by agents that don't read it) |
 | `auth.resolveUserId` | `{ headers, query, body, context }` |
 | Storage provider | last argument of every data method |

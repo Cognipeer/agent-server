@@ -453,12 +453,16 @@ interface ListFilesResponse {
 }
 ```
 
-### ListResult
+### PaginatedResult
+
+What the storage providers' list methods return (`getConversations`, `getMessages`, `getTasks`, `listFiles`).
 
 ```typescript
-interface ListResult<T> {
-  items: T[];
+interface PaginatedResult<T> {
+  data: T[];
   total: number;
+  limit: number;
+  offset: number;
   hasMore: boolean;
 }
 ```
@@ -491,14 +495,17 @@ interface UpdateMessageParams {
 }
 ```
 
-### ListConversationsParams
+### GetConversationsParams
 
 ```typescript
-interface ListConversationsParams {
+interface GetConversationsParams {
   agentId?: string;
   userId?: string;
   limit?: number;
   offset?: number;
+  orderBy?: 'createdAt' | 'updatedAt';   // default createdAt
+  order?: 'asc' | 'desc';                // default desc: newest first
+  actionDueBefore?: Date;                // only conversations whose earliest open approval lapses by then (the expiry sweep; needs capabilities().actionDeadlines)
 }
 ```
 
@@ -521,8 +528,11 @@ interface CreateMessageParams {
 
 ```typescript
 interface GetMessagesParams {
-  limit?: number;
-  before?: Date;
+  limit?: number;                 // default 100
+  offset?: number;
+  order?: 'asc' | 'desc';         // chronological order of the page; default asc (oldest first)
+  before?: string;                // only messages older than this message id (an unknown id is a NotFoundError)
+  after?: string;                 // only messages newer than this message id
 }
 ```
 
@@ -566,6 +576,7 @@ interface AuthUser {
 interface AuthResult {
   valid: boolean;
   userId?: string;
+  metadata?: Record<string, unknown>;
   error?: string;
 }
 ```
@@ -574,32 +585,90 @@ interface AuthResult {
 
 ```typescript
 interface AuthProvider {
-  validate(token: string): Promise<AuthResult>;
+  validateToken(token: string): Promise<AuthResult>;
+  generateToken?(userId: string, metadata?: Record<string, unknown>): Promise<string>;
+  revokeToken?(token: string): Promise<void>;
 }
 ```
 
 ## Error Types
 
-### AuthenticationError
+Every error is an `AgentServerError { message, code, statusCode, details? }`. The HTTP body is `{ "error": { "code", "message", "details" } }` - see [Error Handling](../guide/error-handling)
+for every code. The server also throws plain objects of the same shape (`{ statusCode, code, message }`), and treats them alike.
 
 ```typescript
-class AuthenticationError extends Error {
-  statusCode = 401;
-}
+class AgentServerError extends Error { constructor(message, code, statusCode = 500, details?) }
+class AuthenticationError extends AgentServerError { /* 401 AUTHENTICATION_ERROR */ }
+class AuthorizationError extends AgentServerError { /* 403 AUTHORIZATION_ERROR */ }
+class NotFoundError extends AgentServerError { constructor(resource: string, id: string) /* 404 NOT_FOUND */ }
+class ValidationError extends AgentServerError { constructor(message, details?) /* 400 VALIDATION_ERROR */ }
+class StorageLimitError extends AgentServerError { constructor(message, details?) /* 413 STORAGE_LIMIT_EXCEEDED */ }
 ```
 
-### NotFoundError
+## Host-backed agents
+
+For [`registerHostAgent`](./server#registerhostagent). The guide: [Host-backed agents](../guide/host-agents).
 
 ```typescript
-class NotFoundError extends Error {
-  statusCode = 404;
+interface HostAgentDefinition extends HostAgent {
+  info: AgentInfo;                          // id and name
+  files?: AgentFilesConfig; hitl?: AgentHitlConfig; budget?: SessionBudget | null; pricing?: PricingFn;
 }
-```
 
-### ValidationError
+interface HostInvokeInput {
+  conversationId: string;
+  runId: string;                            // the run this turn executes as
+  message: string;                          // what the person typed
+  history: Message[];                       // the conversation so far, including this message
+  files: FileAttachment[];                  // the files this message carries (stored; real ids)
+  metadata?: Record<string, unknown>;
+  context: RequestContext;
+}
 
-```typescript
-class ValidationError extends Error {
-  statusCode = 400;
+interface HostResolveInput {
+  conversationId: string;
+  runId: string;
+  actionId: string;
+  action: PendingAction;                    // as it was asked
+  resolution: ActionResolution;             // the whole answer: decision, approvedArgs, rememberForSession, answers
+  pendingActions: PendingAction[];          // the other actions of the pause that are still open
+  actor: string;                            // the user id, or 'system:timeout'
+  channel: 'api' | 'timeout';
+  expired?: boolean;                        // the request lapsed and hitl.onTimeout 'deny' answered it
+  metadata?: Record<string, unknown>;
+  context: RequestContext;
+}
+
+interface HostRunIo {
+  emit(event: HostEvent): void;
+  signal: AbortSignal;
+  files: HostFiles;                         // { list(), read(fileId), text(fileId) }: the conversation's files only
+}
+
+type HostEvent =
+  | { type: 'text'; text: string }
+  | { type: 'tool_use'; id: string; name: string; args?: Record<string, unknown> }
+  | { type: 'tool_result'; id: string; name?: string; result?: unknown; error?: string }
+  | { type: 'action_required'; actions: PendingAction[] }
+  | { type: 'usage'; usage: UsageInfo & { model?: string } }
+  | { type: 'stop'; stopReason: StopReason; detail?: string };
+
+interface HostTurnResult {
+  content?: string;                         // empty: the streamed text is the answer
+  status?: MessageStatus;
+  stopReason?: StopReason;
+  pendingActions?: PendingAction[];         // replaces the pause; [] says nothing is open any more; the open ones unchanged (and nothing else) just record an answer
+  usage?: UsageInfo & { model?: string };   // replaces the emitted usage
+  files?: FileAttachment[];
+  metadata?: Record<string, unknown>;
+  detail?: string;
+}
+
+interface HostCancelInput {
+  conversationId: string;
+  runId?: string;                           // absent when only open requests were withdrawn
+  reason: 'user' | 'remote' | 'lease_lost' | 'deleted' | 'shutdown' | 'withdrawn' | 'expired';
+  actions?: PendingAction[];
+  context: RequestContext;
 }
 ```
