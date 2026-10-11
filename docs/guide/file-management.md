@@ -240,14 +240,15 @@ A conversation's files go with the conversation. Deleting a file does not rewrit
       "maxFiles": 3,
       "maxFileSize": 10485760,
       "allowedMimeTypes": ["image/*"],
-      "acceptsImages": true
+      "acceptsImages": true,
+      "retentionDays": 30
     }
   },
   "metadata": { "enableFileUpload": true, "maxFileSize": 10485760, "maxFiles": 3, "allowedFileTypes": ["image/*"], "acceptsImages": true }
 }
 ```
 
-`metadata` carries the same as the keys the first chat-ui read (kept for it); whatever the host puts in `info.capabilities.attachments` or `info.metadata` wins, field by field.
+`retentionDays` is how long an uploaded file is kept, counted from the upload (`0`: until its conversation is deleted) - show it next to the paperclip. `metadata` carries the same as the keys the first chat-ui read (kept for it); whatever the host puts in `info.capabilities.attachments` or `info.metadata` wins, field by field.
 
 ## Errors
 

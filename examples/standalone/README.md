@@ -8,6 +8,8 @@ The end-to-end tests (`test/example.test.ts` in this repository) start exactly t
 cd examples/standalone
 npm install                       # @cognipeer/agent-server comes from ../.. (run `npm run build` there first), or from a tarball:
                                   #   npm install ../../../.local-packages/cognipeer-agent-server-0.3.0.tgz
+                                  # @cognipeer/agent-sdk comes from the local tarball ../../../.local-packages/cognipeer-agent-sdk-0.10.6.tgz
+                                  # (0.10.6 is the first SDK whose Stop hangs up on the model; once it is on npm, depend on "^0.10.6" instead)
 
 npm run start:sqlite              # a file database: ./data/example.db (SQLITE_FILE)
 npm run start:mongodb             # MONGODB_URL, or an in-memory MongoDB when it is not set (mongodb-memory-server)

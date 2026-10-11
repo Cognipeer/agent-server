@@ -111,6 +111,19 @@ export interface ConversationRuntime {
   pendingActionIds: string[];
   /** The run that is executing now (on this or another node). */
   activeRunId?: string;
+  /**
+   * Why the last turn ended in `stopReason: "error"`, when the log says: the code and message of its `session.error`
+   * event. A run whose process died is closed as `{ code: "run_interrupted" }` - the conversation then has the
+   * person's message and no answer, and this is how a client tells them why. Absent for every other stop.
+   */
+  error?: RuntimeError;
+}
+
+/** What went wrong in the last turn of a conversation (`ConversationRuntime.error`). */
+export interface RuntimeError {
+  /** `run_interrupted` (the server stopped mid-turn), or the code of the failure (`INTERNAL_ERROR`, a host's own code, ...). */
+  code: string;
+  message: string;
 }
 
 export interface ConversationWithMessages extends Conversation {
@@ -202,6 +215,11 @@ export interface AttachmentsCapability {
   allowedMimeTypes?: string[];
   /** The agent's model looks at images; without it an attached image is only mentioned. */
   acceptsImages?: boolean;
+  /**
+   * How long an uploaded file is kept, in days, counted from the upload (`0`: until its conversation is deleted).
+   * Clients show it next to the paperclip ("files are kept for 30 days").
+   */
+  retentionDays?: number;
 }
 
 // ============================================================================
@@ -240,6 +258,12 @@ export type PendingAction =
       /** A one-line description of what approving does (`metadata.summary` of the agent's entry). */
       summary?: string;
       args?: Record<string, unknown>;
+      /**
+       * JSON Schema of the tool's arguments, when the server knows it (an agent-sdk tool's zod or JSON schema; a host
+       * agent can set it itself). A client that lets the person edit `args` validates the edit against it; the server
+       * checks `approvedArgs` against the tool's schema either way (`400 invalid_approved_args`).
+       */
+      argsSchema?: Record<string, unknown>;
       expiresAt?: string;
     }
   | {
@@ -1726,6 +1750,24 @@ export interface WireEvent {
   data: Record<string, unknown>;
   run_id?: string;
   created_at: string;
+}
+
+/**
+ * The first frame of `GET /conversations/:id/events/stream` when a run is active on the node that serves the stream. Not a stored
+ * event: it has no `id:` line and no `seq`, and it is sent once, before anything else. It is what a client that joins mid-run
+ * (a reload, a second window) seeds its view from - the user's message when the stored history may not have it yet, and the
+ * answer as far as it has been streamed - and the `agent.message.delta` frames that follow append to `text`.
+ */
+export interface MessageSnapshotFrame {
+  type: "agent.message.snapshot";
+  data: {
+    /** The run that is going. */
+    run_id: string;
+    /** The model text this run has streamed so far (`""` before the first token). */
+    text: string;
+    /** The message the run is answering, once it is stored; `null` for a run that answers an action or continues, and before the message is stored. */
+    user_message: { id: string; content: string; files: FileAttachment[] } | null;
+  };
 }
 
 /** `POST /conversations/:id/cancel` */

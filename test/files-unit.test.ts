@@ -82,8 +82,10 @@ describe("resolveFilesConfig", () => {
       maxFileSize: 10 * 1024 * 1024,
       allowedMimeTypes: ["image/*"],
       acceptsImages: true,
+      retentionDays: 30,
     });
     expect(FILES_DEFAULTS.retentionDays).toBe(30);
+    expect(attachmentsCapability(resolveFilesConfig({ retentionDays: 0 }, undefined, limits)).retentionDays).toBe(0);
   });
 });
 

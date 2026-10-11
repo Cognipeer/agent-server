@@ -92,6 +92,30 @@ describe("messages that attach uploaded files by id", () => {
   });
 });
 
+describe("the shape of a file answer", () => {
+  it("wraps the record in { file } only when it is uploaded: GET /files/:id answers the record itself", async () => {
+    const { post, url, conversation } = await boot();
+    const uploaded = await upload(post, conversation.id, "hello", "a.txt");
+    expect(uploaded.res.status).toBe(201);
+    expect(Object.keys(uploaded.body)).toEqual(["file"]);
+
+    const got = (await (await fetch(`${url}/files/${uploaded.body.file.id}`)).json()) as any;
+    // (the record, as it has always been: no wrapper)
+    expect(got.file).toBeUndefined();
+    expect(got).toEqual(uploaded.body.file);
+    expect(got).toMatchObject({ id: uploaded.body.file.id, name: "a.txt", mimeType: "text/plain", size: 5, conversationId: conversation.id });
+  });
+
+  it("documents exactly that, in the OpenAPI document", async () => {
+    const { generateOpenAPISpec } = await import("../src/swagger.js");
+    const spec = generateOpenAPISpec({ basePath: "/x", storage: await memoryStorage() }, []) as any;
+    expect(spec.paths["/files/{fileId}"].get.responses[200].content["application/json"].schema).toEqual({ $ref: "#/components/schemas/FileRecord" });
+    expect(spec.paths["/files/{fileId}"].get.description).toMatch(/not wrapped/);
+    const created = spec.paths["/files"].post.responses[201].content["application/json"].schema;
+    expect(created.properties.file).toEqual({ $ref: "#/components/schemas/FileRecord" });
+  });
+});
+
 describe("upload size and the Fastify body limit", () => {
   it("rejects a file over limits.maxFileSize before decoding it", async () => {
     const { post, conversation } = await boot({ limits: { maxFileSize: 10 } });

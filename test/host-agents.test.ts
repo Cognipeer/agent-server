@@ -5,7 +5,8 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { createAgentServer, createInMemoryProvider, hostAgentRegistration } from "../src/index.js";
+import { z } from "zod";
+import { createAgentServer, createInMemoryProvider, hostAgentRegistration, toJsonSchema } from "../src/index.js";
 import type {
   AgentServerConfig,
   HostAgent,
@@ -358,6 +359,32 @@ function hostSuite() {
   });
 
   describe("pausing and resolving", () => {
+    it("keeps the schema of the arguments the host gives an approval, and checks edited arguments against it", async () => {
+      const argsSchema = toJsonSchema(z.object({ version: z.string().regex(/^\d+\.\d+$/) }))!;
+      expect(argsSchema).toEqual({ type: "object", required: ["version"], properties: { version: { type: "string", pattern: "^\\d+\\.\\d+$" } } });
+      const t = await boot({
+        invoke: async () => ({ content: "", pendingActions: [approval("ap1", { argsSchema })] }),
+        resolveAction: async () => ({ content: "deployed" }),
+      });
+      const paused = (await t.send("ship it")).body as any;
+      expect(paused.pendingActions[0].argsSchema).toEqual(argsSchema);
+      expect(((await t.get()).pendingActions as any[])[0].argsSchema).toEqual(argsSchema);
+      expect((await t.events()).find((e: any) => e.type === "action.required")!.data.args_schema).toEqual(argsSchema);
+
+      const bad = await t.resolve("ap1", { ...allow, approvedArgs: { version: "latest" } });
+      expect(bad.status).toBe(400);
+      expect((bad.body as any).error).toMatchObject({ code: "invalid_approved_args", details: { toolName: "deploy" } });
+      expect((await t.resolve("ap1", { ...allow, approvedArgs: { version: "2.0" } })).status).toBe(200);
+    });
+
+    it("refuses a schema that is not an object", async () => {
+      const t = await boot({
+        invoke: async () => ({ content: "", pendingActions: [approval("ap1", { argsSchema: "string" as never })] }),
+      });
+      const res = await t.send("ship it");
+      expect(res.status).toBeGreaterThanOrEqual(500);
+    });
+
     it("stores a pause from the result, announces it afterwards, and continues from the full answer", async () => {
       const t = await boot({
         invoke: (_i, { emit }) => {

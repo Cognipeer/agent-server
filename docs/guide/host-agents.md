@@ -66,7 +66,7 @@ a hook, and is handed the full answer to an approval.
 | `text` `{ text }` | A chunk of the answer: a `stream.text` frame for the connection that sent the message, and a live `agent.message.delta` for [followers](./runs.md) |
 | `tool_use` `{ id, name, args? }` | An `agent.tool_use` event and a `stream.tool_call` frame |
 | `tool_result` `{ id, name?, result?, error? }` | An `agent.tool_result` event (`ok: false` with `error`) and a `stream.tool_result` frame. Pair it with its `tool_use` by `id` |
-| `action_required` `{ actions }` | The turn waits on these. Same as returning them as `pendingActions`; stored first, announced when the turn ends |
+| `action_required` `{ actions }` | The turn waits on these. Same as returning them as `pendingActions`; stored first, announced when the turn ends. An approval can carry `argsSchema` (JSON Schema of the tool's arguments; `toJsonSchema(zodSchema)` converts a zod schema): clients validate edits against it and the server checks `approvedArgs` against it |
 | `usage` `{ usage }` | What one model call used. Added up over the turn |
 | `stop` `{ stopReason, detail? }` | Why the turn stopped, when you know before you return |
 

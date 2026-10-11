@@ -126,6 +126,7 @@ function readAction(raw: unknown, where: string): Checked<PendingAction> {
   if (raw.type === "tool_approval") {
     if (!isText(raw.toolName)) return fail(`${where}.toolName must be a non-empty string`);
     if (raw.args !== undefined && !isObject(raw.args)) return fail(`${where}.args must be an object`);
+    if (raw.argsSchema !== undefined && !isObject(raw.argsSchema)) return fail(`${where}.argsSchema must be a JSON Schema object`);
     return {
       ok: true,
       value: {
@@ -136,6 +137,7 @@ function readAction(raw: unknown, where: string): Checked<PendingAction> {
         ...(optionalText(raw.title) !== undefined && { title: raw.title as string }),
         ...(optionalText(raw.summary) !== undefined && { summary: raw.summary as string }),
         ...(raw.args !== undefined && { args: raw.args as Record<string, unknown> }),
+        ...(raw.argsSchema !== undefined && { argsSchema: raw.argsSchema as Record<string, unknown> }),
         ...(expiresAt && { expiresAt }),
       },
     };

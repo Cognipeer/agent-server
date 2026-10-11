@@ -99,6 +99,7 @@ interface ConversationRuntime {
   lastEventSeq: number;         // seq of the newest event (0: none)
   pendingActionIds: string[];
   activeRunId?: string;
+  error?: { code: string; message: string };  // why the last turn ended in 'error' (code 'run_interrupted': the server stopped mid-turn)
 }
 
 type StopReason = 'end_turn' | 'requires_action' | 'cancelled' | 'max_turns' | 'limit' | 'budget_reached' | 'error';
@@ -187,6 +188,19 @@ interface WireEvent {
 }
 
 interface ListEventsResponse { events: WireEvent[]; hasMore: boolean; lastSeq: number }
+
+/**
+ * The first frame of GET /conversations/:id/events/stream while a run is active on the serving node. Not stored, no `id:` line.
+ * `text` is the answer streamed so far; the agent.message.delta frames that follow append to it.
+ */
+interface MessageSnapshotFrame {
+  type: 'agent.message.snapshot';
+  data: {
+    run_id: string;
+    text: string;
+    user_message: { id: string; content: string; files: FileAttachment[] } | null;
+  };
+}
 ```
 
 See [Runs, Cancel & Reattach](../guide/runs#the-event-log) for the types and their data. `EventStore`, `Lease`, `AcquireLeaseParams`,
@@ -338,7 +352,8 @@ interface StreamErrorEvent {
 
 ```typescript
 type PendingAction =
-  | { id: string; type: 'tool_approval'; toolName: string; toolCallId?: string; title?: string; summary?: string; args?: Record<string, unknown>; expiresAt?: string }
+  | { id: string; type: 'tool_approval'; toolName: string; toolCallId?: string; title?: string; summary?: string; args?: Record<string, unknown>;
+      argsSchema?: Record<string, unknown> /* JSON Schema of the tool's arguments, when known */; expiresAt?: string }
   | { id: string; type: 'user_question'; questions: UserQuestion[]; allowFreeText?: boolean; expiresAt?: string };
 
 interface UserQuestion {
@@ -437,6 +452,7 @@ interface AttachmentsCapability {
   maxFileSize?: number;          // bytes
   allowedMimeTypes?: string[];   // empty = any
   acceptsImages?: boolean;
+  retentionDays?: number;        // days a file is kept after the upload (0: until its conversation is deleted)
 }
 ```
 

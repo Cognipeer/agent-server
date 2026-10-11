@@ -657,6 +657,38 @@ function suite(harness: ProviderHarness) {
       expect((ok.body as any).response.content).toBe('deployed:{"version":"2.0","replicas":3}');
     });
 
+    it("tells the client what the tool takes: argsSchema on the request, in the log and on the paused message", async () => {
+      const t = await boot(pausingStub({ tools: [zodTool] }));
+      const paused = (await t.send()).body as any;
+      const argsSchema = {
+        type: "object",
+        properties: { version: { type: "string" }, replicas: { type: "integer", minimum: 1 } },
+        required: ["version"],
+      };
+      expect(paused.pendingActions[0]).toMatchObject({ id: "ap1", toolName: "deploy", argsSchema });
+      // kept with the pause
+      expect((await t.get()).pendingActions[0].argsSchema).toEqual(argsSchema);
+      // announced (JSON Schema keys are not re-cased) and recorded for the history
+      const [required] = await t.events("action.required");
+      expect(required!.data.args_schema).toEqual(argsSchema);
+      expect((await t.pausedMessage()).metadata.pendingActions[0].argsSchema).toEqual(argsSchema);
+    });
+
+    it("hands a JSON Schema on as it is, and says nothing for a tool whose schema is not known", async () => {
+      const parameters = { type: "object", required: ["version"], properties: { version: { type: "string", pattern: "^\\d+\\.\\d+$" } } };
+      const known = await boot(pausingStub({ tools: [{ name: "deploy", parameters }] }));
+      expect(((await known.send()).body as any).pendingActions[0].argsSchema).toEqual(parameters);
+
+      for (const tools of [[{ name: "other", schema: zodTool.schema }], [{ name: "deploy" }], []]) {
+        const unknown = await boot(pausingStub({ tools }));
+        const action = ((await unknown.send()).body as any).pendingActions[0];
+        expect(action.argsSchema).toBeUndefined();
+        expect("argsSchema" in action).toBe(false);
+      }
+      const [event] = await (await boot(pausingStub())).events("action.required");
+      expect(event).toBeUndefined();
+    });
+
     it("understands a JSON Schema too", async () => {
       const tool = {
         name: "deploy",

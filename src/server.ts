@@ -60,6 +60,7 @@ import type {
   MessagesPage,
   StopReason,
   ConversationRuntime,
+  RuntimeError,
   RunsConfig,
   EventStore,
   EventSummary,
@@ -121,7 +122,7 @@ import {
   roundUsd,
   snapshotLedger,
 } from "./usage.js";
-import { findToolSchema, validateAgainstSchema } from "./schema.js";
+import { findToolSchema, toJsonSchema, validateAgainstSchema } from "./schema.js";
 import { hostAgentRegistration, readHostEvent, readHostResult, type HostCollected } from "./host.js";
 import { generateOpenAPISpec, generateSwaggerHTML } from "./swagger.js";
 import {
@@ -135,7 +136,7 @@ import {
   type ResponsesApiConfig,
 } from "./providers/ai/responses.js";
 import { bindStreamToContext, normalizeHeaders, parseCookies, runWithRequestContext } from "./context.js";
-import { EVENT_TYPES, MemoryEventLog, actionRequiredData, clampLimit, wireEvent } from "./events.js";
+import { EVENT_TYPES, MemoryEventLog, actionRequiredData, clampLimit, snapshotFrame, wireEvent } from "./events.js";
 import {
   ActiveRun,
   EventBus,
@@ -2670,6 +2671,9 @@ export class AgentServer {
       metadata: body.metadata,
     }, ctx.context);
 
+    // (a follower that joins from here on is shown the message even if it reads the stored history before the message was in it)
+    run.userMessage = { id: userMessage.id, content: body.message, files };
+
     run.emit({
       events: [
         {
@@ -3195,7 +3199,10 @@ export class AgentServer {
     let content = result.content;
     const usage = normalizeUsage(result.metadata?.usage, { previous: carried, pricing: budget.pricing });
 
-    if (sdkCtx?.__cancelled) {
+    // Stopped: the SDK says so (`__cancelled`), or the run was asked to stop while the SDK was still finishing and it returned an
+    // ordinary result anyway (an SDK that does not hang up on the model, a call that completed in the same breath). Either way the
+    // person pressed Stop, so the turn is recorded as cancelled with the text that was streamed - not as a finished answer.
+    if (sdkCtx?.__cancelled || run.cancelled) {
       return { ...cancelledStep(content || partial.text || bridge.finalChunkText), usage };
     }
 
@@ -3270,7 +3277,7 @@ export class AgentServer {
 
     // A cancelled step ends the turn: nothing it was waiting on is kept
     const hitl = this.hitlFor(x.agent);
-    const actions = step.cancelled ? [] : stampDeadlines(step.pending, hitl.timeoutMinutes);
+    const actions = step.cancelled ? [] : this.withArgsSchemas(x.agent, stampDeadlines(step.pending, hitl.timeoutMinutes));
     let wanted: StopReason = step.cancelled
       ? "cancelled"
       : actions.length > 0
@@ -3699,7 +3706,8 @@ export class AgentServer {
         resolution.decision === "allow" &&
         resolution.approvedArgs !== undefined &&
         !isDeepStrictEqual(resolution.approvedArgs, action.args ?? {});
-      if (edited && useSdk && this.hitlFor(agent).validateApprovedArgs) {
+      // (an agent-sdk agent's tools are looked up; any other agent is checked against the schema it put on the request, if it did)
+      if (edited && this.hitlFor(agent).validateApprovedArgs && (useSdk || (action as { argsSchema?: unknown }).argsSchema !== undefined)) {
         this.checkApprovedArgs(agent, action as Extract<PendingAction, { type: "tool_approval" }>, (resolution as Extract<ActionResolution, { type: "tool_approval" }>).approvedArgs!);
       }
 
@@ -3757,13 +3765,27 @@ export class AgentServer {
     };
   }
 
+  /**
+   * The approvals among `actions` with the JSON Schema of their tool's arguments, where the agent says what the tool takes (an
+   * agent-sdk tool's zod / JSON schema). One that already carries a schema (a host agent set it) is left alone.
+   */
+  private withArgsSchemas(agent: AgentRegistration, actions: PendingAction[]): PendingAction[] {
+    if (!agent.sdkAgent || !actions.some((action) => action.type === "tool_approval" && action.argsSchema === undefined)) return actions;
+    return actions.map((action) => {
+      if (action.type !== "tool_approval" || action.argsSchema !== undefined) return action;
+      const argsSchema = toJsonSchema(findToolSchema(agent.sdkAgent, action.toolName));
+      return argsSchema ? { ...action, argsSchema } : action;
+    });
+  }
+
   /** 400 `invalid_approved_args` when the tool's schema does not accept the arguments the person edited the approval to. */
   private checkApprovedArgs(
     agent: AgentRegistration,
     action: Extract<PendingAction, { type: "tool_approval" }>,
     approvedArgs: Record<string, unknown>
   ): void {
-    const schema = findToolSchema(agent.sdkAgent, action.toolName);
+    // (a host agent has no tool list to look in: the schema it put on the action is what it says the tool takes)
+    const schema = findToolSchema(agent.sdkAgent, action.toolName) ?? action.argsSchema;
     if (schema === undefined) return; // the agent does not say what the tool takes: nothing to check against
     const problem = validateAgainstSchema(schema, approvedArgs);
     if (problem) {
@@ -4396,6 +4418,17 @@ export class AgentServer {
       queue.push(item);
       wake?.();
     });
+    // A run going on this node is told first: its text so far (and the person's message, which the stored history may not have yet).
+    // Read in the same step as subscribing, so what the deltas that follow carry starts exactly where the snapshot stops. (A run on another
+    // node streams no text here: that follower reads the stored events.) A `types` filter that names neither frame does not want it.
+    const active = this.runs.get(conversationId);
+    const snapshot =
+      active && (!wanted || wanted.has(EVENT_TYPES.messageSnapshot) || wanted.has(EVENT_TYPES.messageDelta)) ? active.snapshot() : undefined;
+    // Runs whose answer this follower has been sent as a stored event: text still queued for them is already in it
+    const answered = new Set<string>();
+    const noteAnswered = (event: import("./types.js").ConversationEvent): void => {
+      if (event.runId && (event.type === EVENT_TYPES.message || event.type === EVENT_TYPES.statusIdle)) answered.add(event.runId);
+    };
 
     const eventFrame = (event: import("./types.js").ConversationEvent): string | undefined =>
       !wanted || wanted.has(event.type)
@@ -4419,6 +4452,7 @@ export class AgentServer {
           const page = await self.eventStore.list(conversationId, { after: cursor, limit: 200 }, ctx.context);
           for (const event of page.events) {
             cursor = event.seq;
+            noteAnswered(event);
             const frame = eventFrame(event);
             if (frame) {
               written();
@@ -4432,6 +4466,10 @@ export class AgentServer {
       try {
         yield ": open\n\n";
         written();
+        if (snapshot) {
+          yield snapshotFrame(snapshot);
+          written();
+        }
         yield* catchUp();
 
         while (!closed && Date.now() < deadline) {
@@ -4439,8 +4477,9 @@ export class AgentServer {
             const item = queue.shift()!;
             if (item.kind === "closed") return;
             if (item.kind === "delta") {
-              // A chunk of text the stored events have already caught up with is stale
-              if (item.seq >= cursor && (!wanted || wanted.has(EVENT_TYPES.messageDelta))) {
+              // A chunk of text of an answer this follower was already sent as a stored event is stale; any other is not (events of the
+              // same run stored in between - a tool call - say nothing about the text that is still queued)
+              if (!(item.runId && answered.has(item.runId)) && (!wanted || wanted.has(EVENT_TYPES.messageDelta))) {
                 written();
                 yield deltaFrame(item);
               }
@@ -4454,6 +4493,7 @@ export class AgentServer {
               if (event.seq <= cursor) continue;
             }
             cursor = event.seq;
+            noteAnswered(event);
             const frame = eventFrame(event);
             if (frame) {
               written();
@@ -4540,6 +4580,19 @@ export class AgentServer {
     }
     const leaseByKey = new Map(leases.map((lease) => [lease.key, lease]));
 
+    // Why a turn ended in error is in the log, not in the summary: asked only for the conversations that did
+    const failed = conversations.filter((conversation) => {
+      if (this.runs.has(conversation.id) || leaseByKey.has(conversationLeaseKey(conversation.id))) return false;
+      return summaries[conversation.id]?.stopReason === "error";
+    });
+    const errors = new Map<string, RuntimeError>();
+    await Promise.all(
+      failed.map(async (conversation) => {
+        const error = await this.lastRunError(conversation.id, rc);
+        if (error) errors.set(conversation.id, error);
+      })
+    );
+
     const out = new Map<string, ConversationRuntime>();
     for (const conversation of conversations) {
       const active = this.runs.get(conversation.id);
@@ -4569,9 +4622,38 @@ export class AgentServer {
         lastEventSeq: summary?.lastSeq ?? 0,
         pendingActionIds,
         ...(running && activeRunId ? { activeRunId } : {}),
+        ...(!running && errors.has(conversation.id) ? { error: errors.get(conversation.id) } : {}),
       });
     }
     return out;
+  }
+
+  /**
+   * The failure the newest turn of a conversation ended with: the `session.error` event of its run (`run_interrupted` for a run whose
+   * process died). `undefined` when that turn left none - a handler that merely reported `stopReason: "error"` - or the log cannot be read.
+   */
+  private async lastRunError(conversationId: string, rc?: RequestContext): Promise<RuntimeError | undefined> {
+    try {
+      // Newest first: the idle that ended the turn, then (if it failed with a message) its error, then where the turn began
+      const newest = (
+        await this.eventStore.list(
+          conversationId,
+          { order: "desc", limit: 3, types: [EVENT_TYPES.statusIdle, EVENT_TYPES.error, EVENT_TYPES.statusRunning] },
+          rc
+        )
+      ).events;
+      if (newest[0]?.type !== EVENT_TYPES.statusIdle) return undefined;
+      const failure = newest[1]?.type === EVENT_TYPES.error ? newest[1] : undefined;
+      if (!failure) return undefined;
+      const code = failure.data.code ?? newest[0].data.detail;
+      return {
+        code: typeof code === "string" && code !== "" ? code : "INTERNAL_ERROR",
+        message: typeof failure.data.message === "string" ? failure.data.message : "The turn failed",
+      };
+    } catch {
+      // (the log failing to answer must not fail the request that only wanted to know the status)
+      return undefined;
+    }
   }
 
   // ============================================================================

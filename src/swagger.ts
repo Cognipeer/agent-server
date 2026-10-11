@@ -138,6 +138,11 @@ function generateSchemas(): Record<string, unknown> {
         maxFileSize: { type: "integer", description: "Largest file, in bytes." },
         allowedMimeTypes: { type: "array", items: { type: "string" }, description: "Accepted types (image/* style wildcards); empty means any." },
         acceptsImages: { type: "boolean", description: "The agent's model looks at images; without it an attached image is only mentioned." },
+        retentionDays: {
+          type: "integer",
+          minimum: 0,
+          description: "How long an uploaded file is kept, in days from the upload (0: until its conversation is deleted).",
+        },
       },
     },
     Conversation: {
@@ -256,6 +261,17 @@ function generateSchemas(): Record<string, unknown> {
         },
         pendingActionIds: { type: "array", items: { type: "string" } },
         activeRunId: { type: "string", description: "The run that is executing now." },
+        error: {
+          type: "object",
+          description:
+            "Why the last turn ended with stopReason `error`, from its `session.error` event. A run whose process died is closed as " +
+            "`run_interrupted`: the conversation then holds the person's message and no answer, and this tells a client why. Absent otherwise.",
+          properties: {
+            code: { type: "string", description: "`run_interrupted`, or the code of the failure (INTERNAL_ERROR, a host's own code, ...)." },
+            message: { type: "string" },
+          },
+          required: ["code", "message"],
+        },
       },
       required: ["status", "lastEventSeq", "pendingActionIds"],
     },
@@ -503,6 +519,13 @@ function generateSchemas(): Record<string, unknown> {
         title: { type: "string" },
         summary: { type: "string", description: "A one-line description of what approving does." },
         args: { type: "object", additionalProperties: true },
+        argsSchema: {
+          type: "object",
+          additionalProperties: true,
+          description:
+            "JSON Schema of the tool's arguments, when the server knows it (an agent-sdk tool's schema; a host agent can set it). " +
+            "A client that lets the person edit `args` validates the edit against it. approvedArgs is checked against the tool's schema either way (400 invalid_approved_args).",
+        },
         questions: {
           type: "array",
           items: {
@@ -1557,7 +1580,12 @@ function generatePaths(
           "then follows the conversation. Each stored event is a frame `id: <seq>`, `event: <type>`, `data: <the event as in GET .../events>`. " +
           "agent.message.delta frames (`data: {\"text\": ...}`, no id) carry the model's text as it is written for a turn that was started with " +
           "stream: true; they are not stored. `: ping` every 15 s. Nothing is missed or repeated between the replay and the live part. " +
-          "Closing the stream never affects a run; reconnect with the last id.",
+          "Closing the stream never affects a run; reconnect with the last id. " +
+          "When a run is active on the node that serves the stream, the first frame after `: open` is one `agent.message.snapshot` frame " +
+          "(no id, not stored): `data: {\"type\":\"agent.message.snapshot\",\"data\":{\"run_id\":..., \"text\":<the answer streamed so far>, " +
+          "\"user_message\":{\"id\",\"content\",\"files\"}|null}}`. A client that joins mid-run (a reload, a second window) seeds its answer bubble " +
+          "- and the person's message, if its history does not have it yet - from it, and appends the deltas that follow. " +
+          "It is sent unless `types` is given and names neither agent.message.snapshot nor agent.message.delta.",
         operationId: "streamEvents",
         parameters: [
           { name: "conversationId", in: "path", required: true, schema: { type: "string" } },
@@ -1619,7 +1647,7 @@ function generatePaths(
         },
         responses: {
           201: {
-            description: "File uploaded",
+            description: "File uploaded: the record wrapped as `{ file }` (GET /files/{fileId} answers the record itself)",
             content: {
               "application/json": {
                 schema: {
@@ -1660,6 +1688,9 @@ function generatePaths(
       get: {
         tags: ["Files"],
         summary: "Get file metadata",
+        description:
+          "Answers the file record itself - not wrapped. (The upload answers the same record as `{ file }`.) A file the caller did not upload, " +
+          "or whose conversation they cannot open, is a 404.",
         operationId: "getFile",
         parameters: [
           {

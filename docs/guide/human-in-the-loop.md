@@ -20,12 +20,14 @@ A reloaded UI finds the open request in `GET /conversations/:id` (`pendingAction
 ```typescript
 type PendingAction =
   | { id: string; type: 'tool_approval'; toolName: string; toolCallId?: string;
-      title?: string; summary?: string; args?: Record<string, unknown>; expiresAt?: string }
+      title?: string; summary?: string; args?: Record<string, unknown>;
+      argsSchema?: Record<string, unknown>; expiresAt?: string }
   | { id: string; type: 'user_question'; questions: UserQuestion[];
       allowFreeText?: boolean; expiresAt?: string };
 ```
 
 - `title` is the tool's `approvalPrompt`; `summary` is a one-line description of what approving does (`metadata.summary` of the agent-sdk entry).
+- `argsSchema` is the JSON Schema of the tool's arguments, when the server knows it: an agent-sdk tool's zod schema (converted) or JSON Schema (as it is), looked up in `agent.__runtime.tools`; a [host agent](./host-agents.md) can put its own on the action. A client that lets the person edit `args` validates the edit against it before sending `approvedArgs`. It is absent when the agent does not say what the tool takes. The server checks `approvedArgs` against the tool's schema either way ([Edited arguments](#edited-arguments-are-checked)) - for a host agent, against the `argsSchema` it gave.
 - A question's options can carry a `preview` (agent-sdk's `UserQuestionOption.preview`: a code or ASCII sketch shown while the option is focused).
 - `expiresAt` is when the request [lapses](#requests-that-lapse).
 
@@ -183,7 +185,7 @@ predicate is never remembered; `allowRememberApproval: false` turns it off). It 
 A pause and its resolution are in the event log, so a client that was not connected can follow them (`GET /conversations/:id/events/stream`):
 
 ```
-action.required   { action_id, kind: 'tool_approval' | 'user_question', tool_name?, summary?, args?, questions?, allow_free_text?, expires_at? }
+action.required   { action_id, kind: 'tool_approval' | 'user_question', tool_name?, summary?, args?, args_schema?, questions?, allow_free_text?, expires_at? }
 session.status_idle { stop_reason: 'requires_action', pending_action_ids: [...] }
 action.resolved   { action_id, kind, decision?, cancelled?, expired?, remembered?, edited_args?, remember_for_session?, status: 'approved' | 'rejected' | 'answered' | 'cancelled' | 'expired', resolved_by, channel: 'api' | 'system' | 'timeout' | 'remembered' }
 ```

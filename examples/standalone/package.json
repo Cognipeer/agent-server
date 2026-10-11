@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@cognipeer/agent-sdk": ">=0.10.3",
+    "@cognipeer/agent-sdk": "file:../../../.local-packages/cognipeer-agent-sdk-0.10.6.tgz",
     "@cognipeer/agent-server": "file:../..",
     "better-sqlite3": "^13.0.3",
     "mongodb": "^7.7.0",

@@ -20,7 +20,7 @@ import {
   writeBudget,
   writeHitl,
 } from "../src/hitl.js";
-import { findToolSchema, validateAgainstSchema } from "../src/schema.js";
+import { findToolSchema, toJsonSchema, validateAgainstSchema } from "../src/schema.js";
 import { budgetChangeKind, isCostLimitDetail, ledgerCostUsd, normalizeUsage, parseBudget, priceTokens, roundUsd } from "../src/usage.js";
 import { ledgerCost, testPricing, withCall } from "./sdk-stubs.js";
 
@@ -201,6 +201,113 @@ describe("checking edited arguments", () => {
     expect(findToolSchema(agent, "missing")).toBeUndefined();
     expect(findToolSchema({}, "a")).toBeUndefined();
     expect(findToolSchema(undefined, "a")).toBeUndefined();
+  });
+});
+
+describe("toJsonSchema", () => {
+  it("converts the zod schema of a tool: types, constraints, optional and default, nested objects, enums, unions", () => {
+    const schema = z.object({
+      service: z.string().min(1).max(40).describe("Which service"),
+      version: z.string().regex(/^\d+$/).optional(),
+      replicas: z.number().int().min(1).max(9).default(2),
+      ratio: z.number().min(0).max(1),
+      dryRun: z.boolean(),
+      env: z.enum(["stg", "prod"]),
+      kind: z.literal("blue"),
+      tags: z.array(z.string()).min(1).max(5),
+      labels: z.record(z.string()),
+      owner: z.object({ name: z.string(), email: z.string().email().nullable() }),
+      when: z.union([z.string(), z.number()]),
+      note: z.string().nullable().optional(),
+    });
+    expect(toJsonSchema(schema)).toEqual({
+      type: "object",
+      properties: {
+        service: { type: "string", minLength: 1, maxLength: 40, description: "Which service" },
+        version: { type: "string", pattern: "^\\d+$" },
+        replicas: { type: "integer", minimum: 1, maximum: 9, default: 2 },
+        ratio: { type: "number", minimum: 0, maximum: 1 },
+        dryRun: { type: "boolean" },
+        env: { type: "string", enum: ["stg", "prod"] },
+        kind: { const: "blue" },
+        tags: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 5 },
+        labels: { type: "object", additionalProperties: { type: "string" } },
+        owner: {
+          type: "object",
+          properties: { name: { type: "string" }, email: { anyOf: [{ type: "string", format: "email" }, { type: "null" }] } },
+          required: ["name", "email"],
+        },
+        when: { anyOf: [{ type: "string" }, { type: "number" }] },
+        note: { anyOf: [{ type: "string" }, { type: "null" }] },
+      },
+      required: ["service", "ratio", "dryRun", "env", "kind", "tags", "labels", "owner", "when"],
+    });
+  });
+
+  it("converts the wrappers around a schema, a strict object, an intersection and a native enum", () => {
+    enum Color { Red = "red", Blue = "blue" }
+    enum Level { Low, High }
+    expect(toJsonSchema(z.object({ a: z.string() }).strict())).toMatchObject({ additionalProperties: false });
+    expect(toJsonSchema(z.object({ a: z.string() }).catchall(z.number()))).toMatchObject({ additionalProperties: { type: "number" } });
+    expect(toJsonSchema(z.object({ a: z.string().transform((v) => v.length) }))).toMatchObject({ properties: { a: { type: "string" } }, required: ["a"] });
+    expect(toJsonSchema(z.object({ a: z.string().refine((v) => v !== "x") }))).toMatchObject({ properties: { a: { type: "string" } } });
+    expect(toJsonSchema(z.object({ a: z.string().brand<"x">() }))).toMatchObject({ properties: { a: { type: "string" } } });
+    expect(toJsonSchema(z.object({ a: z.string() }).and(z.object({ b: z.number() })))).toMatchObject({ allOf: [{ properties: { a: {} } }, { properties: { b: {} } }] });
+    expect(toJsonSchema(z.nativeEnum(Color))).toEqual({ enum: ["red", "blue"] });
+    expect(toJsonSchema(z.nativeEnum(Level))).toEqual({ enum: [0, 1] });
+    expect(toJsonSchema(z.object({ pair: z.tuple([z.string(), z.number()]) }))).toMatchObject({
+      properties: { pair: { type: "array", items: [{ type: "string" }, { type: "number" }], minItems: 2, maxItems: 2 } },
+    });
+    // a type this file does not know becomes "any value", so the rest of the schema still helps
+    expect(toJsonSchema(z.object({ a: z.string(), b: z.map(z.string(), z.number()), c: z.any() }))).toMatchObject({
+      properties: { a: { type: "string" }, b: { type: "object" }, c: {} },
+      required: ["a", "b"],
+    });
+    // recursion ends
+    const tree: z.ZodTypeAny = z.lazy(() => z.object({ name: z.string(), children: z.array(tree).optional() }));
+    const converted = toJsonSchema(tree)!;
+    expect(converted.type).toBe("object");
+    expect(JSON.stringify(converted).length).toBeLessThan(32_000);
+  });
+
+  it("converts a zod 4 schema the same way", async () => {
+    const z4 = await import("zod/v4");
+    const schema = z4.object({
+      service: z4.string().min(1),
+      version: z4.string().regex(/^\d+\.\d+$/).optional(),
+      contact: z4.string().email(),
+      replicas: z4.number().int().optional(),
+      env: z4.enum(["stg", "prod"]),
+      tags: z4.array(z4.string()),
+      note: z4.string().nullable(),
+      limits: z4.record(z4.string(), z4.number()),
+    });
+    expect(toJsonSchema(schema)).toEqual({
+      type: "object",
+      properties: {
+        service: { type: "string", minLength: 1 },
+        version: { type: "string", pattern: "^\\d+\\.\\d+$" },
+        contact: { type: "string", format: "email" },
+        replicas: { type: "integer" },
+        env: { type: "string", enum: ["stg", "prod"] },
+        tags: { type: "array", items: { type: "string" } },
+        note: { anyOf: [{ type: "string" }, { type: "null" }] },
+        limits: { type: "object", additionalProperties: { type: "number" } },
+      },
+      required: ["service", "contact", "env", "tags", "note", "limits"],
+    });
+  });
+
+  it("passes a JSON Schema on as a copy, and answers nothing for what is not a schema or is too big", () => {
+    const json = { type: "object", properties: { a: { type: "string" } }, required: ["a"] };
+    const copy = toJsonSchema(json)!;
+    expect(copy).toEqual(json);
+    expect(copy).not.toBe(json);
+    for (const odd of [undefined, null, 5, "x", [], () => 1]) expect(toJsonSchema(odd)).toBeUndefined();
+    expect(toJsonSchema({ type: "object", properties: Object.fromEntries(Array.from({ length: 2000 }, (_, i) => [`property_${i}`, { type: "string", description: "x".repeat(20) }])) })).toBeUndefined();
+    const cyclic: Record<string, unknown> = { type: "object" };
+    cyclic.self = cyclic;
+    expect(toJsonSchema(cyclic)).toBeUndefined();
   });
 });
 

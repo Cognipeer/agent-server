@@ -37,6 +37,7 @@ What a run gives you:
 | `lastEventSeq` | `seq` of the newest event (0 when there is none): follow from here with `?after=` |
 | `pendingActionIds` | The actions the conversation waits on |
 | `activeRunId` | The running run (the `runId` of the message response, the `run_id` of its events) |
+| `error` | Why the last turn ended in `error`, when the log says: `{ code, message }` from its `session.error` event. `code: "run_interrupted"` is a run whose server died - the conversation then has the person's message and no answer, and this is how a client tells them why. Absent for every other stop, and gone with the next turn |
 
 The assistant message of every turn records how it ended: `message.status` (`completed`, `requires_action`, `incomplete`, `cancelled`) and
 `message.metadata.stopReason`. A custom handler or a host agent can report `max_turns` or `limit` itself with `stopReason` in its result; `budget_reached` is the server's, when the conversation's [budget](./budgets.md) ends a turn.
@@ -93,6 +94,15 @@ agentServer.registerCustomAgent('slow', {
 A host-backed agent gets the same `signal` in `io.signal` and may implement `cancel` for a backend that runs elsewhere ([Host-backed agents](./host-agents.md#cancel)).
 For agent-sdk agents nothing is needed: the signal is passed as `cancellationToken` (an `AbortSignal` is a valid token, and tools receive it).
 An SDK result with `state.ctx.__cancelled` is a cancelled turn; `state.ctx.__limitBreached` ends the turn with `stopReason: "limit"`.
+
+**A cancelled run is recorded as cancelled, whichever agent it was.** When the person pressed Stop, the turn ends `status: "cancelled"` / `stopReason: "cancelled"`
+(message, `runtime`, `session.status_idle { stop_reason: "cancelled" }`, no `session.work_done`) and keeps the text streamed so far - also when the agent returned an ordinary answer in the
+same breath, or does not mark its result as cancelled. That holds for an agent-sdk agent, a Chat Completions / Responses agent, a handler and a host agent, on a message, on the answer to an
+approval and on `continue`.
+
+**The model request is hung up on.** Chat Completions and Responses agents pass the signal to `fetch`. An agent-sdk agent does when its SDK does: **agent-sdk 0.10.6 or later** passes the cancellation
+token to the provider request (OpenAI, Azure, Anthropic, Bedrock and Vertex adapters and LangChain models), so the connection to the model is closed at once and the provider stops generating - with an
+older SDK the model finishes writing its answer into the void and bills for it. Upgrade the SDK in an application that offers Stop.
 
 ## The event log
 
@@ -160,10 +170,30 @@ without it shows the finished `agent.message` at once. Treat deltas as a bonus: 
 A client that goes away only closes its own stream. Events written by another server instance reach the stream by polling the log
 (`runs.followPollMs`, 1 s).
 
+#### The snapshot frame
+
+A client that joins **while a run is active** (a reload, a second window) missed the text the run has already streamed - deltas are not stored. So when the run is on the
+node that serves the stream, the first frame after `: open` is one **snapshot**:
+
+```
+event: agent.message.snapshot
+data: {"type":"agent.message.snapshot","data":{"run_id":"run_x1","text":"Hello ","user_message":{"id":"msg_1","content":"say hello","files":[]}}}
+```
+
+It has **no `id:`** and is not in the log (`GET .../events` never lists it), so it does not move the cursor; it is sent once per connection (a client that reconnects - an `EventSource` after a dropped
+connection - is sent a fresh one: replace the text of the bubble with it, do not append to it). `text` is the answer as far as it has been
+streamed (`""` before the first token); the `agent.message.delta` frames that follow continue exactly where it stops - nothing between is missing or repeated - so the view is
+`snapshot.text + every delta`. `user_message` is the message the run is answering (`null` for a run that answers an action or continues a turn, and for the instant before the message is stored): a client
+whose stored history does not have it yet shows it. When the run ends, the stored `agent.message` / `session.status_idle` events arrive as usual - reload the final message then.
+
+It is sent unless `types=` is given and names neither `agent.message.snapshot` nor `agent.message.delta`. A run on **another** node cannot be summarised here (its text is not shared), so that
+stream has no snapshot and follows the stored events.
+
 ### Reattaching after a reload
 
 1. `GET /conversations/:id` - render the history and `pendingActions`; read `runtime`.
-2. If `runtime.status === 'running'`: `GET /conversations/:id/events/stream?after=<runtime.lastEventSeq>` and show the live turn (text deltas, tool calls, new cards). When `session.status_idle` arrives, reload the final message.
+2. If `runtime.status === 'running'`: `GET /conversations/:id/events/stream?after=<runtime.lastEventSeq>`. Seed the answer bubble from the first frame, the [snapshot](#the-snapshot-frame) (and the person's message, if the history lacks it), then append the text deltas and show tool calls and new cards. When `session.status_idle` arrives, reload the final message.
+   If `runtime.stopReason === 'error'` read `runtime.error`: `run_interrupted` means the server stopped mid-turn and there is no answer to wait for - offer to send the message again.
 3. If it is `requires_action`: show the cards and resolve them.
 
 A client that streamed a message and lost the connection uses the `seq` of the last `stream.*` frame it saw the same way - see [Streaming](./streaming.md).

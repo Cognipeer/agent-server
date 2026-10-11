@@ -14,7 +14,9 @@ import { nanoid } from "nanoid";
 import { truncateEventData } from "./events.js";
 import type {
   ConversationEvent,
+  FileAttachment,
   Lease,
+  MessageSnapshotFrame,
   MessageStatus,
   NewConversationEvent,
   RequestContext,
@@ -142,6 +144,13 @@ export class ActiveRun {
   taskId?: string;
   /** The newest event-log cursor this run has seen. */
   lastSeq = 0;
+  /**
+   * The model text this run has streamed so far. Kept in step with what followers are sent (updated in the same step that
+   * publishes a delta), so a follower that subscribes and reads this in one go misses nothing and sees nothing twice.
+   */
+  streamedText = "";
+  /** The message this run answers, once it is stored (message runs only). */
+  userMessage?: { id: string; content: string; files: FileAttachment[] };
   /** Resolves when the run has finished, persisted and released the conversation. Never rejects. */
   done: Promise<TurnOutcome> = Promise.resolve({ content: "", stopReason: "error", pendingActions: [] });
   /** Resolves once the run has given the conversation back - also for a run that never got to start. */
@@ -216,6 +225,7 @@ export class ActiveRun {
         }
       }
       if (spec.delta !== undefined && spec.delta !== "") {
+        this.streamedText += spec.delta;
         this.deps.bus.publish(this.conversationId, { kind: "delta", text: spec.delta, runId: this.id, seq });
       }
       if (spec.frame && this.subscribers.size > 0) {
@@ -225,6 +235,11 @@ export class ActiveRun {
         }
       }
     });
+  }
+
+  /** What a follower that joins now is told first (see {@link MessageSnapshotFrame}). Read it in the same step as subscribing. */
+  snapshot(): MessageSnapshotFrame["data"] {
+    return { run_id: this.id, text: this.streamedText, user_message: this.userMessage ?? null };
   }
 
   /** Resolves when everything queued so far has been stored and delivered. */

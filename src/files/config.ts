@@ -92,6 +92,7 @@ export function attachmentsCapability(cfg: ResolvedFilesConfig): Required<Attach
     maxFileSize: cfg.maxFileSize,
     allowedMimeTypes: cfg.allowedMimeTypes,
     acceptsImages: cfg.vision,
+    retentionDays: cfg.retentionDays,
   };
 }
 

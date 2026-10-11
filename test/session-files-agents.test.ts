@@ -204,7 +204,7 @@ describe("agent info", () => {
     const t = await bootServer({
       storage: await memoryStorage(),
       files: { maxFiles: 4, maxFileSize: 5_000_000 },
-      agentFiles: { vision: true, allowedMimeTypes: ["image/*", "application/pdf"] },
+      agentFiles: { vision: true, allowedMimeTypes: ["image/*", "application/pdf"], retentionDays: 7 },
     });
     const info = (await t.call("GET", "/agents/a")).body as any;
     expect(info.capabilities.attachments).toEqual({
@@ -213,6 +213,7 @@ describe("agent info", () => {
       maxFileSize: 5_000_000,
       allowedMimeTypes: ["image/*", "application/pdf"],
       acceptsImages: true,
+      retentionDays: 7,
     });
     expect(info.metadata).toEqual({
       enableFileUpload: true,
@@ -232,7 +233,11 @@ describe("agent info", () => {
     expect(((await off.call("GET", "/agents/a")).body as any).metadata.enableFileUpload).toBe(false);
     const plain = await bootServer({ storage: await memoryStorage() });
     const info = (await plain.call("GET", "/agents/a")).body as any;
-    expect(info.capabilities.attachments).toMatchObject({ enabled: true, acceptsImages: false, maxFiles: 10 });
+    // (without a setting of its own an agent keeps files for the default 30 days)
+    expect(info.capabilities.attachments).toMatchObject({ enabled: true, acceptsImages: false, maxFiles: 10, retentionDays: 30 });
+    // 0 = kept until the conversation goes
+    const forever = await bootServer({ storage: await memoryStorage(), files: { retentionDays: 0 } });
+    expect(((await forever.call("GET", "/agents/a")).body as any).capabilities.attachments.retentionDays).toBe(0);
     expect(info.metadata.allowedFileTypes).toBeUndefined();
   });
 

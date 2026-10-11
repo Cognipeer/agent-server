@@ -1,17 +1,13 @@
 /**
  * The standalone example (examples/standalone), run for real: the Node HTTP server, an agent-sdk agent on the scripted model, and a
  * host-backed agent, over SQLite and over MongoDB. This is what the end-to-end run starts, so it must keep working. Skipped when there is
- * no agent-sdk to load (a checkout next to this repository, or AGENT_SDK_SRC).
+ * no agent-sdk to load (see vitest.config.ts).
  */
 
 import { randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
-import path from "node:path";
 import { afterAll, describe, expect, inject, it } from "vitest";
 import { parseSse } from "./helpers.js";
-
-const sdkSource = path.resolve(process.env.AGENT_SDK_SRC ?? path.join(__dirname, "../../agent-sdk/src/index.ts"));
-const hasSdk = existsSync(sdkSource);
+import { hasSdk } from "./sdk.js";
 
 type Example = { url: string; close: () => Promise<void> };
 

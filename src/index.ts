@@ -136,6 +136,8 @@ export type {
   StopReason,
   RuntimeStatus,
   ConversationRuntime,
+  RuntimeError,
+  MessageSnapshotFrame,
   RunsConfig,
   ListEventsResponse,
   WireEvent,
@@ -204,6 +206,7 @@ export { defaultExtractText } from "./files/extract.js";
 
 // Usage and budgets
 export { costEstimatorFromPricing } from "./usage.js";
+export { toJsonSchema } from "./schema.js";
 
 // Host-backed agents (for hosts that resolve their agents per request: return this from `config.agents`)
 export { hostAgentRegistration } from "./host.js";

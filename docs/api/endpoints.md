@@ -470,6 +470,11 @@ Server-Sent Events: replays the events after `?after=` (or the `Last-Event-ID` h
 `id: <seq>`, `event: <type>`, `data: <the event as above>`; `agent.message.delta` frames (no `id`) carry the model's text of a streamed turn; `: ping` every 15 s.
 `types` filters as above. A closed connection never affects a run.
 
+When a run is active on the node that serves the stream, the first frame after `: open` is an `agent.message.snapshot` (no `id`, never stored):
+`data: {"type":"agent.message.snapshot","data":{"run_id":"run_x1","text":"<the answer so far>","user_message":{"id":"msg_1","content":"...","files":[]}|null}}`.
+A client that joins mid-run seeds its answer bubble from it and appends the deltas that follow ([details](../guide/runs#the-snapshot-frame)).
+It is sent unless `types` names neither `agent.message.snapshot` nor `agent.message.delta`.
+
 ## Files
 
 Settings, limits and what the agent is given: [Files](../guide/file-management).
@@ -501,7 +506,7 @@ or **JSON** (a request without a `Content-Type` is read as JSON):
 { "file": { "name": "contract.pdf", "content": "<base64>", "mimeType": "application/pdf" }, "conversationId": "conv_123", "metadata": {} }
 ```
 
-**Response `201`:**
+**Response `201`:** the record, wrapped as `{ "file": { ... } }` (`GET /files/:fileId` answers the record itself):
 
 ```json
 {
@@ -549,7 +554,24 @@ Oldest first. `maxFiles` is what the conversation may hold.
 GET /files/:fileId
 ```
 
-The record, as in the upload response. `404` for a file that does not exist, that the caller did not upload, or whose conversation the caller cannot open.
+**Response `200`:** the file record **itself**, not wrapped - the shape this route has always had:
+
+```json
+{
+  "id": "file_123",
+  "name": "contract.pdf",
+  "mimeType": "application/pdf",
+  "size": 12345,
+  "conversationId": "conv_123",
+  "userId": "user_1",
+  "agentId": "contracts",
+  "expiresAt": "2025-01-31T00:00:00.000Z",
+  "metadata": {},
+  "createdAt": "2025-01-01T00:00:00.000Z"
+}
+```
+
+Only the upload answers `{ "file": { ... } }` (the same record, one level down). `404` for a file that does not exist, that the caller did not upload, or whose conversation the caller cannot open.
 
 ### Download File
 

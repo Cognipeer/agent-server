@@ -50,7 +50,7 @@ describe("OpenAPI spec", () => {
     expect(schemas.SendMessageRequest.properties.fileIds).toMatchObject({ type: "array" });
     expect(Object.keys(schemas.FileRecord.properties)).toEqual(expect.arrayContaining(["userId", "agentId", "expiresAt"]));
     expect(Object.keys(schemas.AttachmentsCapability.properties)).toEqual(
-      expect.arrayContaining(["enabled", "maxFiles", "maxFileSize", "allowedMimeTypes", "acceptsImages"])
+      expect.arrayContaining(["enabled", "maxFiles", "maxFileSize", "allowedMimeTypes", "acceptsImages", "retentionDays"])
     );
     expect(schemas.Agent.properties.capabilities.properties.attachments).toEqual({ $ref: "#/components/schemas/AttachmentsCapability" });
     expect(schemas.ListFilesResponse.required).toContain("maxFiles");
@@ -85,5 +85,17 @@ describe("OpenAPI spec", () => {
     expect(schemas.PendingAction.properties.questions.items.properties.options.items.properties.preview).toBeDefined();
     expect(schemas.ActionSnapshot.properties.status.enum).toEqual(["pending", "resolved", "cancelled", "expired"]);
     expect(schemas.StreamActionResolvedEvent.properties.resolution.properties.expired).toBeDefined();
+  });
+
+  it("documents what a client reattaching to a run needs: the snapshot frame, the failure in the runtime, the schema of an approval's arguments", async () => {
+    const spec = generateOpenAPISpec({ basePath: "/api", storage: await memoryStorage() }, []);
+    const stream = (spec.paths["/conversations/{conversationId}/events/stream"] as any).get;
+    expect(stream.description).toContain("agent.message.snapshot");
+    expect(stream.description).toContain("user_message");
+
+    const schemas = spec.components.schemas as Record<string, any>;
+    expect(schemas.ConversationRuntime.properties.error).toMatchObject({ type: "object", required: ["code", "message"] });
+    expect(schemas.ConversationRuntime.properties.error.description).toContain("run_interrupted");
+    expect(schemas.PendingAction.properties.argsSchema).toMatchObject({ type: "object" });
   });
 });

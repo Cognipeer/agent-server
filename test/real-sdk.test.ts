@@ -1,19 +1,16 @@
 /**
- * Against the real agent-sdk (a checkout next to this repository, or AGENT_SDK_SRC=/path/to/agent-sdk/src/index.ts): the
+ * Against the real agent-sdk (the installed package, AGENT_SDK_SRC=/path/to/agent-sdk/src/index.ts, or a checkout next to this repository): the
  * ledger the SDK keeps (added to IN PLACE, cumulative over a resumed state), its tool schemas, `needsApproval`, and the cost
  * limit that stops a turn. Skipped when there is no SDK to load. The other tests use stand-ins that behave the same way.
  */
 
-import { existsSync } from "node:fs";
-import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { createAgentServer, costEstimatorFromPricing } from "../src/index.js";
 import { memoryStorage } from "./helpers.js";
 import { testPricing } from "./sdk-stubs.js";
+import { sdk } from "./sdk.js";
 
-const sdkPath = path.resolve(process.env.AGENT_SDK_SRC ?? path.join(__dirname, "../../agent-sdk/src/index.ts"));
-const sdk = existsSync(sdkPath) ? ((await import(/* @vite-ignore */ sdkPath)) as any) : undefined;
 const createSmartAgent = sdk?.createSmartAgent as (opts: unknown) => any;
 const createTool = sdk?.createTool as (opts: unknown) => any;
 

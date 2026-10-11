@@ -13,6 +13,7 @@ import type {
   EventStore,
   EventSummary,
   ListEventsParams,
+  MessageSnapshotFrame,
   NewConversationEvent,
   PendingAction,
   WireEvent,
@@ -26,6 +27,8 @@ export const EVENT_TYPES = {
   toolResult: "agent.tool_result",
   message: "agent.message",
   messageDelta: "agent.message.delta",
+  /** Not stored: the first frame of a follower that joins a run in progress (see {@link MessageSnapshotFrame}). */
+  messageSnapshot: "agent.message.snapshot",
   actionRequired: "action.required",
   actionResolved: "action.resolved",
   usage: "session.usage",
@@ -72,6 +75,8 @@ export function actionRequiredData(action: PendingAction): Record<string, unknow
       ...(action.title ? { title: action.title } : {}),
       ...(action.summary ? { summary: action.summary } : {}),
       ...(action.args !== undefined ? { args: action.args } : {}),
+      // (a JSON Schema: its keys are the schema's own, never re-cased)
+      ...(action.argsSchema !== undefined ? { args_schema: action.argsSchema } : {}),
       ...(action.expiresAt ? { expires_at: action.expiresAt } : {}),
     };
   }
@@ -93,6 +98,12 @@ export function wireEvent(event: ConversationEvent): WireEvent {
     ...(event.runId ? { run_id: event.runId } : {}),
     created_at: new Date(event.createdAt).toISOString(),
   };
+}
+
+/** The snapshot frame of a run in progress as it goes on the wire: `event:` + `data:`, and no `id:` (it is not in the log). */
+export function snapshotFrame(snapshot: MessageSnapshotFrame["data"]): string {
+  const frame: MessageSnapshotFrame = { type: EVENT_TYPES.messageSnapshot, data: snapshot };
+  return `event: ${EVENT_TYPES.messageSnapshot}\ndata: ${JSON.stringify(frame)}\n\n`;
 }
 
 // ----------------------------------------------------------------------------
