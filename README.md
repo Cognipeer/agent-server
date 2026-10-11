@@ -14,6 +14,8 @@ Documentation: <https://docs.cognipeer.com/agent-server/guide/getting-started>
 - 🌐 **Framework Agnostic**: Works with Express, Next.js, Fastify, and raw Node HTTP
 - 🧩 **Request Context & Dynamic Agents**: Resolve user/tenant per request, serve a different agent list and storage scope per request
 - 📁 **Files the agent reads**: upload a file as itself or as JSON; it is owned by the uploader, limited per agent, deleted after `retentionDays` or with its conversation, and its text (PDF and Office with `@cognipeer/to-markdown`) or picture reaches the agent - inline, in pages with `session_files_read`, or as an image by reference
+- ✅ **Approvals that hold up**: several people can answer the actions of one pause at once without losing an answer, requests lapse (and are denied or dropped) instead of waiting for ever, you decide who may answer, edited arguments are checked against the tool's schema, and the paused message records who decided what
+- 💰 **Usage & budgets**: per-turn usage from agent-sdk's ledger (a resumed turn is never counted twice), cost from your price list, a spend limit per conversation that stops a turn, waits for a raise, and carries on (`POST /continue`)
 - ⏯️ **Runs that outlive the connection**: a turn keeps running when the client disconnects; cancel it, follow it from another client (event log + SSE), one turn at a time per conversation across server instances
 
 ## Installation
@@ -141,11 +143,14 @@ export const { GET, POST, PATCH, DELETE, OPTIONS } =
 | GET    | /conversations              | List conversations                |
 | POST   | /conversations              | Create new conversation           |
 | GET    | /conversations/:id          | Conversation details and messages |
-| PATCH  | /conversations/:id          | Update conversation               |
+| PATCH  | /conversations/:id          | Update conversation (title, metadata, budget) |
 | DELETE | /conversations/:id          | Delete conversation               |
 | GET    | /conversations/:id/messages | List messages                     |
 | POST   | /conversations/:id/messages | Send message                      |
 | POST   | /conversations/:id/actions/:actionId | Resolve a pending tool approval / question |
+| POST   | /conversations/:id/continue | Carry on a turn the budget stopped |
+| GET    | /conversations/:id/remembered-tools | Tools approved "for the session" |
+| DELETE | /conversations/:id/remembered-tools/:tool | Forget one: it asks again |
 | POST   | /conversations/:id/cancel   | Cancel the running turn (or the open approvals) |
 | GET    | /conversations/:id/events   | The conversation's event log  |
 | GET    | /conversations/:id/events/stream | Replay and follow the event log (SSE) |

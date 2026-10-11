@@ -29,6 +29,7 @@ import type {
   UpdateConversationParams,
   CreateMessageParams,
   GetMessagesParams,
+  UpdateMessageParams,
   SaveFileParams,
   CreateTaskParams,
   GetTasksParams,
@@ -53,7 +54,7 @@ type Statement = {
 };
 
 /** Bumped when `migrate()` gains a step that must run once on existing databases. */
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 export interface SQLiteConfig {
   /**
@@ -124,9 +125,11 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       ...super.capabilities(),
       maxFileBytes: Math.min(1_000_000_000, MAX_BUFFER_BYTES),
       maxStateBytes: 1_000_000_000,
+      atomicUpdate: true,
       events: true,
       leases: true,
       fileIndex: true,
+      actionDeadlines: true,
     };
   }
 
@@ -189,7 +192,9 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
         metadata TEXT DEFAULT '{}',
         state TEXT DEFAULT '{}',
         created_at TEXT DEFAULT (datetime('now')),
-        updated_at TEXT DEFAULT (datetime('now'))
+        updated_at TEXT DEFAULT (datetime('now')),
+        version INTEGER NOT NULL DEFAULT 0,
+        action_due_at TEXT
       )
     `);
 
@@ -356,6 +361,15 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
             db.exec(`ALTER TABLE ${this.tables.files} ADD COLUMN ${column} TEXT`);
           }
         }
+        // Schema version 5: conversations carry a version (compare-and-set updates) and the moment their
+        // earliest pending action lapses (the expiry sweep)
+        const conversationColumns = db.prepare(`PRAGMA table_info(${this.tables.conversations})`).all() as Array<{ name: string }>;
+        if (!conversationColumns.some((c) => c.name === "version")) {
+          db.exec(`ALTER TABLE ${this.tables.conversations} ADD COLUMN version INTEGER NOT NULL DEFAULT 0`);
+        }
+        if (!conversationColumns.some((c) => c.name === "action_due_at")) {
+          db.exec(`ALTER TABLE ${this.tables.conversations} ADD COLUMN action_due_at TEXT`);
+        }
         db.prepare(
           `INSERT INTO ${this.tables.meta} (key, value) VALUES ('schema_version', ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value`
@@ -363,6 +377,10 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       });
     }
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_${p}tasks_conv ON ${this.tables.tasks}(conversation_id)`);
+    // The expiry sweep only looks at conversations that wait on an action with a deadline
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_${p}conv_due ON ${this.tables.conversations}(action_due_at) WHERE action_due_at IS NOT NULL`
+    );
     // Files of a conversation by age, and the retention sweep (only files that expire are in the index)
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_${p}files_conv_t ON ${this.tables.files}(conversation_id, created_at)`);
     this.db.exec(
@@ -404,6 +422,7 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       state: params.state || {},
       createdAt: new Date(now),
       updatedAt: new Date(now),
+      version: 0,
     };
   }
 
@@ -437,6 +456,10 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       conditions.push("user_id = ?");
       values.push(params.userId);
     }
+    if (params.actionDueBefore) {
+      conditions.push("action_due_at IS NOT NULL AND action_due_at <= ?");
+      values.push(params.actionDueBefore.toISOString());
+    }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
@@ -446,9 +469,12 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
     const total = countRow.count;
 
     // Insertion order (rowid) breaks ties between rows created in the same millisecond
+    const ordering = params.actionDueBefore
+      ? "action_due_at ASC, rowid ASC"
+      : `${orderBy} ${order}, rowid ${order}`;
     const rows = this.db.prepare(
       `SELECT * FROM ${this.tables.conversations} ${whereClause}
-       ORDER BY ${orderBy} ${order}, rowid ${order}
+       ORDER BY ${ordering}
        LIMIT ? OFFSET ?`
     ).all(...values, normalized.limit, normalized.offset) as DbConversation[];
 
@@ -461,22 +487,7 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
   ): Promise<Conversation> {
     if (!this.db) throw new Error("Database not initialized");
 
-    const updates: string[] = ["updated_at = ?"];
-    const values: unknown[] = [new Date().toISOString()];
-
-    if (params.title !== undefined) {
-      updates.push("title = ?");
-      values.push(params.title);
-    }
-    if (params.metadata !== undefined) {
-      updates.push("metadata = ?");
-      values.push(JSON.stringify(params.metadata));
-    }
-    if (params.state !== undefined) {
-      updates.push("state = ?");
-      values.push(JSON.stringify(params.state));
-    }
-
+    const { updates, values } = this.conversationAssignments(params);
     values.push(id);
 
     const changed = this.db.prepare(
@@ -493,6 +504,50 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
     }
 
     return this.mapConversation(row);
+  }
+
+  /** The `SET` clauses of a conversation update (every update bumps `version`). */
+  private conversationAssignments(params: UpdateConversationParams): { updates: string[]; values: unknown[] } {
+    const updates: string[] = ["updated_at = ?", "version = version + 1"];
+    const values: unknown[] = [new Date().toISOString()];
+
+    if (params.title !== undefined) {
+      updates.push("title = ?");
+      values.push(params.title);
+    }
+    if (params.metadata !== undefined) {
+      updates.push("metadata = ?");
+      values.push(JSON.stringify(params.metadata));
+    }
+    if (params.state !== undefined) {
+      updates.push("state = ?");
+      values.push(JSON.stringify(params.state));
+    }
+    if (params.actionDueAt !== undefined) {
+      updates.push("action_due_at = ?");
+      values.push(params.actionDueAt === null ? null : params.actionDueAt.toISOString());
+    }
+    return { updates, values };
+  }
+
+  protected async _updateConversationIf(
+    id: string,
+    ifVersion: number,
+    params: UpdateConversationParams
+  ): Promise<Conversation | null> {
+    if (!this.db) throw new Error("Database not initialized");
+    const { updates, values } = this.conversationAssignments(params);
+    values.push(id, ifVersion);
+
+    // One statement: the version test and the write cannot be separated
+    const changed = this.db.prepare(
+      `UPDATE ${this.tables.conversations} SET ${updates.join(", ")} WHERE id = ? AND version = ?`
+    ).run(...values).changes;
+    const row = this.db.prepare(
+      `SELECT * FROM ${this.tables.conversations} WHERE id = ?`
+    ).get(id) as DbConversation | undefined;
+    if (!row) throw new NotFoundError("Conversation", id);
+    return changed === 0 ? null : this.mapConversation(row);
   }
 
   protected async _deleteConversation(id: string): Promise<void> {
@@ -607,6 +662,26 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
     ).get(id) as DbMessage | undefined;
 
     return row ? this.mapMessage(row) : null;
+  }
+
+  protected async _updateMessage(id: string, params: UpdateMessageParams): Promise<Message> {
+    if (!this.db) throw new Error("Database not initialized");
+    const updates: string[] = ["updated_at = ?"];
+    const values: unknown[] = [new Date().toISOString()];
+    if (params.content !== undefined) {
+      updates.push("content = ?");
+      values.push(JSON.stringify(params.content));
+    }
+    if (params.metadata !== undefined) {
+      updates.push("metadata = ?");
+      values.push(JSON.stringify(params.metadata));
+    }
+    values.push(id);
+    const changed = this.db.prepare(`UPDATE ${this.tables.messages} SET ${updates.join(", ")} WHERE id = ?`).run(...values).changes;
+    if (changed === 0) throw new NotFoundError("Message", id);
+    const row = this.db.prepare(`SELECT * FROM ${this.tables.messages} WHERE id = ?`).get(id) as DbMessage | undefined;
+    if (!row) throw new NotFoundError("Message", id);
+    return this.mapMessage(row);
   }
 
   protected async _deleteMessage(id: string): Promise<void> {
@@ -1200,6 +1275,8 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       state: typeof row.state === "string" ? JSON.parse(row.state) : row.state,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
+      version: Number(row.version ?? 0),
+      actionDueAt: row.action_due_at ? new Date(row.action_due_at) : undefined,
     };
   }
 
@@ -1300,6 +1377,8 @@ interface DbConversation {
   state: string;
   created_at: string;
   updated_at: string;
+  version: number | null;
+  action_due_at: string | null;
 }
 
 interface DbMessage {

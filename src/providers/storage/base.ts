@@ -25,6 +25,7 @@ import type {
   UpdateConversationParams,
   CreateMessageParams,
   GetMessagesParams,
+  UpdateMessageParams,
   SaveFileParams,
   ListFilesParams,
   PurgeExpiredFilesParams,
@@ -92,6 +93,7 @@ export abstract class BaseStorageProvider implements StorageProvider {
       events: false,
       leases: false,
       fileIndex: false,
+      actionDeadlines: false,
     };
   }
 
@@ -119,6 +121,17 @@ export abstract class BaseStorageProvider implements StorageProvider {
     ctx?: RequestContext
   ): Promise<Conversation>;
   protected abstract _deleteConversation(id: string, ctx?: RequestContext): Promise<void>;
+  /**
+   * Optional compare-and-set update. Resolves the updated conversation (its `version` bumped), or `null` when the
+   * stored version is not `ifVersion`; an unknown conversation is a `NotFoundError`. A provider that implements it
+   * bumps `version` in `_updateConversation` too and reports `capabilities().atomicUpdate`.
+   */
+  protected _updateConversationIf?(
+    id: string,
+    ifVersion: number,
+    params: UpdateConversationParams,
+    ctx?: RequestContext
+  ): Promise<Conversation | null>;
 
   // Messages
   protected abstract _createMessage(
@@ -133,6 +146,8 @@ export abstract class BaseStorageProvider implements StorageProvider {
   ): Promise<PaginatedResult<Message>>;
   protected abstract _getMessage(id: string, ctx?: RequestContext): Promise<Message | null>;
   protected abstract _deleteMessage(id: string, ctx?: RequestContext): Promise<void>;
+  /** Optional: replaces a message's content and / or metadata (`NotFoundError` for an unknown message). */
+  protected _updateMessage?(id: string, params: UpdateMessageParams, ctx?: RequestContext): Promise<Message>;
 
   // Files
   protected abstract _saveFile(
@@ -249,6 +264,9 @@ export abstract class BaseStorageProvider implements StorageProvider {
     ctx?: RequestContext
   ): Promise<PaginatedResult<Conversation>> {
     this.ensureConnected();
+    if (params?.actionDueBefore !== undefined && !validDate(params.actionDueBefore)) {
+      throw new ValidationError("actionDueBefore must be a valid Date");
+    }
     const result = await this._getConversations(params, ctx);
     return { ...result, data: result.data.map(normalizeConversation) };
   }
@@ -259,12 +277,37 @@ export abstract class BaseStorageProvider implements StorageProvider {
     ctx?: RequestContext
   ): Promise<Conversation> {
     this.ensureConnected();
-    const clean: UpdateConversationParams = {
+    return normalizeConversation(await this._updateConversation(id, this.cleanUpdate(params), ctx));
+  }
+
+  /**
+   * Compare-and-set: updates the conversation only if it is still at `ifVersion`. Resolves `null` when it is not
+   * (somebody else updated it; read it again). Atomic on every built-in provider.
+   */
+  async updateConversationIf(
+    id: string,
+    ifVersion: number,
+    params: UpdateConversationParams,
+    ctx?: RequestContext
+  ): Promise<Conversation | null> {
+    this.ensureConnected();
+    if (!this._updateConversationIf) throw new Error("This storage provider does not support compare-and-set updates");
+    if (!Number.isInteger(ifVersion) || ifVersion < 0) {
+      throw new ValidationError("ifVersion must be a non-negative integer (the `version` of the conversation you read)");
+    }
+    const updated = await this._updateConversationIf(id, ifVersion, this.cleanUpdate(params), ctx);
+    return updated ? normalizeConversation(updated) : null;
+  }
+
+  private cleanUpdate(params: UpdateConversationParams): UpdateConversationParams {
+    if (params.actionDueAt !== undefined && params.actionDueAt !== null && !validDate(params.actionDueAt)) {
+      throw new ValidationError("actionDueAt must be a valid Date or null");
+    }
+    return {
       ...params,
       metadata: jsonClone(params.metadata),
       state: this.cleanState(params.state),
     };
-    return normalizeConversation(await this._updateConversation(id, clean, ctx));
   }
 
   async deleteConversation(id: string, ctx?: RequestContext): Promise<void> {
@@ -302,6 +345,16 @@ export abstract class BaseStorageProvider implements StorageProvider {
     this.ensureConnected();
     const message = await this._getMessage(id, ctx);
     return message ? normalizeMessage(message) : null;
+  }
+
+  async updateMessage(id: string, params: UpdateMessageParams, ctx?: RequestContext): Promise<Message> {
+    this.ensureConnected();
+    if (!this._updateMessage) throw new Error("This storage provider does not support updating messages");
+    const clean: UpdateMessageParams = {
+      content: params.content === undefined ? undefined : jsonClone(params.content),
+      metadata: params.metadata === undefined ? undefined : jsonClone(params.metadata),
+    };
+    return normalizeMessage(await this._updateMessage(id, clean, ctx));
   }
 
   async deleteMessage(id: string, ctx?: RequestContext): Promise<void> {
@@ -654,8 +707,12 @@ function normalizeConversation(c: Conversation): Conversation {
     state: c.state ?? {},
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
+    version: typeof c.version === "number" ? c.version : undefined,
+    actionDueAt: c.actionDueAt ? new Date(c.actionDueAt) : undefined,
   };
 }
+
+const validDate = (value: unknown): value is Date => value instanceof Date && Number.isFinite(value.getTime());
 
 function normalizeMessage(m: Message): Message {
   return {

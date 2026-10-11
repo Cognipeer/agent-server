@@ -26,6 +26,7 @@ import type {
   UpdateConversationParams,
   CreateMessageParams,
   GetMessagesParams,
+  UpdateMessageParams,
   SaveFileParams,
   CreateTaskParams,
   GetTasksParams,
@@ -50,7 +51,7 @@ type PoolClient = {
 };
 
 /** Bumped when `migrate()` gains a step that must run once on existing databases. */
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 /** `bytea` holds 1 GB; `jsonb` a little over 255 MiB. */
 const MAX_FILE_BYTES = 1_000_000_000;
@@ -203,9 +204,11 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       ...super.capabilities(),
       maxFileBytes: Math.min(MAX_FILE_BYTES, MAX_BUFFER_BYTES),
       maxStateBytes: MAX_STATE_BYTES,
+      atomicUpdate: true,
       events: true,
       leases: true,
       fileIndex: true,
+      actionDeadlines: true,
     };
   }
 
@@ -341,7 +344,9 @@ export class PostgresStorageProvider extends BaseStorageProvider {
         metadata JSONB DEFAULT '{}',
         state JSONB DEFAULT '{}',
         created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        version INTEGER NOT NULL DEFAULT 0,
+        action_due_at TIMESTAMPTZ
       )
     `);
 
@@ -435,7 +440,7 @@ export class PostgresStorageProvider extends BaseStorageProvider {
     // task comments, an insertion sequence for ordering, one result per task, and the
     // indexes of the time-ordered lists. Version 3: the event log, leases, and the
     // conversation a task runs in. Version 4: who uploaded a file, for which agent and when it
-    // expires. Every step is additive and repeatable.
+    // expires. Version 5: the conversation version and action deadline. Every step is additive and repeatable.
     await db.query("BEGIN");
     try {
       const t = this.tables;
@@ -488,6 +493,14 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       // The retention sweep only looks at files that expire
       await db.query(
         `CREATE INDEX IF NOT EXISTS "idx_${this.tablePrefix}files_expires" ON ${t.files} (expires_at) WHERE expires_at IS NOT NULL`
+      );
+
+      // Version 5: conversations carry a version (compare-and-set updates) and the moment their earliest pending
+      // action lapses (the expiry sweep, which only looks at conversations that have one)
+      await db.query(`ALTER TABLE ${t.conversations} ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 0`);
+      await db.query(`ALTER TABLE ${t.conversations} ADD COLUMN IF NOT EXISTS action_due_at TIMESTAMPTZ`);
+      await db.query(
+        `CREATE INDEX IF NOT EXISTS "idx_${this.tablePrefix}conv_due" ON ${t.conversations} (action_due_at) WHERE action_due_at IS NOT NULL`
       );
 
       await db.query(
@@ -621,6 +634,10 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       conditions.push(`user_id = $${paramIndex++}`);
       values.push(params.userId);
     }
+    if (params.actionDueBefore) {
+      conditions.push(`action_due_at IS NOT NULL AND action_due_at <= $${paramIndex++}`);
+      values.push(params.actionDueBefore);
+    }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
@@ -632,10 +649,11 @@ export class PostgresStorageProvider extends BaseStorageProvider {
     const total = parseInt(countResult.rows[0].count, 10);
 
     // Get paginated results; the insertion sequence breaks ties between rows created in one millisecond
+    const ordering = params.actionDueBefore ? "action_due_at ASC, seq ASC" : `${orderBy} ${order}, seq ${order}`;
     const result = await this.pool.query<DbConversation>(
       `SELECT * FROM ${this.tables.conversations}
        ${whereClause}
-       ORDER BY ${orderBy} ${order}, seq ${order}
+       ORDER BY ${ordering}
        LIMIT $${paramIndex++} OFFSET $${paramIndex}`,
       [...values, normalized.limit, normalized.offset]
     );
@@ -654,8 +672,28 @@ export class PostgresStorageProvider extends BaseStorageProvider {
   ): Promise<Conversation> {
     if (!this.pool) throw new Error("Pool not initialized");
 
+    const { updates, values, next } = this.conversationAssignments(params);
+    values.push(id);
+
+    const result = await this.pool.query<DbConversation>(
+      `UPDATE ${this.tables.conversations}
+       SET ${updates.join(", ")}
+       WHERE id = $${next}
+       RETURNING *`,
+      values
+    );
+
+    if (result.rows.length === 0) {
+      throw new NotFoundError("Conversation", id);
+    }
+
+    return this.mapConversation(result.rows[0]);
+  }
+
+  /** The `SET` clauses of a conversation update (every update bumps `version`); `next` is the next free parameter number. */
+  private conversationAssignments(params: UpdateConversationParams): { updates: string[]; values: unknown[]; next: number } {
     // The app clock stamps every time, so created_at / updated_at / message times agree
-    const updates: string[] = ["updated_at = $1"];
+    const updates: string[] = ["updated_at = $1", "version = version + 1"];
     const values: unknown[] = [new Date()];
     let paramIndex = 2;
 
@@ -671,22 +709,34 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       updates.push(`state = $${paramIndex++}`);
       values.push(toJsonb(params.state));
     }
+    if (params.actionDueAt !== undefined) {
+      updates.push(`action_due_at = $${paramIndex++}`);
+      values.push(params.actionDueAt);
+    }
+    return { updates, values, next: paramIndex };
+  }
 
-    values.push(id);
+  protected async _updateConversationIf(
+    id: string,
+    ifVersion: number,
+    params: UpdateConversationParams
+  ): Promise<Conversation | null> {
+    if (!this.pool) throw new Error("Pool not initialized");
+    const { updates, values, next } = this.conversationAssignments(params);
+    values.push(id, ifVersion);
 
+    // One statement: the version test and the write cannot be separated (a concurrent writer waits on the row lock, then re-tests)
     const result = await this.pool.query<DbConversation>(
       `UPDATE ${this.tables.conversations}
        SET ${updates.join(", ")}
-       WHERE id = $${paramIndex}
+       WHERE id = $${next} AND version = $${next + 1}
        RETURNING *`,
       values
     );
-
-    if (result.rows.length === 0) {
-      throw new NotFoundError("Conversation", id);
-    }
-
-    return this.mapConversation(result.rows[0]);
+    if (result.rows[0]) return this.mapConversation(result.rows[0]);
+    const exists = await this.pool.query(`SELECT 1 FROM ${this.tables.conversations} WHERE id = $1`, [id]);
+    if (exists.rows.length === 0) throw new NotFoundError("Conversation", id);
+    return null;
   }
 
   protected async _deleteConversation(id: string): Promise<void> {
@@ -797,6 +847,28 @@ export class PostgresStorageProvider extends BaseStorageProvider {
     );
 
     return result.rows[0] ? this.mapMessage(result.rows[0]) : null;
+  }
+
+  protected async _updateMessage(id: string, params: UpdateMessageParams): Promise<Message> {
+    if (!this.pool) throw new Error("Pool not initialized");
+    const updates: string[] = ["updated_at = $1"];
+    const values: unknown[] = [new Date()];
+    let paramIndex = 2;
+    if (params.content !== undefined) {
+      updates.push(`content = $${paramIndex++}`);
+      values.push(toJsonb(params.content));
+    }
+    if (params.metadata !== undefined) {
+      updates.push(`metadata = $${paramIndex++}`);
+      values.push(toJsonb(params.metadata));
+    }
+    values.push(id);
+    const result = await this.pool.query<DbMessage>(
+      `UPDATE ${this.tables.messages} SET ${updates.join(", ")} WHERE id = $${paramIndex} RETURNING *`,
+      values
+    );
+    if (!result.rows[0]) throw new NotFoundError("Message", id);
+    return this.mapMessage(result.rows[0]);
   }
 
   protected async _deleteMessage(id: string): Promise<void> {
@@ -1385,6 +1457,8 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       state: row.state,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
+      version: Number(row.version ?? 0),
+      actionDueAt: row.action_due_at ? new Date(row.action_due_at) : undefined,
     };
   }
 
@@ -1475,6 +1549,8 @@ interface DbConversation {
   state: Record<string, unknown>;
   created_at: string;
   updated_at: string;
+  version: number | null;
+  action_due_at: string | null;
 }
 
 interface DbMessage {

@@ -32,14 +32,14 @@ What a run gives you:
 
 | Field | |
 | --- | --- |
-| `status` | `idle`, `running` (a turn is executing, here or on another node), `requires_action` (waiting for a [human](./human-in-the-loop.md)), `budget_paused` |
+| `status` | `idle`, `running` (a turn is executing, here or on another node), `requires_action` (waiting for a [human](./human-in-the-loop.md)), `budget_paused` (the last turn stopped on the conversation's [budget](./budgets.md) and it is still used up) |
 | `stopReason` | Why the last turn stopped: `end_turn`, `requires_action`, `cancelled`, `max_turns`, `limit`, `budget_reached`, `error`. Absent while a turn is running. |
 | `lastEventSeq` | `seq` of the newest event (0 when there is none): follow from here with `?after=` |
 | `pendingActionIds` | The actions the conversation waits on |
 | `activeRunId` | The running run (the `runId` of the message response, the `run_id` of its events) |
 
 The assistant message of every turn records how it ended: `message.status` (`completed`, `requires_action`, `incomplete`, `cancelled`) and
-`message.metadata.stopReason`. A custom handler can report `max_turns`, `limit` or `budget_reached` itself with `stopReason` in its result.
+`message.metadata.stopReason`. A custom handler can report `max_turns` or `limit` itself with `stopReason` in its result; `budget_reached` is the server's, when the conversation's [budget](./budgets.md) ends a turn.
 
 ## One turn at a time
 
@@ -101,13 +101,14 @@ snake_case types and data, `seq` unique and ascending within the conversation.
 | Type | `data` |
 | --- | --- |
 | `user.message` | `content`, `message_id`, `files?` (`id`, `name`, `mime_type`, `size` of each file the message carries) |
-| `session.status_running` | `trigger`: `message` or `resume` |
+| `session.status_running` | `trigger`: `message`, `resume` (an answer, or a [continuation](./budgets.md#raising-it-and-carrying-on)) or `timeout` (a request [lapsed](./human-in-the-loop.md#requests-that-lapse) and the agent carries on) |
 | `agent.tool_use` | `tool_call_id`, `name`, `args` |
 | `agent.tool_result` | `tool_call_id`, `name`, `ok`, `duration_ms?`, `error?` |
-| `agent.message` | `content`, `message_id`, `stop_reason`, `usage?` |
-| `session.usage` | `input_tokens`, `output_tokens`, `total_tokens` |
-| `action.required` | `action_id`, `kind` (`tool_approval` \| `user_question`), `tool_name?`, `args?`, `questions?`, `allow_free_text?`, `expires_at?` |
-| `action.resolved` | `action_id`, `kind`, `decision?`, `cancelled?`, `status` (`approved`, `rejected`, `answered`, `cancelled`), `resolved_by`, `channel` (`api` or `system`) |
+| `agent.message` | `content`, `message_id`, `stop_reason`, `usage?` (`input_tokens`, `output_tokens`, `total_tokens`, `cached_input_tokens?`, `cost_usd?`) |
+| `session.usage` | `input_tokens`, `output_tokens`, `total_tokens`, `cached_input_tokens?` and - with [pricing](./budgets.md#prices) - `turn_cost_usd`, `spent_usd`, `budget?` (`max_cost_usd`, `on_reach`) |
+| `budget.reached` | `spent_usd`, `max_cost_usd`, `on_reach`; just before the `session.status_idle` with `stop_reason: budget_reached` |
+| `action.required` | `action_id`, `kind` (`tool_approval` \| `user_question`), `tool_name?`, `summary?`, `args?`, `questions?`, `allow_free_text?`, `expires_at?` |
+| `action.resolved` | `action_id`, `kind`, `decision?`, `cancelled?`, `expired?`, `remembered?`, `edited_args?`, `status` (`approved`, `rejected`, `answered`, `cancelled`, `expired`), `resolved_by`, `channel` (`api`, `system`, `timeout` or `remembered`) |
 | `session.status_idle` | `stop_reason`, `pending_action_ids?`, `detail?` |
 | `session.work_done` | none; right after an idle with `stop_reason: end_turn` |
 | `session.error` | `message`, `code?` |
@@ -178,6 +179,8 @@ A run that was executing when its server died never wrote `session.status_idle`.
 
 - the next message to that conversation takes it over and first closes the old run: `session.error` (`code: "run_interrupted"`) and `session.status_idle` with `stop_reason: "error"`;
 - the sweep does the same for conversations nobody writes to: once at the first request, then every `runs.sweepIntervalMs` (60 s). Call `server.recoverStaleRuns()` yourself to run it on demand.
+
+The same sweep handles the approvals and questions nobody answered in time ([Requests that lapse](./human-in-the-loop.md#requests-that-lapse)); `server.expirePendingActions()` runs that part on demand.
 
 A [task](/tasks) left `running` by a process that is gone is failed (`"The server stopped while the task was running"`). With leases that means
 a task nobody has renewed a lease for in `runs.leaseTtlMs`; without leases the server assumes it is the only node and fails what it finds that is older than itself

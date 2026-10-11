@@ -69,7 +69,7 @@ describeProvider("postgres", (harness) => {
         await provider.disconnect();
 
         expect(await sql(`SELECT COUNT(*)::int AS n FROM "${schema}"."agent_server_task_results"`)).toEqual([{ n: 1 }]);
-        expect((await sql(`SELECT value FROM "${schema}"."agent_server_meta" WHERE key = 'schema_version'`))[0].value).toBe("4");
+        expect((await sql(`SELECT value FROM "${schema}"."agent_server_meta" WHERE key = 'schema_version'`))[0].value).toBe("5");
         const columns = (await sql(
           `SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = $1 AND column_name IN ('seq', 'comments', 'conversation_id')`,
           [schema]
@@ -126,7 +126,7 @@ describeProvider("postgres", (harness) => {
         expect(await upgraded.acquireLease!({ key: "k", owner: "o", ttlMs: 1000 })).toMatchObject({ acquired: true });
         expect((await upgraded.updateTask(task.id, { conversationId: conv.id })).conversationId).toBe(conv.id);
         await upgraded.disconnect();
-        expect((await client.query(`SELECT value FROM "${schema}"."agent_server_meta" WHERE key = 'schema_version'`)).rows[0].value).toBe("4");
+        expect((await client.query(`SELECT value FROM "${schema}"."agent_server_meta" WHERE key = 'schema_version'`)).rows[0].value).toBe("5");
         // the provider that `open()` gave us is closed; the harness closes the schema
         opened.storage = createPostgresProvider({ connectionString: url, schema });
         await opened.storage.connect();
@@ -168,7 +168,48 @@ describeProvider("postgres", (harness) => {
         const indexes = (await client.query(`SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = 'agent_server_files'`, [schema])).rows.map((r) => r.indexname);
         expect(indexes).toEqual(expect.arrayContaining(["idx_agent_server_files_conv_t", "idx_agent_server_files_expires"]));
         expect(indexes).not.toContain("idx_agent_server_files_conv");
-        expect((await client.query(`SELECT value FROM "${schema}"."agent_server_meta" WHERE key = 'schema_version'`)).rows[0].value).toBe("4");
+        expect((await client.query(`SELECT value FROM "${schema}"."agent_server_meta" WHERE key = 'schema_version'`)).rows[0].value).toBe("5");
+        opened.storage = createPostgresProvider({ connectionString: url, schema });
+        await opened.storage.connect();
+      } finally {
+        await client.end();
+        await opened.close();
+      }
+    });
+
+    it("upgrades the previous schema (version 4): conversations learn their version and deadline", async () => {
+      const opened = await harness.open();
+      const { url, schema } = opened.where as { url: string; schema: string };
+      const { default: pg } = await import("pg");
+      const client = new pg.Client({ connectionString: url });
+      await client.connect();
+      try {
+        const conv = await opened.storage.createConversation({ agentId: "a", title: "kept", state: { s: 1 } });
+        const message = await opened.storage.createMessage({ conversationId: conv.id, role: "user", content: "old" });
+        await opened.storage.disconnect();
+
+        // take it back to what version 4 had
+        await client.query(`
+          DROP INDEX "${schema}"."idx_agent_server_conv_due";
+          ALTER TABLE "${schema}"."agent_server_conversations" DROP COLUMN version, DROP COLUMN action_due_at;
+          UPDATE "${schema}"."agent_server_meta" SET value = '4' WHERE key = 'schema_version';
+        `);
+
+        const upgraded = createPostgresProvider({ connectionString: url, schema });
+        await upgraded.connect();
+        const read = (await upgraded.getConversation(conv.id))!;
+        expect(read).toMatchObject({ title: "kept", state: { s: 1 }, version: 0 });
+        expect(read.actionDueAt).toBeUndefined();
+        expect((await upgraded.getMessage(message.id))?.content).toBe("old");
+        expect(await upgraded.updateConversationIf!(conv.id, 1, { title: "stale" })).toBeNull();
+        const due = new Date(Date.now() - 1000);
+        expect((await upgraded.updateConversationIf!(conv.id, 0, { actionDueAt: due }))!.version).toBe(1);
+        expect((await upgraded.getConversations({ actionDueBefore: new Date() })).data.map((c) => c.id)).toContain(conv.id);
+        await upgraded.disconnect();
+
+        expect((await client.query(`SELECT value FROM "${schema}"."agent_server_meta" WHERE key = 'schema_version'`)).rows[0].value).toBe("5");
+        const indexes = (await client.query(`SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = 'agent_server_conversations'`, [schema])).rows.map((r) => r.indexname);
+        expect(indexes).toContain("idx_agent_server_conv_due");
         opened.storage = createPostgresProvider({ connectionString: url, schema });
         await opened.storage.connect();
       } finally {

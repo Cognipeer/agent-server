@@ -46,6 +46,7 @@ export default defineConfig({
             { text: 'Streaming', link: '/guide/streaming' },
             { text: 'Runs, Cancel & Reattach', link: '/guide/runs' },
             { text: 'Approvals & Questions', link: '/guide/human-in-the-loop' },
+            { text: 'Usage & Budgets', link: '/guide/budgets' },
             { text: 'Swagger UI', link: '/guide/swagger' },
           ],
         },

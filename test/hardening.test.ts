@@ -73,7 +73,8 @@ describe("paging is clamped before storage", () => {
     const seen: Array<Record<string, unknown>> = [];
     const storage = new Proxy(inner, {
       get(t, p, r) {
-        if (p === "getConversations") return async (params: Record<string, unknown>) => { seen.push(params); return { data: [], total: 0, limit: 0, offset: 0, hasMore: false }; };
+        // (only what a client asked for: the expiry sweep looks for lapsed requests with its own query)
+        if (p === "getConversations") return async (params: Record<string, unknown>) => { if (!params.actionDueBefore) seen.push(params); return { data: [], total: 0, limit: 0, offset: 0, hasMore: false }; };
         const v = Reflect.get(t, p, r);
         return typeof v === "function" ? v.bind(t) : v;
       },

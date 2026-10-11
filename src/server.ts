@@ -55,6 +55,7 @@ import type {
   ResolveActionRequest,
   ResolveActionResponse,
   AgentCapabilities,
+  BudgetChange,
   TurnWarning,
   MessagesPage,
   StopReason,
@@ -71,20 +72,50 @@ import type {
   AgentFilesConfig,
   ProcessMessageParams,
   ContentPart,
+  AgentHitlConfig,
+  PricingFn,
+  SessionBudget,
+  UsageInfo,
+  UpdateConversationParams,
+  UpdateConversationRequest,
+  ContinueConversationRequest,
+  RememberedToolsResponse,
 } from "./types.js";
 import {
+  BUDGET_STATE_KEY,
   HITL_STATE_KEY,
   applySdkResolution,
+  earliestDeadline,
+  isExpired,
   jsonSafe,
+  openSnapshot,
   portableState,
   publicState,
+  readBudget,
   readHitl,
   runSdkTurn,
+  settleSnapshot,
+  stampDeadlines,
   supportsSdkPause,
+  withHiddenStores,
+  writeBudget,
   writeHitl,
+  type BudgetStore,
   type HitlSdkAgent,
   type HitlStore,
+  type SettledAction,
 } from "./hitl.js";
+import {
+  budgetChangeKind,
+  budgetWire,
+  isCostLimitDetail,
+  ledgerCostUsd,
+  normalizeUsage,
+  parseBudget,
+  roundUsd,
+  snapshotLedger,
+} from "./usage.js";
+import { findToolSchema, validateAgainstSchema } from "./schema.js";
 import { generateOpenAPISpec, generateSwaggerHTML } from "./swagger.js";
 import {
   invokeChatCompletions,
@@ -134,6 +165,7 @@ import {
   type ImageSource,
 } from "./files/images.js";
 import { runWithTurnFiles, type TurnFiles } from "./files/turn.js";
+import { isDeepStrictEqual } from "node:util";
 import { nanoid } from "nanoid";
 
 /** Largest file the upload route accepts when `limits.maxFileSize` is not set (capped by the storage provider). */
@@ -312,23 +344,37 @@ interface ResolveRun {
   /** SDK state with the decision applied (SDK agents only). */
   nextSdkState?: unknown;
   metadata?: Record<string, unknown>;
+  /** Who gave the answer (`system:timeout` for a request that lapsed). */
+  actor: string;
+  /** Where it came from: `api`, or `timeout` for the sweep. */
+  channel: "api" | "timeout";
+  /** The answer replaced the person's arguments with their own. */
+  edited: boolean;
+  /** The request lapsed and `onTimeout: "deny"` answered it. */
+  expired?: boolean;
 }
 
 /** What the agent produced in one step of a turn, before it is persisted. */
 interface AgentStep {
   content: string;
   files?: Message["files"];
-  usage?: SendMessageResponse["usage"];
+  usage?: UsageInfo;
   /** What the step waits on (never set for a cancelled step). */
   pending: PendingAction[];
   sdkState?: unknown;
   /** State a custom handler wrote this step. */
   handlerState?: Record<string, unknown>;
   handlerMetadata?: Record<string, unknown>;
+  /** Keys to put on the conversation's visible state (the Responses API's `lastResponseId`). */
+  statePatch?: Record<string, unknown>;
   /** The run was cancelled while the step ran. */
   cancelled: boolean;
   /** The agent stopped at one of its limits. */
   limited?: boolean;
+  /** The conversation's budget - not the agent's own per-turn limit - stopped the step in the middle. */
+  budgetBreach?: boolean;
+  /** The agent-sdk state to carry on from after a budget stop (`POST .../continue`). */
+  budgetState?: unknown;
   /** What the agent said about it (reported as the `detail` of `session.status_idle`). */
   detail?: string;
   /** Why the step stopped, when the agent said so (a custom handler's `stopReason`). */
@@ -340,6 +386,17 @@ interface AgentStep {
 }
 
 const cancelledStep = (content: string): AgentStep => ({ content, pending: [], cancelled: true });
+
+/** What a turn needs to know about money (see `planTurnBudget`). */
+interface TurnBudget {
+  pricing?: PricingFn;
+  /** The conversation's budget; null when it has none. */
+  budget: SessionBudget | null;
+  /** What the conversation had spent when the turn started. */
+  spentBefore: number;
+  /** The cap given to agent-sdk, and whether it is the budget's (not the agent's own per-turn limit). */
+  limit?: { maxCostUsd: number; sessionBinds: boolean };
+}
 
 /** The message status that goes with a stop reason. */
 function statusForStop(stopReason: StopReason): MessageStatus {
@@ -407,6 +464,22 @@ const extractInfo = (record: FileRecord) => ({ id: record.id, name: record.name,
 export interface AgentRegistrationOptions {
   /** Attachment settings of this agent; each field overrides the server's `files` option. */
   files?: AgentFilesConfig;
+  /** Approval and question settings of this agent; each field overrides the server's `hitl` option. */
+  hitl?: AgentHitlConfig;
+  /** The spend limit new conversations with this agent start with (`null`: none, whatever the server says). Needs pricing. */
+  budget?: SessionBudget | null;
+  /** Prices the tokens this agent uses (overrides the server's `pricing`). */
+  pricing?: PricingFn;
+}
+
+/** The fields of {@link AgentRegistrationOptions} as an {@link AgentRegistration} holds them. */
+function registrationExtras(options?: AgentRegistrationOptions): Partial<AgentRegistration> {
+  return {
+    ...(options?.files && { files: options.files }),
+    ...(options?.hitl && { hitl: options.hitl }),
+    ...(options?.budget !== undefined && { budget: options.budget }),
+    ...(options?.pricing && { pricing: options.pricing }),
+  };
 }
 
 export interface RouteContext {
@@ -505,6 +578,8 @@ export class AgentServer {
   private lastPrune = 0;
   private sweepWarned = false;
   private closed = false;
+  private snapshotWarned = false;
+  private sweeping = false;
   private startedAt = Date.now();
   /** Turns files into text for agents; keeps what it read so a file is not converted again for every page. */
   private extractor: TextExtractor;
@@ -514,8 +589,9 @@ export class AgentServer {
     this.config = config;
     this.basePath = config.basePath.replace(/\/$/, "");
     if (Array.isArray(config.agents)) {
-      for (const registration of config.agents) this.agents.set(registration.info.id, registration);
+      for (const registration of config.agents) this.addAgent(registration.info.id, registration);
     }
+    this.validateBudgets();
     const runs = config.runs ?? {};
     const positive = (value: number | undefined, fallback: number) =>
       typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
@@ -593,6 +669,120 @@ export class AgentServer {
         `limits.maxStateBytes (${maxStateBytes} bytes) is larger than the ${capabilities.maxStateBytes} bytes this storage provider can hold`
       );
     }
+  }
+
+  // ============================================================================
+  // Approvals, budgets: settings
+  // ============================================================================
+
+  /** Registers an agent, refusing a budget that nothing can price. */
+  private addAgent(id: string, registration: AgentRegistration): void {
+    this.assertBudgetUsable(registration);
+    this.agents.set(id, registration);
+  }
+
+  private assertBudgetUsable(registration: AgentRegistration): void {
+    const budget = registration.budget;
+    if (budget) {
+      const parsed = parseBudget(budget, `agent "${registration.info.id}" budget`);
+      if (!parsed.ok) throw new Error(parsed.message);
+      if (!this.pricingFor(registration)) {
+        throw new Error(`Agent "${registration.info.id}" has a budget but no pricing: set AgentRegistration.pricing or the server's pricing option`);
+      }
+    }
+  }
+
+  /** Called once the server's own settings are known: a server-wide budget needs server-wide pricing. */
+  private validateBudgets(): void {
+    if (this.config.budget) {
+      const parsed = parseBudget(this.config.budget, "budget");
+      if (!parsed.ok) throw new Error(parsed.message);
+      if (!this.config.pricing) {
+        throw new Error("The server has a budget but no pricing: set the pricing option (model name -> price per token)");
+      }
+    }
+  }
+
+  /** The approval settings of one agent: the agent's own, else the server's, else the defaults. */
+  private hitlFor(agent?: Pick<AgentRegistration, "hitl">): { timeoutMinutes: number; onTimeout: "deny" | "cancel"; validateApprovedArgs: boolean } {
+    const server = this.config.hitl ?? {};
+    const own = agent?.hitl ?? {};
+    const minutes = own.timeoutMinutes ?? server.timeoutMinutes;
+    return {
+      timeoutMinutes: typeof minutes === "number" && Number.isFinite(minutes) && minutes >= 0 ? minutes : 1440,
+      onTimeout: (own.onTimeout ?? server.onTimeout) === "cancel" ? "cancel" : "deny",
+      validateApprovedArgs: (own.validateApprovedArgs ?? server.validateApprovedArgs) !== false,
+    };
+  }
+
+  private get resolveWaitMs(): number {
+    const wait = this.config.hitl?.resolveWaitMs;
+    return typeof wait === "number" && Number.isFinite(wait) && wait >= 0 ? wait : 3000;
+  }
+
+  private pricingFor(agent?: Pick<AgentRegistration, "pricing">): PricingFn | undefined {
+    return agent?.pricing ?? this.config.pricing;
+  }
+
+  /** The spend limit new conversations with this agent start with. */
+  private agentBudget(agent?: Pick<AgentRegistration, "budget">): SessionBudget | null {
+    const configured = agent?.budget !== undefined ? agent.budget : this.config.budget ?? null;
+    if (!configured) return null;
+    const parsed = parseBudget(configured);
+    return parsed.ok ? parsed.budget : null;
+  }
+
+  /** The conversation's budget in effect: its own (`null`: removed), else its agent's default. */
+  private effectiveBudget(conversation: Pick<Conversation, "state">, agent?: Pick<AgentRegistration, "budget">): SessionBudget | null {
+    const stored = readBudget(conversation.state);
+    if (stored && stored.budget !== undefined) {
+      if (stored.budget === null) return null;
+      const parsed = parseBudget(stored.budget);
+      return parsed.ok ? parsed.budget : null;
+    }
+    return this.agentBudget(agent);
+  }
+
+  private spentOf(conversation: Pick<Conversation, "state">): number {
+    const spent = readBudget(conversation.state)?.spentUsd;
+    return typeof spent === "number" && Number.isFinite(spent) && spent > 0 ? spent : 0;
+  }
+
+  private budgetReachedError(spentUsd: number, budget: SessionBudget) {
+    return {
+      statusCode: 402,
+      code: "budget_reached",
+      message: `The budget of this conversation is used up ($${spentUsd.toFixed(4)} of $${budget.maxCostUsd}). Raise it to carry on.`,
+      details: { spentUsd, maxCostUsd: budget.maxCostUsd, onReach: budget.onReach },
+    };
+  }
+
+  /**
+   * What a turn that starts now needs to know about money: the prices, the conversation's budget and what it has
+   * spent, and the cap to give agent-sdk so it stops in the middle of the turn. Throws 402 `budget_reached` when
+   * nothing is left: the model is not called. `carried` is the usage ledger of the state a resumed turn carries on from
+   * (its cost counts against agent-sdk's own cap, but is already in `spentUsd`).
+   */
+  private planTurnBudget(conversation: Pick<Conversation, "state">, agent: AgentRegistration, carried?: unknown): TurnBudget {
+    const pricing = this.pricingFor(agent);
+    const budget = this.effectiveBudget(conversation, agent);
+    const spentBefore = this.spentOf(conversation);
+    if (!budget) return { pricing, budget: null, spentBefore };
+    if (!pricing) {
+      throw {
+        statusCode: 500,
+        code: "budget_misconfigured",
+        message: `Agent "${agent.info.id}" has a budget but no pricing, so it cannot be enforced`,
+      };
+    }
+    const remaining = roundUsd(budget.maxCostUsd - spentBefore);
+    if (remaining <= 0) throw this.budgetReachedError(spentBefore, budget);
+    const own = (agent.sdkAgent as { __runtime?: { limits?: { maxCostUsd?: unknown } } } | undefined)?.__runtime?.limits?.maxCostUsd;
+    const perTurn = typeof own === "number" && own > 0 ? own : undefined;
+    // agent-sdk compares the cost of the whole ledger of the state it runs on with the cap
+    const sessionCap = remaining + ledgerCostUsd(carried, pricing);
+    const sessionBinds = perTurn === undefined || sessionCap <= perTurn;
+    return { pricing, budget, spentBefore, limit: { maxCostUsd: sessionBinds ? sessionCap : perTurn!, sessionBinds } };
   }
 
   // ============================================================================
@@ -886,7 +1076,7 @@ export class AgentServer {
       }
     }
 
-    this.agents.set(id, {
+    this.addAgent(id, {
       info: {
         id,
         name,
@@ -896,7 +1086,7 @@ export class AgentServer {
         ...(capabilities && { capabilities }),
       },
       sdkAgent: agent,
-      ...(options?.files && { files: options.files }),
+      ...registrationExtras(options),
     });
   }
 
@@ -909,10 +1099,10 @@ export class AgentServer {
     info: Omit<AgentInfo, "id">,
     options?: AgentRegistrationOptions
   ): void {
-    this.agents.set(id, {
+    this.addAgent(id, {
       info: { id, ...info },
       handler,
-      ...(options?.files && { files: options.files }),
+      ...registrationExtras(options),
     });
   }
 
@@ -939,10 +1129,10 @@ export class AgentServer {
     info: Omit<AgentInfo, "id">,
     options?: AgentRegistrationOptions
   ): void {
-    this.agents.set(id, {
+    this.addAgent(id, {
       info: { id, ...info },
       chatCompletions: config,
-      ...(options?.files && { files: options.files }),
+      ...registrationExtras(options),
     });
   }
 
@@ -970,10 +1160,10 @@ export class AgentServer {
     info: Omit<AgentInfo, "id">,
     options?: AgentRegistrationOptions
   ): void {
-    this.agents.set(id, {
+    this.addAgent(id, {
       info: { id, ...info },
       responsesApi: config,
-      ...(options?.files && { files: options.files }),
+      ...registrationExtras(options),
     });
   }
 
@@ -1091,6 +1281,11 @@ export class AgentServer {
       this.handleResolveAction.bind(this)
     );
 
+    // Carry a turn the budget stopped on, and what was approved "for the session"
+    this.addRoute("POST", "/conversations/:conversationId/continue", this.handleContinue.bind(this));
+    this.addRoute("GET", "/conversations/:conversationId/remembered-tools", this.handleListRememberedTools.bind(this));
+    this.addRoute("DELETE", "/conversations/:conversationId/remembered-tools/:tool*", this.handleRevokeRememberedTool.bind(this));
+
     // Runs: stop a turn, read and follow what happened in a conversation
     this.addRoute("POST", "/conversations/:conversationId/cancel", this.handleCancel.bind(this));
     this.addRoute("GET", "/conversations/:conversationId/events", this.handleListEvents.bind(this));
@@ -1125,9 +1320,11 @@ export class AgentServer {
     isPublic = false
   ): void {
     const paramNames: string[] = [];
-    const patternStr = path.replace(/:([^/]+)/g, (_, name) => {
-      paramNames.push(name);
-      return "([^/]+)";
+    // `:name` is one path segment; `:name*` takes the rest of the path (a name that may itself hold a slash)
+    const patternStr = path.replace(/:([^/]+)/g, (_, name: string) => {
+      const rest = name.endsWith("*");
+      paramNames.push(rest ? name.slice(0, -1) : name);
+      return rest ? "(.+)" : "([^/]+)";
     });
     const pattern = new RegExp(`^${patternStr}$`);
 
@@ -1407,7 +1604,7 @@ export class AgentServer {
       status: 200,
       body: {
         conversations: result.data.map((conv) => ({
-          ...this.publicConversation(conv, runtimes.get(conv.id)),
+          ...this.publicConversation(conv, runtimes.get(conv.id), registry.get(conv.agentId)),
           agentName: registry.get(conv.agentId)?.info.name,
         })),
         total: result.total,
@@ -1432,7 +1629,8 @@ export class AgentServer {
     }
 
     // Check if agent exists
-    if (!(await this.getAgentFor(body.agentId, ctx.context))) {
+    const agent = await this.getAgentFor(body.agentId, ctx.context);
+    if (!agent) {
       throw {
         statusCode: 404,
         code: "NOT_FOUND",
@@ -1443,17 +1641,57 @@ export class AgentServer {
     // Resolve userId: from body, ctx.user (token), or resolveUserId callback
     const userId = await this.effectiveUserId(ctx, body.userId);
 
+    // A budget of its own: lower than the agent's default is the caller's to ask for, higher needs `authorizeBudget`
+    let state: Record<string, unknown> | undefined;
+    if (body.budget !== undefined) {
+      const requested = this.parseBudgetRequest(body.budget, agent);
+      await this.checkBudgetChange(ctx, { current: this.agentBudget(agent), requested, spentUsd: 0 });
+      state = writeBudget(undefined, { budget: requested });
+    }
+
     const conversation = await this.config.storage.createConversation({
       agentId: body.agentId,
       userId,
       title: body.title,
       metadata: body.metadata,
+      ...(state && { state }),
     }, ctx.context);
 
     return {
       status: 201,
-      body: { conversation },
+      body: { conversation: this.publicConversation(conversation, undefined, agent) },
     };
+  }
+
+  /**
+   * A budget as a request spells it: 400 `invalid_budget` when it is not one, 400 `budget_unavailable` when the
+   * agent cannot price its calls (a budget nothing can count against is refused, never ignored). `null` removes it.
+   */
+  private parseBudgetRequest(value: unknown, agent: AgentRegistration | undefined): SessionBudget | null {
+    if (value === null) return null;
+    const parsed = parseBudget(value);
+    if (!parsed.ok) throw { statusCode: 400, code: "invalid_budget", message: parsed.message };
+    if (!this.pricingFor(agent)) {
+      throw {
+        statusCode: 400,
+        code: "budget_unavailable",
+        message: "This agent has no pricing, so its cost cannot be counted and a budget cannot be enforced",
+      };
+    }
+    return parsed.budget;
+  }
+
+  /** Lowering a budget is the conversation owner's to do; raising or removing one needs `authorizeBudget` (403 `budget_forbidden`). */
+  private async checkBudgetChange(ctx: RouteContext, change: BudgetChange): Promise<void> {
+    if (budgetChangeKind(change.current, change.requested) !== "raise") return;
+    const allowed = this.config.authorizeBudget ? await this.config.authorizeBudget(ctx.context!, change) : false;
+    if (!allowed) {
+      throw {
+        statusCode: 403,
+        code: "budget_forbidden",
+        message: "A budget can be lowered by the conversation's owner; raising or removing it is not allowed",
+      };
+    }
   }
 
   private async handleGetConversation(
@@ -1476,11 +1714,12 @@ export class AgentServer {
     const { messages, page } = await this.loadMessagesPage(conversationId, ctx);
     const pendingActions = readHitl(conversation.state)?.pending?.actions;
     const runtime = (await this.runtimesFor([conversation], ctx.context)).get(conversation.id);
+    const agent = await this.getAgentFor(conversation.agentId, ctx.context);
 
     return {
       status: 200,
       body: {
-        conversation: this.publicConversation(conversation, runtime),
+        conversation: this.publicConversation(conversation, runtime, agent),
         messages: messages.map(publicMessage),
         messagesPage: page,
         ...(pendingActions?.length && { pendingActions }),
@@ -1541,7 +1780,7 @@ export class AgentServer {
     ctx: RouteContext
   ): Promise<RouteResult<Conversation>> {
     const { conversationId } = ctx.params;
-    const body = ctx.body as { title?: string; metadata?: Record<string, unknown> };
+    const body = ctx.body as UpdateConversationRequest;
 
     const existing = await this.config.storage.getConversation(conversationId, ctx.context);
     if (!existing) {
@@ -1555,14 +1794,46 @@ export class AgentServer {
     // Verify user has access to this conversation
     await this.verifyConversationAccess(existing, ctx);
 
-    const conversation = await this.config.storage.updateConversation(conversationId, {
-      title: body?.title,
-      metadata: body?.metadata,
-    }, ctx.context);
+    let conversation = existing;
+    let agent: AgentRegistration | undefined;
+    if (body?.budget !== undefined) {
+      agent = await this.getAgentFor(existing.agentId, ctx.context);
+      const requested = this.parseBudgetRequest(body.budget, agent);
+      const done = await this.mutateConversation(conversationId, ctx.context, async (fresh) => {
+        const current = this.effectiveBudget(fresh, agent);
+        const spentUsd = this.spentOf(fresh);
+        if (requested && requested.maxCostUsd <= spentUsd) {
+          throw {
+            statusCode: 400,
+            code: "invalid_budget",
+            message: `The budget has to be more than the conversation has already spent ($${spentUsd})`,
+            details: { spentUsd },
+          };
+        }
+        // Lowering is the owner's; raising or removing it is the host's call
+        await this.checkBudgetChange(ctx, {
+          conversation: this.publicConversation(fresh, undefined, agent),
+          current,
+          requested,
+          spentUsd,
+        });
+        if (budgetChangeKind(current, requested) === "same") return null;
+        return { state: writeBudget(fresh.state, { ...readBudget(fresh.state), budget: requested }) };
+      });
+      conversation = done.conversation;
+    }
 
+    if (body?.budget === undefined || body.title !== undefined || body.metadata !== undefined) {
+      conversation = await this.config.storage.updateConversation(conversationId, {
+        title: body?.title,
+        metadata: body?.metadata,
+      }, ctx.context);
+    }
+
+    const runtime = body?.budget !== undefined ? (await this.runtimesFor([conversation], ctx.context)).get(conversation.id) : undefined;
     return {
       status: 200,
-      body: this.publicConversation(conversation),
+      body: this.publicConversation(conversation, runtime, agent),
     };
   }
 
@@ -1639,13 +1910,28 @@ export class AgentServer {
   // Human-in-the-loop (pending actions)
   // ============================================================================
 
-  /** Conversation as clients see it: without the internal pending-action store. */
-  private publicConversation<T extends Conversation>(conversation: T, runtime?: ConversationRuntime): T {
-    const visible =
-      conversation.state && HITL_STATE_KEY in conversation.state
-        ? { ...conversation, state: publicState(conversation.state) }
-        : conversation;
-    return runtime ? { ...visible, runtime } : visible;
+  /**
+   * Conversation as clients see it: without the internal stores (pending actions, budget) and storage bookkeeping,
+   * plus what is worth showing of them - the budget and what is spent, the tools remembered for the session.
+   */
+  private publicConversation<T extends Conversation>(
+    conversation: T,
+    runtime?: ConversationRuntime,
+    agent?: Pick<AgentRegistration, "budget">
+  ): T {
+    const { version: _version, actionDueAt: _due, ...visible } = conversation;
+    const hidden = conversation.state && (HITL_STATE_KEY in conversation.state || BUDGET_STATE_KEY in conversation.state);
+    const budget = this.effectiveBudget(conversation, agent);
+    const spent = this.spentOf(conversation);
+    const remembered = readHitl(conversation.state)?.allowedTools;
+    return {
+      ...visible,
+      ...(hidden ? { state: publicState(conversation.state) } : {}),
+      ...(runtime ? { runtime } : {}),
+      ...(budget ? { budget } : {}),
+      ...(budget || spent > 0 ? { spentUsd: spent } : {}),
+      ...(remembered?.length ? { rememberedTools: [...remembered] } : {}),
+    } as T;
   }
 
   /** The event data of a decision on `action` (`action.resolved`). */
@@ -1653,21 +1939,230 @@ export class AgentServer {
     action: PendingAction,
     resolution: ActionResolution | undefined,
     resolvedBy: string,
-    channel: "api" | "system",
-    cancelled = false
+    channel: "api" | "system" | "timeout" | "remembered",
+    extra: { cancelled?: boolean; expired?: boolean; remembered?: boolean; edited?: boolean } = {}
   ): Record<string, unknown> {
     const approval = resolution?.type === "tool_approval" ? resolution : undefined;
     const questionCancelled = resolution?.type === "user_question" && resolution.cancelled === true;
-    const wasCancelled = cancelled || questionCancelled;
+    const wasCancelled = extra.cancelled === true || questionCancelled;
     return {
       action_id: action.id,
       kind: action.type,
+      ...(action.type === "tool_approval" && (extra.remembered || extra.expired) ? { tool_name: action.toolName } : {}),
       ...(approval ? { decision: approval.decision } : {}),
       ...(wasCancelled ? { cancelled: true } : {}),
-      status: wasCancelled ? "cancelled" : approval ? (approval.decision === "allow" ? "approved" : "rejected") : "answered",
+      ...(extra.expired ? { expired: true } : {}),
+      ...(extra.remembered ? { remembered: true } : {}),
+      ...(extra.edited ? { edited_args: true } : {}),
+      ...(approval?.rememberForSession ? { remember_for_session: true } : {}),
+      status:
+        extra.expired && extra.cancelled
+          ? "expired"
+          : wasCancelled
+            ? "cancelled"
+            : approval
+              ? approval.decision === "allow"
+                ? "approved"
+                : "rejected"
+              : "answered",
       resolved_by: resolvedBy,
       channel,
     };
+  }
+
+  // ---- state writes -----------------------------------------------------------
+
+  /** Whether the storage provider can compare-and-set a conversation. */
+  private get atomicUpdates(): boolean {
+    const provider = this.config.storage;
+    return typeof provider.updateConversationIf === "function" && provider.capabilities?.().atomicUpdate === true;
+  }
+
+  /**
+   * Changes a conversation from what it is NOW: reads it, lets `build` say what to write, and writes it only if
+   * nobody changed it in between (`updateConversationIf`; a store without it writes plainly). When somebody did, it reads
+   * again and `build` runs again on the newer record, so two writers of one conversation - two answers to one pause,
+   * a sweep and an answer, a budget change and a turn - never overwrite each other. `build` returns `null` to write
+   * nothing, and may throw to give up.
+   */
+  private async mutateConversation(
+    conversationId: string,
+    rc: RequestContext | undefined,
+    build: (fresh: Conversation) => UpdateConversationParams | null | Promise<UpdateConversationParams | null>
+  ): Promise<{ conversation: Conversation; written: boolean }> {
+    const storage = this.config.storage;
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const fresh = await storage.getConversation(conversationId, rc);
+      if (!fresh) throw { statusCode: 404, code: "NOT_FOUND", message: `Conversation not found: ${conversationId}` } as NotFoundError;
+      const params = await build(fresh);
+      if (!params) return { conversation: fresh, written: false };
+      if (this.atomicUpdates && typeof fresh.version === "number") {
+        const updated = await storage.updateConversationIf!(conversationId, fresh.version, params, rc);
+        if (updated) return { conversation: updated, written: true };
+        // somebody else got in first: look again (a short, growing pause keeps a crowd from colliding forever)
+        await new Promise((resolve) => setTimeout(resolve, Math.min(5 * (attempt + 1), 40)));
+        continue;
+      }
+      return { conversation: await storage.updateConversation(conversationId, params, rc), written: true };
+    }
+    throw {
+      statusCode: 409,
+      code: "conversation_conflict",
+      message: "The conversation keeps changing under this request. Try again.",
+    };
+  }
+
+  /**
+   * The conversation state after a turn: `fresh` (the conversation as it is now) with the visible part replaced
+   * by what a handler returned or patched, the HITL store rewritten for what the turn waits on, and the budget store
+   * brought up to date with the turn's spend. Hidden stores are the server's alone: a handler's state never overwrites them.
+   * `changed` is false when the turn leaves the state exactly as it was (a plain agent's turn writes nothing).
+   */
+  private composeState(
+    fresh: Conversation,
+    plan: {
+      baseState?: Record<string, unknown>;
+      statePatch?: Record<string, unknown>;
+      pending?: { actions: PendingAction[]; messageId: string; sdkState?: unknown; onTimeout: "deny" | "cancel" };
+      budgetPause?: { sdkState: unknown; messageId: string };
+      rememberAdd?: string[];
+      spend?: { turnCostUsd: number; budget: SessionBudget | null };
+    }
+  ): { state: Record<string, unknown>; changed: boolean } {
+    const before = readHitl(fresh.state);
+    const stored = readBudget(fresh.state);
+    // A conversation that inherits its agent's budget keeps it from here on, so the runtime state needs nothing else
+    const adoptBudget = !!plan.spend?.budget && stored?.budget === undefined;
+    const spendWrite = !!plan.spend && (plan.spend.turnCostUsd > 0 || adoptBudget);
+    const changed = !!(
+      plan.baseState ||
+      plan.statePatch ||
+      plan.pending ||
+      before?.pending ||
+      plan.budgetPause ||
+      before?.budgetPause ||
+      plan.rememberAdd?.length ||
+      spendWrite
+    );
+    if (!changed) return { state: fresh.state ?? {}, changed };
+
+    let visible: Record<string, unknown> = plan.baseState ? withHiddenStores(plan.baseState, fresh.state) : { ...(fresh.state ?? {}) };
+    if (plan.statePatch) visible = { ...visible, ...plan.statePatch };
+
+    const allowed = [...new Set([...(before?.allowedTools ?? []), ...(plan.rememberAdd ?? [])])];
+    const hitl: HitlStore = {
+      ...(allowed.length > 0 && { allowedTools: allowed }),
+      ...(plan.pending && {
+        pending: {
+          actions: plan.pending.actions,
+          messageId: plan.pending.messageId,
+          onTimeout: plan.pending.onTimeout,
+          ...(plan.pending.sdkState !== undefined && { sdkState: plan.pending.sdkState }),
+        },
+      }),
+      ...(plan.budgetPause && { budgetPause: plan.budgetPause }),
+    };
+    let next = writeHitl(visible, hitl);
+    if (spendWrite) {
+      const budgetStore: BudgetStore = {
+        budget: stored?.budget !== undefined ? stored.budget : plan.spend!.budget ?? undefined,
+        spentUsd: roundUsd((stored?.spentUsd ?? 0) + plan.spend!.turnCostUsd),
+      };
+      next = writeBudget(next, budgetStore);
+    } else {
+      next = writeBudget(next, stored);
+    }
+    return { state: next, changed };
+  }
+
+  /**
+   * Records how actions ended on the paused assistant message (`metadata.pendingActions`), so a history shows
+   * approved / denied / answered / expired / cancelled. Best effort: the answer itself is already in the conversation's
+   * state, and a store that cannot update messages simply keeps showing the request as it was asked.
+   */
+  private async settleOnMessage(
+    messageId: string,
+    settled: Map<string, SettledAction>,
+    rc: RequestContext | undefined
+  ): Promise<void> {
+    const storage = this.config.storage;
+    if (typeof storage.updateMessage !== "function" || settled.size === 0) return;
+    try {
+      const message = await storage.getMessage(messageId, rc);
+      if (!message) return;
+      const metadata = settleSnapshot(message.metadata, settled);
+      if (metadata) await storage.updateMessage(messageId, { metadata }, rc);
+    } catch (error) {
+      if (!this.snapshotWarned) {
+        this.snapshotWarned = true;
+        console.error("[AgentServer] Could not record how an action ended on its message (further failures are not logged):", error);
+      }
+    }
+  }
+
+  /**
+   * Withdraws the actions a conversation waits on, under the state write rules above: they leave the pause, the paused message
+   * records each as `cancelled` / `expired`, and `action.resolved` events are written (the caller adds whatever else the log
+   * needs, in the same append). Resolves the actions that were open and the message they were asked on.
+   */
+  private async closePause(
+    conversationId: string,
+    rc: RequestContext | undefined,
+    how: {
+      status: (action: PendingAction) => "cancelled" | "expired";
+      by: string;
+      channel: "system" | "api" | "timeout";
+      /** Only these (default: all open ones). */
+      only?: (action: PendingAction) => boolean;
+      moreEvents?: NewConversationEvent[];
+      /** Where the events go (default: appended to the log outside any run). */
+      emit?: (events: NewConversationEvent[]) => void | Promise<void>;
+    }
+  ): Promise<{ actions: PendingAction[]; messageId?: string }> {
+    let closed: PendingAction[] = [];
+    let messageId: string | undefined;
+    await this.mutateConversation(conversationId, rc, (fresh) => {
+      const store = readHitl(fresh.state);
+      closed = [];
+      if (!store?.pending) return null;
+      messageId = store.pending.messageId;
+      closed = store.pending.actions.filter((action) => !how.only || how.only(action));
+      if (closed.length === 0) return null;
+      const closedIds = new Set(closed.map((action) => action.id));
+      const left = store.pending.actions.filter((action) => !closedIds.has(action.id));
+      const next: HitlStore = { ...store, pending: left.length > 0 ? { ...store.pending, actions: left } : undefined };
+      return { state: writeHitl(fresh.state, next), actionDueAt: earliestDeadline(left) ?? (fresh.actionDueAt ? null : undefined) };
+    });
+    if (closed.length === 0) return { actions: [] };
+    const now = new Date();
+    await this.settleOnMessage(
+      messageId!,
+      new Map(
+        closed.map((action) => [
+          action.id,
+          {
+            status: how.status(action),
+            resolvedBy: how.by,
+            resolvedAt: now,
+            ...(action.type === "user_question" ? { resolution: { type: "user_question" as const, answers: {}, cancelled: true } } : {}),
+          } satisfies SettledAction,
+        ])
+      ),
+      rc
+    );
+    const events: NewConversationEvent[] = [
+      ...closed.map((action) => ({
+        type: EVENT_TYPES.actionResolved,
+        data: this.actionResolvedData(action, undefined, how.by, how.channel, {
+          cancelled: true,
+          expired: how.status(action) === "expired",
+        }),
+      })),
+      ...(how.moreEvents ?? []),
+    ];
+    if (how.emit) await how.emit(events);
+    else await this.appendEvents(conversationId, events, rc);
+    return { actions: closed, messageId };
   }
 
   /**
@@ -1686,17 +2181,8 @@ export class AgentServer {
         details: { pendingActionIds: store.pending.actions.map((a) => a.id) },
       };
     }
-    const state = writeHitl(conversation.state, { allowedTools: store.allowedTools });
-    await this.config.storage.updateConversation(conversation.id, { state }, ctx.context);
-    await this.appendEvents(
-      conversation.id,
-      store.pending.actions.map((action) => ({
-        type: EVENT_TYPES.actionResolved,
-        data: this.actionResolvedData(action, undefined, "system", "system", true),
-      })),
-      ctx.context
-    );
-    return { ...conversation, state };
+    await this.closePause(conversation.id, ctx.context, { status: () => "cancelled", by: "system", channel: "system" });
+    return (await this.config.storage.getConversation(conversation.id, ctx.context)) ?? conversation;
   }
 
   // ============================================================================
@@ -1726,12 +2212,14 @@ export class AgentServer {
     return { data: { system: true } };
   }
 
-  private busyError(activeRunId?: string) {
+  private busyError(activeRunId?: string, runKind?: string) {
     return {
       statusCode: 409,
       code: "conversation_busy",
       message: "The conversation is already running a turn. Wait for it to finish, or cancel it.",
       details: { ...(activeRunId ? { activeRunId } : {}) },
+      // (for the server's own use: an answer waits for another answer, not for a turn that takes as long as the model)
+      runKind,
     };
   }
 
@@ -1781,7 +2269,7 @@ export class AgentServer {
   ): Promise<ActiveRun> {
     const conversationId = conversation.id;
     const existing = this.runs.get(conversationId);
-    if (existing) throw this.busyError(existing.id);
+    if (existing) throw this.busyError(existing.id, existing.kind);
 
     const run = new ActiveRun({
       conversationId,
@@ -1808,7 +2296,7 @@ export class AgentServer {
           },
           ctx.context
         );
-        if (!result.acquired) throw this.busyError(result.lease.data?.runId as string | undefined);
+        if (!result.acquired) throw this.busyError(result.lease.data?.runId as string | undefined, result.lease.data?.kind as string | undefined);
         run.lease = new LeaseKeeper({
           storage: this.config.storage,
           key,
@@ -1985,7 +2473,11 @@ export class AgentServer {
     // One turn at a time per conversation (409 conversation_busy), then: waiting on a human?
     // Reject (409) or cancel the pending actions, per config.
     const run = await this.beginRun(ctx, conversation, "message", "message", streaming);
+    let budget: TurnBudget;
     try {
+      // A conversation whose budget is used up takes no message (402 budget_reached, before anything is stored - not even
+      // the cancelling of what it waits on)
+      budget = this.planTurnBudget(conversation, agent);
       conversation = await this.guardPendingActions(conversation, ctx);
     } catch (error) {
       await this.endRun(run);
@@ -1993,7 +2485,7 @@ export class AgentServer {
     }
 
     const stream = streaming ? this.attachStream(run) : undefined;
-    this.launch(run, ctx, () => this.executeMessage(run, { ctx, conversation, agent, body, attachments }));
+    this.launch(run, ctx, () => this.executeMessage(run, { ctx, conversation, agent, body, attachments, budget }));
     if (stream) return { status: 200, headers: SSE_HEADERS, stream: stream.generator, close: stream.close };
 
     const outcome = await run.done;
@@ -2010,6 +2502,7 @@ export class AgentServer {
         ...(outcome.warnings && { warnings: outcome.warnings }),
         stopReason: outcome.stopReason,
         runId: run.id,
+        ...(outcome.budget && { budget: outcome.budget, spentUsd: outcome.spentUsd }),
       },
     };
   }
@@ -2026,11 +2519,14 @@ export class AgentServer {
       attachments?: PreparedAttachments;
       /** What a custom handler gets as `metadata`, when it is not the message's own (a task hands over its comments). */
       handlerMetadata?: Record<string, unknown>;
+      /** The money plan of the turn (made by the caller, which can answer 402 before anything starts; a task makes it here). */
+      budget?: TurnBudget;
     }
   ): Promise<TurnOutcome> {
     const { ctx, conversation, agent, body } = x;
     const conversationId = conversation.id;
     const cfg = x.attachments?.cfg ?? this.filesConfigFor(agent);
+    const budget = x.budget ?? this.planTurnBudget(conversation, agent);
 
     // Which uploads were already sent is known from the conversation's history (only read early when it is needed)
     const attachNewUploads = cfg.attachNewUploads && cfg.enabled;
@@ -2090,15 +2586,17 @@ export class AgentServer {
       files: files.length > 0 ? files : undefined,
       currentMessageId: userMessage.id,
       handlerMetadata: x.handlerMetadata,
+      budget,
     });
     return this.finalizeTurn(run, {
       ctx,
       conversation,
+      agent,
       step,
       userMessage,
       // (a task's conversation gets no generated title: it is not a chat)
       firstExchange: history.length === 1 && !run.taskId ? body.message : undefined,
-      allowedTools: undefined,
+      budget,
     });
   }
 
@@ -2134,9 +2632,11 @@ export class AgentServer {
       /** The user message being answered (its images are shown; its warnings are reported). */
       currentMessageId?: string;
       handlerMetadata?: Record<string, unknown>;
+      budget: TurnBudget;
     }
   ): Promise<AgentStep> {
     const { ctx, conversation, agent, history, body, files } = x;
+    const pricing = x.budget.pricing;
     const conversationId = conversation.id;
     const grace = this.runCfg.cancelGraceMs;
     // Text streamed so far: what a cancelled turn keeps
@@ -2175,7 +2675,8 @@ export class AgentServer {
             { messages: toSdkMessages(history, attached) },
             new Set(readHitl(conversation.state)?.allowedTools ?? []),
             partial,
-            turn
+            turn,
+            x.budget
           )
         );
       }
@@ -2196,19 +2697,20 @@ export class AgentServer {
         }));
         const messages = (await this.resolveImages(raw, turn, "data-url")) as typeof raw;
 
+        const priced = (raw: unknown) => normalizeUsage(raw, { pricing, model: agent.chatCompletions!.model });
         if (!run.streaming) {
           const result = await invokeChatCompletions(agent.chatCompletions, messages, { signal: run.signal });
-          return withWarnings({ content: result.content, usage: result.usage, pending: [], cancelled: run.cancelled });
+          return withWarnings({ content: result.content, usage: priced(result.usage), pending: [], cancelled: run.cancelled });
         }
         let content = "";
-        let usage: SendMessageResponse["usage"];
+        let usage: UsageInfo | undefined;
         for await (const event of streamChatCompletions(agent.chatCompletions, messages, { signal: run.signal })) {
           if (event.type === "text") {
             partial.text += event.text;
             run.emit({ delta: event.text, frame: textFrame(event.text, false) });
           } else if (event.type === "done") {
             content = event.content;
-            usage = event.usage;
+            usage = priced(event.usage);
           }
         }
         return withWarnings({ content, usage, pending: [], cancelled: run.cancelled });
@@ -2229,12 +2731,13 @@ export class AgentServer {
         }));
 
         let content = "";
-        let usage: SendMessageResponse["usage"];
+        let usage: UsageInfo | undefined;
         let responseId: string | undefined;
+        const priced = (raw: unknown) => normalizeUsage(raw, { pricing, model: agent.responsesApi!.model });
         if (!run.streaming) {
           const result = await invokeResponsesApi(agent.responsesApi, messages, undefined, { signal: run.signal });
           content = result.content;
-          usage = result.usage;
+          usage = priced(result.usage);
           responseId = result.responseId;
         } else {
           for await (const event of streamResponsesApi(agent.responsesApi, messages, undefined, { signal: run.signal })) {
@@ -2243,18 +2746,19 @@ export class AgentServer {
               run.emit({ delta: event.text, frame: textFrame(event.text, false) });
             } else if (event.type === "done") {
               content = event.content;
-              usage = event.usage;
+              usage = priced(event.usage);
               responseId = event.responseId || undefined;
             }
           }
         }
-        // Store responseId in conversation state for potential chaining
-        if (responseId) {
-          await this.config.storage.updateConversation(conversationId, {
-            state: { ...conversation.state, lastResponseId: responseId },
-          }, ctx.context);
-        }
-        return withWarnings({ content, usage, pending: [], cancelled: run.cancelled });
+        // The id of the response is kept in the conversation's state for chaining (written with the rest of the turn)
+        return withWarnings({
+          content,
+          usage,
+          pending: [],
+          cancelled: run.cancelled,
+          ...(responseId ? { statePatch: { lastResponseId: responseId } } : {}),
+        });
       }
 
       if (agent.handler) {
@@ -2287,16 +2791,11 @@ export class AgentServer {
           // Send the full content as a single text event
           run.emit({ frame: textFrame(result.content, true) });
         }
-        // Update conversation state if provided
-        if (result.state) {
-          await this.config.storage.updateConversation(conversationId, {
-            state: result.state,
-          }, ctx.context);
-        }
+        // (the state it returned is stored with the rest of the turn, next to the server's own bookkeeping)
         return {
           content: result.content,
           files: result.files,
-          usage: result.usage,
+          usage: normalizeUsage(result.usage, { pricing }),
           pending,
           handlerState: result.state,
           handlerMetadata: result.metadata,
@@ -2354,16 +2853,22 @@ export class AgentServer {
     input: unknown,
     allowedTools: ReadonlySet<string>,
     partial: { text: string },
-    turn: TurnFiles
+    turn: TurnFiles,
+    budget: TurnBudget
   ): Promise<AgentStep> {
     const sdkAgent = agent.sdkAgent as HitlSdkAgent;
     const bridge = createSdkBridge(run, partial);
+    // A resumed turn starts from a state that already holds the usage of its earlier legs: they are not this run's.
+    // (A copy: agent-sdk adds this run's calls to the ledger it is handed, in place.)
+    const carried = snapshotLedger((input as { usage?: unknown } | null)?.usage);
     const config = {
       context: ctx.context,
       // An AbortSignal is a valid SDK cancellation token, and tools see it as their `signal`
       cancellationToken: run.signal,
       onEvent: bridge.onEvent,
       ...(run.streaming ? { stream: true, onStream: bridge.onStream } : {}),
+      // The conversation's budget stops the turn in the middle (when the agent can price its calls: see costEstimatorFromPricing)
+      ...(budget.limit ? { limits: { maxCostUsd: budget.limit.maxCostUsd } } : {}),
     };
     // An agent whose model reads image references itself (`withSessionImages`) is given references; for any other
     // the server reads the images now - they are put back to references before a paused state is stored.
@@ -2371,7 +2876,19 @@ export class AgentServer {
     const sdkInput = wrapped ? input : await this.hydrateSdkInput(input, turn);
     // The tools and the model wrapper find the conversation's files through the turn
     const raced = await run.raceCancel(
-      runWithTurnFiles(turn, () => runSdkTurn(sdkAgent, sdkInput, config, allowedTools)),
+      runWithTurnFiles(turn, () =>
+        runSdkTurn(sdkAgent, sdkInput, config, allowedTools, (action) =>
+          // A tool the person asked not to be asked about again was approved without asking: the log says so
+          run.emit({
+            events: [
+              {
+                type: EVENT_TYPES.actionResolved,
+                data: this.actionResolvedData(action, { type: "tool_approval", decision: "allow" }, "remembered", "remembered", { remembered: true }),
+              },
+            ],
+          })
+        )
+      ),
       this.runCfg.cancelGraceMs
     );
     if ("abandoned" in raced) return cancelledStep(partial.text);
@@ -2379,7 +2896,7 @@ export class AgentServer {
     const { result, pending } = raced.value;
     const sdkCtx = (result.state as { ctx?: Record<string, unknown> } | undefined)?.ctx;
     let content = result.content;
-    const usage = result.metadata?.usage as SendMessageResponse["usage"];
+    const usage = normalizeUsage(result.metadata?.usage, { previous: carried, pricing: budget.pricing });
 
     if (sdkCtx?.__cancelled) {
       return { ...cancelledStep(content || partial.text || bridge.finalChunkText), usage };
@@ -2404,6 +2921,12 @@ export class AgentServer {
       content = fallbackText;
     }
 
+    // agent-sdk stopped the turn on a cost limit, and the limit was the conversation's budget (not the agent's own cap)
+    const breach =
+      typeof sdkCtx?.__limitBreached === "string" &&
+      isCostLimitDetail(sdkCtx.__limitBreached) &&
+      budget.limit?.sessionBinds === true &&
+      pending.length === 0;
     return {
       content,
       usage,
@@ -2411,12 +2934,17 @@ export class AgentServer {
       sdkState: pending.length > 0 ? dehydrateImages(portableState(result.state)) : undefined,
       cancelled: false,
       limited: !!sdkCtx?.__limitBreached,
+      ...(breach && { budgetBreach: true }),
+      // Where to carry on from once the budget is raised (`pause` only: a `stop` budget ends the conversation)
+      ...(breach && budget.budget?.onReach === "pause" && result.state
+        ? { budgetState: dehydrateImages(portableState(result.state)) }
+        : {}),
       ...(typeof sdkCtx?.__limitBreached === "string" ? { detail: sdkCtx.__limitBreached } : {}),
     };
   }
 
   /**
-   * Stores what a step produced as the assistant message, records what it waits on, and reports
+   * Stores what a step produced as the assistant message, records what it waits on, settles the money, and reports
    * the end of the turn (events, then the legacy done frame). A pause whose state the store cannot hold
    * is not taken: the turn finishes with a `pause_state_too_large` warning.
    */
@@ -2425,11 +2953,16 @@ export class AgentServer {
     x: {
       ctx: RouteContext;
       conversation: Conversation;
+      agent: AgentRegistration;
       step: AgentStep;
       userMessage?: Message;
       /** The first message of the conversation: a title is generated from it. */
       firstExchange?: string;
-      allowedTools?: string[];
+      budget: TurnBudget;
+      /** Tools this turn's answer asked to remember for the session. */
+      rememberAdd?: string[];
+      /** How this turn's answer ended the actions of the paused message it continues. */
+      settled?: { messageId: string; entries: Map<string, SettledAction> };
     }
   ): Promise<TurnOutcome> {
     const { ctx, conversation, step } = x;
@@ -2439,22 +2972,39 @@ export class AgentServer {
     }
 
     // A cancelled step ends the turn: nothing it was waiting on is kept
-    const actions = step.cancelled ? [] : step.pending;
-    const wanted: StopReason = step.cancelled
+    const hitl = this.hitlFor(x.agent);
+    const actions = step.cancelled ? [] : stampDeadlines(step.pending, hitl.timeoutMinutes);
+    let wanted: StopReason = step.cancelled
       ? "cancelled"
       : actions.length > 0
         ? "requires_action"
         : step.stopReason ?? (step.limited || step.handlerStatus === "incomplete" ? "limit" : step.handlerStatus === "cancelled" ? "cancelled" : "end_turn");
 
+    // Money: what the turn cost goes on the conversation's total - also when it was cancelled - and a budget that is used
+    // up ends the turn. A pause for a person and a cancellation keep their own stop: the next turn is refused anyway.
+    const tb = x.budget;
+    const turnCostUsd = step.usage?.costUsd ?? 0;
+    const spentUsd = tb.pricing ? roundUsd(tb.spentBefore + turnCostUsd) : undefined;
+    const keepsOwnStop = step.cancelled || actions.length > 0;
+    const reached = !!tb.budget && spentUsd !== undefined && (step.budgetBreach === true || (!keepsOwnStop && spentUsd >= tb.budget.maxCostUsd));
+    if (reached && !keepsOwnStop) wanted = "budget_reached";
+
     const saved = await this.saveAssistantTurn(ctx, conversation, {
       content: step.content,
       files: step.files,
       handlerState: step.handlerState,
+      statePatch: step.statePatch,
       actions,
       sdkState: step.sdkState,
+      budgetState: reached ? step.budgetState : undefined,
       stopReason: wanted,
-      allowedTools: x.allowedTools,
+      // A turn that crossed the budget on its own finished its answer; one the budget cut short did not
+      status: wanted === "budget_reached" && !step.budgetBreach ? "completed" : undefined,
+      rememberAdd: x.rememberAdd,
       warnings: step.warnings,
+      onTimeout: hitl.onTimeout,
+      spend: tb.pricing ? { turnCostUsd, budget: tb.budget } : undefined,
+      settled: x.settled,
     });
     const assistant = saved.message;
     const stopReason = saved.stopReason;
@@ -2470,6 +3020,12 @@ export class AgentServer {
       noticeFrame = (seq) => ({ type: "stream.text", timestamp: Date.now(), text: notice, isFinal: true, seq } satisfies StreamTextEvent);
     }
 
+    const tokens = (usage: UsageInfo) => ({
+      input_tokens: usage.inputTokens,
+      output_tokens: usage.outputTokens,
+      total_tokens: usage.totalTokens,
+      ...(usage.cachedInputTokens !== undefined ? { cached_input_tokens: usage.cachedInputTokens } : {}),
+    });
     if (content !== "") {
       events.push({
         type: EVENT_TYPES.message,
@@ -2477,16 +3033,18 @@ export class AgentServer {
           content,
           message_id: assistant.id,
           stop_reason: stopReason,
-          ...(step.usage
-            ? { usage: { input_tokens: step.usage.inputTokens, output_tokens: step.usage.outputTokens, total_tokens: step.usage.totalTokens } }
-            : {}),
+          ...(step.usage ? { usage: { ...tokens(step.usage), ...(step.usage.costUsd !== undefined ? { cost_usd: step.usage.costUsd } : {}) } } : {}),
         },
       });
     }
-    if (step.usage) {
+    if (step.usage || tb.budget) {
       events.push({
         type: EVENT_TYPES.usage,
-        data: { input_tokens: step.usage.inputTokens, output_tokens: step.usage.outputTokens, total_tokens: step.usage.totalTokens },
+        data: {
+          ...(step.usage ? tokens(step.usage) : {}),
+          ...(spentUsd !== undefined ? { turn_cost_usd: turnCostUsd, spent_usd: spentUsd } : {}),
+          ...(tb.budget ? { budget: budgetWire(tb.budget) } : {}),
+        },
       });
     }
     for (const action of pendingActions) events.push({ type: EVENT_TYPES.actionRequired, data: actionRequiredData(action) });
@@ -2514,9 +3072,13 @@ export class AgentServer {
       }
     }
 
+    const budgetNow = tb.budget && spentUsd !== undefined ? tb.budget : undefined;
     const legacyStatus = saved.status && saved.status !== "completed" ? saved.status : undefined;
     run.emit({
       events: [
+        ...(stopReason === "budget_reached" && tb.budget
+          ? [{ type: EVENT_TYPES.budgetReached, data: { spent_usd: spentUsd, max_cost_usd: tb.budget.maxCostUsd, on_reach: tb.budget.onReach } }]
+          : []),
         {
           type: EVENT_TYPES.statusIdle,
           data: {
@@ -2538,18 +3100,13 @@ export class AgentServer {
         messageId: assistant.id,
         content,
         title: conversationTitle,
-        usage: step.usage
-          ? {
-              inputTokens: step.usage.inputTokens,
-              outputTokens: step.usage.outputTokens,
-              totalTokens: step.usage.totalTokens,
-            }
-          : undefined,
+        usage: step.usage,
         ...(legacyStatus && { status: legacyStatus }),
         ...(pendingActions.length > 0 && { pendingActions }),
         ...(saved.warnings && { warnings: saved.warnings }),
         stopReason,
         runId: run.id,
+        ...(budgetNow && { budget: budgetNow, spentUsd }),
         seq,
       } satisfies StreamDoneEvent),
     });
@@ -2565,14 +3122,15 @@ export class AgentServer {
       warnings: saved.warnings,
       conversationTitle,
       handlerMetadata: step.handlerMetadata,
+      ...(budgetNow && { budget: budgetNow, spentUsd }),
     };
   }
 
   /**
-   * Saves the assistant message of a turn and what it waits on. A pause whose state the
-   * store cannot hold (`limits.maxStateBytes`, or the provider's own limit) is not taken:
-   * the turn finishes as if it had not paused and the message carries a
-   * `pause_state_too_large` warning, instead of failing after the message was written.
+   * Saves the assistant message of a turn and what it waits on, and brings the conversation's state up to date (the
+   * pause, the money, remembered tools) in one compare-and-set write. A pause whose state the
+   * store cannot hold (`limits.maxStateBytes`, or the provider's own limit) is not taken: the turn finishes as if
+   * it had not paused and the message carries a `pause_state_too_large` warning, instead of failing after the message was written.
    */
   private async saveAssistantTurn(
     ctx: RouteContext,
@@ -2582,14 +3140,23 @@ export class AgentServer {
       files?: Message["files"];
       /** State a handler wrote this turn; without it the conversation's own is kept. */
       handlerState?: Record<string, unknown>;
+      statePatch?: Record<string, unknown>;
       actions: PendingAction[];
       sdkState?: unknown;
+      /** The agent-sdk state to carry on from after a budget stop. */
+      budgetState?: unknown;
       /** Why the turn stopped, unless the pause is dropped (then it simply ended). */
       stopReason: StopReason;
-      /** Remembered tools to store (a resolve may have added one); default: the ones already stored. */
-      allowedTools?: string[];
+      /** The message status when it is not the one the stop reason implies. */
+      status?: MessageStatus;
+      /** Tools this turn's answer asked to remember. */
+      rememberAdd?: string[];
       /** Warnings the turn already has (about its files); the message carries them. */
       warnings?: TurnWarning[];
+      onTimeout: "deny" | "cancel";
+      spend?: { turnCostUsd: number; budget: SessionBudget | null };
+      /** The actions of the message this turn continues that the turn's answer ended. */
+      settled?: { messageId: string; entries: Map<string, SettledAction> };
     }
   ): Promise<{
     message: Message;
@@ -2598,35 +3165,49 @@ export class AgentServer {
     status: MessageStatus;
     warnings?: TurnWarning[];
   }> {
-    let { actions, sdkState, content, stopReason } = turn;
+    let { actions, sdkState, budgetState, content, stopReason } = turn;
     let warnings: TurnWarning[] | undefined = turn.warnings?.length ? [...turn.warnings] : undefined;
 
     const dropPause = (bytes: number | undefined) => {
       const max = this.maxStateBytes;
+      const what = actions.length > 0 ? "paused state" : "state to carry on from";
       warnings = [
         ...(warnings ?? []),
         {
           code: "pause_state_too_large",
-          message: `The paused state${bytes ? ` (${bytes} bytes)` : ""} does not fit the ${max} byte limit, so the turn was not paused`,
+          message: `The ${what}${bytes ? ` (${bytes} bytes)` : ""} does not fit the ${max} byte limit, so the turn was not paused`,
           ...(bytes && { stateBytes: bytes }),
           maxStateBytes: max,
         },
       ];
+      const waited = actions.length > 0;
       actions = [];
       sdkState = undefined;
+      budgetState = undefined;
       if (stopReason === "requires_action") stopReason = "end_turn";
-      if (!content) content = PAUSE_NOT_STORED_NOTICE;
+      if (waited && !content) content = PAUSE_NOT_STORED_NOTICE;
     };
 
-    if (actions.length > 0) {
-      const state = this.pausedState(conversation, turn.handlerState, "msg_".padEnd(25, "x"), actions, sdkState, turn.allowedTools);
+    const plan = (messageId: string) => ({
+      baseState: turn.handlerState,
+      statePatch: turn.statePatch,
+      pending: actions.length > 0 ? { actions, messageId, sdkState, onTimeout: turn.onTimeout } : undefined,
+      budgetPause: budgetState !== undefined ? { sdkState: budgetState, messageId } : undefined,
+      rememberAdd: turn.rememberAdd,
+      spend: turn.spend,
+    });
+
+    if (actions.length > 0 || budgetState !== undefined) {
+      const { state } = this.composeState(conversation, plan("msg_".padEnd(25, "x")));
       const bytes = Buffer.byteLength(JSON.stringify(state));
       if (bytes > this.maxStateBytes) dropPause(bytes);
     }
 
+    let message!: Message;
+    let status: MessageStatus = turn.status ?? statusForStop(stopReason);
     for (let attempt = 0; ; attempt++) {
-      const status = statusForStop(stopReason);
-      const message = await this.config.storage.createMessage({
+      status = turn.status ?? statusForStop(stopReason);
+      message = await this.config.storage.createMessage({
         conversationId: conversation.id,
         role: "assistant",
         content,
@@ -2636,62 +3217,38 @@ export class AgentServer {
           status,
           stopReason,
           ...(warnings && { warnings }),
+          // What was asked, so a history can show it - and, once it is answered, how
+          ...(actions.length > 0 && { pendingActions: openSnapshot(actions) }),
         },
       }, ctx.context);
       try {
-        await this.persistPendingActions(ctx, conversation, turn.handlerState, message.id, actions, sdkState, turn.allowedTools);
-        return { message, actions, stopReason, status, warnings };
+        // A plain turn changes nothing in the conversation record: it is not even read again. (Under the conversation's
+        // lease nothing else changes what decides that: the pause, the remembered tools, the spend.)
+        const touches = this.composeState(conversation, plan(message.id)).changed || !!conversation.actionDueAt;
+        if (touches) {
+          await this.mutateConversation(conversation.id, ctx.context, (fresh) => {
+            const { state, changed } = this.composeState(fresh, plan(message.id));
+            const due = earliestDeadline(actions);
+            const dueChange = due ?? (fresh.actionDueAt ? null : undefined);
+            if (!changed && dueChange === undefined) return null;
+            return { state, ...(dueChange !== undefined && { actionDueAt: dueChange }) };
+          });
+        }
+        break;
       } catch (error) {
         // Never leave an assistant message that says it waits on an action the store did not keep
         await this.config.storage.deleteMessage(message.id, ctx.context).catch(() => undefined);
         const tooLarge = (error as { code?: string } | null)?.code === "STORAGE_LIMIT_EXCEEDED";
-        if (attempt === 0 && actions.length > 0 && tooLarge) {
+        if (attempt === 0 && (actions.length > 0 || budgetState !== undefined) && tooLarge) {
           dropPause(undefined);
           continue;
         }
         throw error;
       }
     }
-  }
-
-  /** The conversation state as it is stored while the turn waits on `actions`. */
-  private pausedState(
-    conversation: Conversation,
-    baseState: Record<string, unknown> | undefined,
-    messageId: string,
-    actions: PendingAction[],
-    sdkState: unknown,
-    allowedTools?: string[]
-  ): Record<string, unknown> {
-    const before = readHitl(conversation.state);
-    const remembered = allowedTools ?? before?.allowedTools;
-    const store: HitlStore = {
-      ...(remembered?.length && { allowedTools: remembered }),
-      ...(actions.length > 0 && { pending: { actions, messageId, ...(sdkState !== undefined && { sdkState }) } }),
-    };
-    return writeHitl(baseState ?? conversation.state, store);
-  }
-
-  /**
-   * Records what a turn is waiting on (or clears it) so a reload can render
-   * it and a resolve can continue. `baseState` is the state the handler just
-   * wrote, if any; without it the conversation's current state is kept.
-   * No-op for agents that never pause.
-   */
-  private async persistPendingActions(
-    ctx: RouteContext,
-    conversation: Conversation,
-    baseState: Record<string, unknown> | undefined,
-    messageId: string,
-    actions: PendingAction[],
-    sdkState?: unknown,
-    allowedTools?: string[]
-  ): Promise<void> {
-    const before = readHitl(conversation.state);
-    if (actions.length === 0 && !before?.pending) return;
-    await this.config.storage.updateConversation(conversation.id, {
-      state: this.pausedState(conversation, baseState, messageId, actions, sdkState, allowedTools),
-    }, ctx.context);
+    // The state is stored; now the paused message this turn continues learns how its actions ended
+    if (turn.settled) await this.settleOnMessage(turn.settled.messageId, turn.settled.entries, ctx.context);
+    return { message, actions, stopReason, status, warnings };
   }
 
   /** The error of a failed stream as the legacy `stream.error` event (honours `maskServerErrors`). */
@@ -2746,6 +3303,38 @@ export class AgentServer {
     return bad('resolution.type must be "tool_approval" or "user_question"');
   }
 
+  /**
+   * Takes the conversation for an answer. An answer that meets another answer being recorded waits for it (up to
+   * `hitl.resolveWaitMs`) instead of failing, so the several actions of one pause can be answered at the same time; a
+   * message or a continuation that takes as long as the model is not waited for.
+   */
+  private async beginResolveRun(
+    ctx: RouteContext,
+    conversation: Conversation,
+    trigger: RunTrigger,
+    streaming: boolean,
+    kind: RunKind = "resolve"
+  ): Promise<ActiveRun> {
+    const deadline = Date.now() + this.resolveWaitMs;
+    for (;;) {
+      try {
+        return await this.beginRun(ctx, conversation, kind, trigger, streaming);
+      } catch (error) {
+        const busy = error as { code?: string; runKind?: string } | null;
+        if (busy?.code !== "conversation_busy" || Date.now() >= deadline) throw error;
+        const local = this.runs.get(conversation.id);
+        if (local) {
+          if (local.kind !== "resolve") throw error;
+          // (until it gives the conversation back: a run that has not even started has no result to wait for yet)
+          await this.releasedWithin(local, deadline - Date.now());
+        } else {
+          if (busy.runKind !== "resolve") throw error;
+          await new Promise((resolve) => setTimeout(resolve, 40));
+        }
+      }
+    }
+  }
+
   private async handleResolveAction(ctx: RouteContext): Promise<RouteResult<ResolveActionResponse>> {
     const { conversationId, actionId } = ctx.params;
     const body = ctx.body as ResolveActionRequest | undefined;
@@ -2755,7 +3344,9 @@ export class AgentServer {
     if (!initial) {
       throw { statusCode: 404, code: "NOT_FOUND", message: `Conversation not found: ${conversationId}` } as NotFoundError;
     }
-    await this.verifyConversationAccess(initial, ctx);
+    // Who may answer: the owner of the conversation - unless the host says (`hitl.authorizeResolve`), who then decides for everyone
+    const authorize = this.config.hitl?.authorizeResolve;
+    if (!authorize) await this.verifyConversationAccess(initial, ctx);
 
     const agent = await this.getAgentFor(initial.agentId, ctx.context);
     if (!agent) {
@@ -2767,11 +3358,12 @@ export class AgentServer {
       throw { statusCode: 404, code: "NOT_FOUND", message: "This agent does not support resolving actions" } as NotFoundError;
     }
 
-    // Answering is a turn like any other: one at a time. A second answer to the same pause (a double
-    // click, two tabs) meets the first one's run and is refused.
+    // Answering is a turn like any other: one at a time. An answer that meets another answer waits for it a moment;
+    // a second answer to the same action then finds it answered.
     const streaming = !!body?.stream;
-    const run = await this.beginRun(ctx, initial, "resolve", "resume", streaming);
+    const run = await this.beginResolveRun(ctx, initial, "resume", streaming);
     let resolveRun!: ResolveRun;
+    let budget: TurnBudget | undefined;
     try {
       // Read again under the lease: another request may have answered since the check above
       const conversation = (await this.config.storage.getConversation(conversationId, ctx.context)) ?? initial;
@@ -2779,6 +3371,17 @@ export class AgentServer {
       const action = store?.pending?.actions.find((a) => a.id === actionId);
       if (!store?.pending || !action) {
         throw { statusCode: 409, code: "action_not_pending", message: `Action is not pending: ${actionId}` };
+      }
+      if (isExpired(action)) {
+        throw {
+          statusCode: 410,
+          code: "action_expired",
+          message: `This request lapsed at ${action.expiresAt} and can no longer be answered`,
+          details: { actionId, expiresAt: action.expiresAt },
+        };
+      }
+      if (authorize && !(await authorize(ctx.context!, { conversation: this.publicConversation(conversation), action }))) {
+        throw { statusCode: 403, code: "action_forbidden", message: "You are not allowed to answer this request" };
       }
       if (action.type !== resolution.type) {
         throw {
@@ -2788,7 +3391,19 @@ export class AgentServer {
         } as ValidationError;
       }
 
+      // Edited arguments have to be arguments the tool accepts
+      const edited =
+        action.type === "tool_approval" &&
+        resolution.type === "tool_approval" &&
+        resolution.decision === "allow" &&
+        resolution.approvedArgs !== undefined &&
+        !isDeepStrictEqual(resolution.approvedArgs, action.args ?? {});
+      if (edited && useSdk && this.hitlFor(agent).validateApprovedArgs) {
+        this.checkApprovedArgs(agent, action as Extract<PendingAction, { type: "tool_approval" }>, (resolution as Extract<ActionResolution, { type: "tool_approval" }>).approvedArgs!);
+      }
+
       // Apply the decision to the paused SDK state up front, so an invalid answer is a plain 400.
+      const actor = ctx.context?.user?.id ?? ctx.user?.id ?? "anonymous";
       let nextSdkState: unknown;
       if (useSdk) {
         if (store.pending.sdkState === undefined) {
@@ -2810,14 +3425,18 @@ export class AgentServer {
           } as ValidationError;
         }
       }
-      resolveRun = { ctx, conversation, agent, store, action, resolution, nextSdkState, metadata: body?.metadata };
+
+      // The answer that lets the model run again needs a budget with something left (402 before anything is recorded)
+      const lastOpen = store.pending.actions.length === 1;
+      if (lastOpen || !useSdk) budget = this.planTurnBudget(conversation, agent, (nextSdkState as { usage?: unknown } | undefined)?.usage);
+      resolveRun = { ctx, conversation, agent, store, action, resolution, nextSdkState, metadata: body?.metadata, actor, channel: "api", edited };
     } catch (error) {
       await this.endRun(run);
       throw error;
     }
 
     const stream = streaming ? this.attachStream(run) : undefined;
-    this.launch(run, ctx, () => this.executeResolve(run, resolveRun));
+    this.launch(run, ctx, () => this.executeResolve(run, resolveRun, budget));
     if (stream) return { status: 200, headers: SSE_HEADERS, stream: stream.generator, close: stream.close };
 
     const outcome = await run.done;
@@ -2832,21 +3451,51 @@ export class AgentServer {
         ...(outcome.warnings && { warnings: outcome.warnings }),
         stopReason: outcome.stopReason,
         runId: run.id,
+        ...(outcome.budget && { budget: outcome.budget, spentUsd: outcome.spentUsd }),
       },
     };
   }
 
+  /** 400 `invalid_approved_args` when the tool's schema does not accept the arguments the person edited the approval to. */
+  private checkApprovedArgs(
+    agent: AgentRegistration,
+    action: Extract<PendingAction, { type: "tool_approval" }>,
+    approvedArgs: Record<string, unknown>
+  ): void {
+    const schema = findToolSchema(agent.sdkAgent, action.toolName);
+    if (schema === undefined) return; // the agent does not say what the tool takes: nothing to check against
+    const problem = validateAgainstSchema(schema, approvedArgs);
+    if (problem) {
+      throw {
+        statusCode: 400,
+        code: "invalid_approved_args",
+        message: `The edited arguments are not valid for ${action.toolName}: ${problem}`,
+        details: { toolName: action.toolName },
+      };
+    }
+  }
+
   /**
-   * Resolves one action and, when nothing else is pending, continues the turn.
+   * Records one answer and, when it was the last open action of the pause, continues the turn. An answer that leaves
+   * other actions open is written with a compare-and-set against the conversation as it is now (the decision applied
+   * to the stored state, never to a copy read earlier), so answers to the actions of one pause lose none of each other.
    */
-  private async executeResolve(run: ActiveRun, resolveRun: ResolveRun): Promise<TurnOutcome> {
-    const { ctx, conversation, agent, store, action, resolution } = resolveRun;
+  private async executeResolve(run: ActiveRun, resolveRun: ResolveRun, budget?: TurnBudget): Promise<TurnOutcome> {
+    const { ctx, conversation, agent, store, action, resolution, actor } = resolveRun;
     const conversationId = conversation.id;
     const pending = store.pending!;
-    const actor = ctx.context?.user?.id ?? ctx.user?.id ?? "anonymous";
+    const sdk = agent.sdkAgent as HitlSdkAgent | undefined;
 
     run.emit({
-      events: [{ type: EVENT_TYPES.actionResolved, data: this.actionResolvedData(action, resolution, actor, "api") }],
+      events: [
+        {
+          type: EVENT_TYPES.actionResolved,
+          data: this.actionResolvedData(action, resolution, actor, resolveRun.channel, {
+            edited: resolveRun.edited,
+            expired: resolveRun.expired,
+          }),
+        },
+      ],
       frame: (seq) => [
         {
           type: "stream.start",
@@ -2864,18 +3513,21 @@ export class AgentServer {
             type: resolution.type,
             ...(resolution.type === "tool_approval" && { decision: resolution.decision }),
             ...(resolution.type === "user_question" && resolution.cancelled && { cancelled: true }),
+            ...(resolveRun.expired && { expired: true }),
           },
           seq,
         } satisfies StreamActionResolvedEvent,
       ],
     });
 
+    const answered: SettledAction = { status: "resolved", resolution, resolvedBy: actor, resolvedAt: new Date() };
     const remaining = pending.actions.filter((a) => a.id !== action.id);
     const allowedTools = new Set(store.allowedTools ?? []);
+    const rememberAdd: string[] = [];
     const partial = { text: "" };
     let step: AgentStep;
 
-    if (agent.sdkAgent) {
+    if (sdk) {
       if (resolution.type === "tool_approval" && resolution.decision === "allow" && resolution.rememberForSession
         && this.config.allowRememberApproval !== false) {
         const toolName = (action as Extract<PendingAction, { type: "tool_approval" }>).toolName;
@@ -2883,16 +3535,39 @@ export class AgentServer {
         const runtimeTools = (agent.sdkAgent as { __runtime?: { tools?: Array<{ name?: string; needsApproval?: unknown }> } }).__runtime?.tools;
         const predicateGated = Array.isArray(runtimeTools)
           && runtimeTools.some((t) => t?.name === toolName && typeof t.needsApproval === "function");
-        if (!predicateGated) allowedTools.add(toolName);
+        if (!predicateGated) {
+          allowedTools.add(toolName);
+          rememberAdd.push(toolName);
+        }
       }
 
       if (remaining.length > 0) {
         // More actions of the same pause are still open: record this answer and wait.
-        const state = writeHitl(conversation.state, {
-          allowedTools: [...allowedTools],
-          pending: { actions: remaining, messageId: pending.messageId, sdkState: jsonSafe(resolveRun.nextSdkState) },
+        await this.mutateConversation(conversationId, ctx.context, (fresh) => {
+          const freshStore = readHitl(fresh.state);
+          const freshPending = freshStore?.pending;
+          const stillOpen = freshPending?.actions.find((a) => a.id === action.id);
+          if (!freshPending || !stillOpen) {
+            throw { statusCode: 409, code: "action_not_pending", message: `Action is not pending: ${action.id}` };
+          }
+          if (freshPending.sdkState === undefined) {
+            throw { statusCode: 409, code: "action_not_pending", message: `Action cannot be resumed: ${action.id}` };
+          }
+          const left = freshPending.actions.filter((a) => a.id !== action.id);
+          if (left.length === 0) {
+            throw { statusCode: 409, code: "conversation_conflict", message: "The conversation changed while the answer was recorded. Try again." };
+          }
+          // the decision goes onto the state as it is NOW
+          const applied = applySdkResolution(sdk, jsonSafe(freshPending.sdkState), stillOpen, resolution, actor);
+          const hitl: HitlStore = {
+            ...freshStore,
+            allowedTools: [...new Set([...(freshStore?.allowedTools ?? []), ...rememberAdd])],
+            pending: { ...freshPending, actions: left, sdkState: jsonSafe(applied) },
+          };
+          return { state: writeHitl(fresh.state, hitl), actionDueAt: earliestDeadline(left) ?? (fresh.actionDueAt ? null : undefined) };
         });
-        await this.config.storage.updateConversation(conversationId, { state }, ctx.context);
+        await this.settleOnMessage(pending.messageId, new Map([[action.id, answered]]), ctx.context);
+
         const paused = await this.config.storage.getMessage(pending.messageId, ctx.context);
         const now = new Date();
         const assistant: Message =
@@ -2933,7 +3608,7 @@ export class AgentServer {
 
       run.emit({ events: [{ type: EVENT_TYPES.statusRunning, data: { trigger: run.trigger } }] });
       try {
-        step = await this.runSdk(run, ctx, agent, resolveRun.nextSdkState, allowedTools, partial, this.turnFilesFor(conversationId, agent, ctx.context));
+        step = await this.runSdk(run, ctx, agent, resolveRun.nextSdkState, allowedTools, partial, this.turnFilesFor(conversationId, agent, ctx.context), budget!);
       } catch (error) {
         if (run.cancelled) step = cancelledStep(partial.text);
         else throw error;
@@ -2974,7 +3649,7 @@ export class AgentServer {
           step = {
             content: result.content,
             files: result.files,
-            usage: result.usage,
+            usage: normalizeUsage(result.usage, { pricing: budget?.pricing }),
             pending: newPending,
             handlerState: result.state ?? conversation.state,
             handlerMetadata: result.metadata,
@@ -2989,7 +3664,151 @@ export class AgentServer {
       }
     }
 
-    return this.finalizeTurn(run, { ctx, conversation, step, allowedTools: [...allowedTools] });
+    return this.finalizeTurn(run, {
+      ctx,
+      conversation,
+      agent,
+      step,
+      budget: budget!,
+      rememberAdd,
+      settled: { messageId: pending.messageId, entries: new Map([[action.id, answered]]) },
+    });
+  }
+
+  // ============================================================================
+  // Continue (after the budget stopped a turn)
+  // ============================================================================
+
+  /**
+   * Carries on a turn the conversation's budget stopped in the middle - with no new message. The agent resumes from the
+   * state it stopped in. Needs the budget to allow it (raise it first: 402 `budget_reached`), nothing to be waiting on a
+   * person (409 `action_pending`) and a stopped turn to carry on (409 `nothing_to_continue`).
+   */
+  private async handleContinue(ctx: RouteContext): Promise<RouteResult<ResolveActionResponse>> {
+    const { conversationId } = ctx.params;
+    const body = (ctx.body ?? {}) as ContinueConversationRequest;
+    const streaming = !!body.stream;
+    const { conversation: initial, agent } = await this.loadForTurn(conversationId, ctx);
+
+    const run = await this.beginRun(ctx, initial, "continue", "resume", streaming);
+    let conversation: Conversation = initial;
+    let budget!: TurnBudget;
+    let carried: Record<string, unknown> | undefined;
+    let allowedTools: Set<string>;
+    let fromMessageId: string;
+    try {
+      conversation = (await this.config.storage.getConversation(conversationId, ctx.context)) ?? initial;
+      const store = readHitl(conversation.state);
+      if (store?.pending) {
+        throw {
+          statusCode: 409,
+          code: "action_pending",
+          message: "The conversation is waiting for a pending action to be resolved",
+          details: { pendingActionIds: store.pending.actions.map((a) => a.id) },
+        };
+      }
+      const pause = store?.budgetPause;
+      if (!pause || !agent.sdkAgent) {
+        throw {
+          statusCode: 409,
+          code: "nothing_to_continue",
+          message: "No turn was stopped by the budget, so there is nothing to carry on. Send a message to go on.",
+        };
+      }
+      // The stopped state, without the verdicts that stopped it
+      carried = jsonSafe(pause.sdkState) as Record<string, unknown>;
+      if (carried?.ctx && typeof carried.ctx === "object") {
+        const { __limitBreached: _breached, __cancelled: _cancelled, ...rest } = carried.ctx as Record<string, unknown>;
+        carried.ctx = rest;
+      }
+      allowedTools = new Set(store?.allowedTools ?? []);
+      fromMessageId = pause.messageId;
+      budget = this.planTurnBudget(conversation, agent, carried?.usage);
+    } catch (error) {
+      await this.endRun(run);
+      throw error;
+    }
+
+    const stream = streaming ? this.attachStream(run) : undefined;
+    this.launch(run, ctx, async () => {
+      run.emit({
+        events: [{ type: EVENT_TYPES.statusRunning, data: { trigger: run.trigger } }],
+        frame: (seq) => ({
+          type: "stream.start",
+          timestamp: Date.now(),
+          conversationId,
+          messageId: fromMessageId,
+          seq,
+        } satisfies StreamStartEvent),
+      });
+      const partial = { text: "" };
+      let step: AgentStep;
+      try {
+        step = await this.runSdk(run, ctx, agent, carried, allowedTools, partial, this.turnFilesFor(conversationId, agent, ctx.context), budget);
+      } catch (error) {
+        if (run.cancelled) step = cancelledStep(partial.text);
+        else throw error;
+      }
+      return this.finalizeTurn(run, { ctx, conversation, agent, step, budget });
+    });
+    if (stream) return { status: 200, headers: SSE_HEADERS, stream: stream.generator, close: stream.close };
+
+    const outcome = await run.done;
+    if (outcome.error) throw outcome.error;
+    return {
+      status: 200,
+      body: {
+        response: publicMessage(outcome.assistant!),
+        usage: outcome.usage,
+        ...(outcome.status && outcome.status !== "completed" && { status: outcome.status }),
+        ...(outcome.pendingActions.length > 0 && { pendingActions: outcome.pendingActions }),
+        ...(outcome.warnings && { warnings: outcome.warnings }),
+        stopReason: outcome.stopReason,
+        runId: run.id,
+        ...(outcome.budget && { budget: outcome.budget, spentUsd: outcome.spentUsd }),
+      },
+    };
+  }
+
+  // ============================================================================
+  // Remembered tools
+  // ============================================================================
+
+  private async handleListRememberedTools(ctx: RouteContext): Promise<RouteResult<RememberedToolsResponse>> {
+    const { conversationId } = ctx.params;
+    const conversation = await this.config.storage.getConversation(conversationId, ctx.context);
+    if (!conversation) {
+      throw { statusCode: 404, code: "NOT_FOUND", message: `Conversation not found: ${conversationId}` } as NotFoundError;
+    }
+    await this.verifyConversationAccess(conversation, ctx);
+    return { status: 200, body: { tools: [...(readHitl(conversation.state)?.allowedTools ?? [])] } };
+  }
+
+  /** Takes a tool off the list of those the person asked not to be asked about again: the next call asks again. */
+  private async handleRevokeRememberedTool(ctx: RouteContext): Promise<RouteResult<RememberedToolsResponse>> {
+    const { conversationId } = ctx.params;
+    let tool = ctx.params.tool ?? "";
+    try {
+      tool = decodeURIComponent(tool);
+    } catch {
+      // (not percent-encoded after all)
+    }
+    const existing = await this.config.storage.getConversation(conversationId, ctx.context);
+    if (!existing) {
+      throw { statusCode: 404, code: "NOT_FOUND", message: `Conversation not found: ${conversationId}` } as NotFoundError;
+    }
+    await this.verifyConversationAccess(existing, ctx);
+
+    let tools: string[] = [];
+    await this.mutateConversation(conversationId, ctx.context, (fresh) => {
+      const store = readHitl(fresh.state);
+      if (!store?.allowedTools?.includes(tool)) {
+        throw { statusCode: 404, code: "NOT_FOUND", message: `The tool is not remembered for this conversation: ${tool}` } as NotFoundError;
+      }
+      tools = store.allowedTools.filter((name) => name !== tool);
+      return { state: writeHitl(fresh.state, { ...store, allowedTools: tools }) };
+    });
+    return { status: 200, body: { tools } };
   }
 
   // ============================================================================
@@ -3048,6 +3867,22 @@ export class AgentServer {
     return { cancelled: cancelledIds.length > 0, settled: true, cancelledActionIds: cancelledIds, stopReason: "cancelled" };
   }
 
+  /** Whether the run has given the conversation back within `ms`. */
+  private async releasedWithin(run: ActiveRun, ms: number): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        run.released.then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), Math.max(1, ms));
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /** Whether the run has finished within `ms`. */
   private async settledWithin(run: ActiveRun, ms: number): Promise<boolean> {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -3069,22 +3904,17 @@ export class AgentServer {
     const routeCtx = { params: {}, query: {}, context: rc, user: rc?.user } as RouteContext;
     const run = await this.beginRun(routeCtx, conversation, "resolve", "resume", false);
     try {
-      const fresh = (await this.config.storage.getConversation(conversation.id, rc)) ?? conversation;
-      const store = readHitl(fresh.state);
-      if (!store?.pending) return [];
-      const state = writeHitl(fresh.state, { allowedTools: store.allowedTools });
-      await this.config.storage.updateConversation(fresh.id, { state }, rc);
-      run.emit({
-        events: [
-          ...store.pending.actions.map((action) => ({
-            type: EVENT_TYPES.actionResolved,
-            data: this.actionResolvedData(action, undefined, rc?.user?.id ?? "anonymous", "api", true),
-          })),
-          { type: EVENT_TYPES.statusIdle, data: { stop_reason: "cancelled" } },
-        ],
+      const closed = await this.closePause(conversation.id, rc, {
+        status: () => "cancelled",
+        by: rc?.user?.id ?? "anonymous",
+        channel: "api",
+        moreEvents: [{ type: EVENT_TYPES.statusIdle, data: { stop_reason: "cancelled" } }],
+        emit: (events) => {
+          run.emit({ events: events.map((e) => ({ type: e.type, data: e.data ?? {} })) });
+        },
       });
       await run.flush();
-      return store.pending.actions.map((a) => a.id);
+      return closed.actions.map((a) => a.id);
     } finally {
       await this.endRun(run);
       if (run.taskId) await this.syncTask(run, { content: "", stopReason: "cancelled", pendingActions: [], partial: false }, rc);
@@ -3330,11 +4160,16 @@ export class AgentServer {
       const activeRunId = active?.id ?? (lease?.data?.runId as string | undefined);
       const running = !!active || !!lease;
       const stop = summary?.stopReason as StopReason | undefined;
+      // Paused on its budget: the last turn stopped on it, the conversation is set to wait, and the budget is still used up
+      // (raising or removing it makes the conversation idle again, ready to continue)
+      const budget = this.effectiveBudget(conversation);
+      const budgetPaused =
+        stop === "budget_reached" && budget?.onReach === "pause" && this.spentOf(conversation) >= budget.maxCostUsd;
       const status: ConversationRuntime["status"] = running
         ? "running"
         : pendingActionIds.length > 0
           ? "requires_action"
-          : stop === "budget_reached"
+          : budgetPaused
             ? "budget_paused"
             : "idle";
       out.set(conversation.id, {
@@ -3366,9 +4201,12 @@ export class AgentServer {
   }
 
   private async sweep(): Promise<void> {
-    if (this.closed || !this.config.storage.isConnected()) return;
+    if (this.closed || this.sweeping || !this.config.storage.isConnected()) return;
+    this.sweeping = true;
     try {
       await this.recoverStaleRuns();
+      // (the turns it sets going are runs like any other: the sweep does not wait for them)
+      await this.expireLapsed({}, false);
       await this.pruneOldEvents();
       await this.purgeDueFiles();
     } catch (error) {
@@ -3377,6 +4215,193 @@ export class AgentServer {
       if (!this.sweepWarned) {
         this.sweepWarned = true;
         console.error("[AgentServer] The recovery sweep failed (further failures are not logged):", error);
+      }
+    } finally {
+      this.sweeping = false;
+    }
+  }
+
+  // ============================================================================
+  // Requests that lapsed
+  // ============================================================================
+
+  /**
+   * Handles the approvals and questions nobody answered in time (`PendingAction.expiresAt`), per the agent's
+   * `onTimeout`: `"deny"` answers each as a refusal (a question as skipped) and, once nothing else is open, lets the agent carry
+   * on - as a run of its own, `session.status_running` with `trigger: "timeout"`; `"cancel"` drops the pause, and the turn ends with
+   * `stopReason: "cancelled"`. The server does it by itself in the recovery sweep (`runs.sweepIntervalMs`); call it to do it
+   * now. With `conversationId` it looks at that conversation only (also for a store without `capabilities().actionDeadlines`,
+   * which the sweep cannot search). Resolves when the continuations it started have finished.
+   */
+  async expirePendingActions(
+    options: { now?: Date; conversationId?: string } = {}
+  ): Promise<{ conversations: number; expired: number; denied: number; continued: number }> {
+    return this.expireLapsed(options, true);
+  }
+
+  private async expireLapsed(
+    options: { now?: Date; conversationId?: string },
+    wait: boolean
+  ): Promise<{ conversations: number; expired: number; denied: number; continued: number }> {
+    const storage = this.config.storage;
+    const now = options.now ?? new Date();
+    const rc = this.systemContext();
+    const result = { conversations: 0, expired: 0, denied: 0, continued: 0 };
+    const continuing: Promise<unknown>[] = [];
+
+    const handle = async (conversation: Conversation): Promise<boolean> => {
+      try {
+        return await this.expireConversation(conversation, now, result, continuing);
+      } catch (error) {
+        console.error(`[AgentServer] Could not handle the expired requests of conversation ${conversation.id}:`, error);
+        return false;
+      }
+    };
+
+    if (options.conversationId) {
+      const conversation = await storage.getConversation(options.conversationId, rc);
+      if (conversation) await handle(conversation);
+    } else if (storage.capabilities?.().actionDeadlines === true) {
+      // A handled conversation leaves the due list; one that could not be handled (it is busy) stays, so the page skips it
+      let skip = 0;
+      for (let round = 0; round < 40; round++) {
+        const page = await storage.getConversations({ actionDueBefore: now, limit: 50, offset: skip }, rc);
+        if (page.data.length === 0) break;
+        for (const conversation of page.data) {
+          if (!(await handle(conversation))) skip++;
+        }
+        if (page.data.length < 50) break;
+      }
+    }
+    if (wait) await Promise.all(continuing);
+    return result;
+  }
+
+  /** Resolves whether the conversation's deadline marker is dealt with (false: it is busy, try again next time). */
+  private async expireConversation(
+    conversation: Conversation,
+    now: Date,
+    result: { conversations: number; expired: number; denied: number; continued: number },
+    continuing: Promise<unknown>[]
+  ): Promise<boolean> {
+    const storage = this.config.storage;
+    const owner: RequestContext = {
+      user: conversation.userId ? { id: conversation.userId } : undefined,
+      data: { system: true, timeout: true },
+    };
+    const routeCtx = { params: {}, query: {}, context: owner, user: owner.user } as RouteContext;
+
+    let run: ActiveRun;
+    try {
+      run = await this.beginRun(routeCtx, conversation, "resolve", "timeout", false);
+    } catch (error) {
+      if ((error as { code?: string } | null)?.code === "conversation_busy") return false;
+      throw error;
+    }
+
+    // Under the lease: look at the conversation as it is now
+    let handedOver = false;
+    let dropped = false;
+    try {
+      const fresh = (await storage.getConversation(conversation.id, owner)) ?? conversation;
+      const store = readHitl(fresh.state);
+      const due = store?.pending?.actions.filter((action) => isExpired(action, now)) ?? [];
+      if (!store?.pending || due.length === 0) {
+        // The marker is out of date (the pause was answered, or its next deadline is later): put it right
+        await this.mutateConversation(fresh.id, owner, (current) => {
+          const wanted = earliestDeadline(readHitl(current.state)?.pending?.actions ?? []);
+          if ((wanted?.getTime() ?? null) === (current.actionDueAt?.getTime() ?? null)) return null;
+          return { actionDueAt: wanted ?? null };
+        });
+        return true;
+      }
+
+      result.conversations++;
+      const agent = await this.getAgentFor(fresh.agentId, owner).catch(() => undefined);
+      const policy = store.pending.onTimeout ?? this.hitlFor(agent).onTimeout;
+      const sdkAgent = agent?.sdkAgent;
+      let budget: TurnBudget | undefined;
+      let canDeny =
+        policy === "deny" &&
+        !!agent &&
+        (sdkAgent ? supportsSdkPause(sdkAgent) && store.pending.sdkState !== undefined : typeof agent.handler?.resolveAction === "function");
+      if (canDeny) {
+        // (the continuation needs a budget with something left)
+        try {
+          budget = this.planTurnBudget(fresh, agent!, (store.pending.sdkState as { usage?: unknown } | undefined)?.usage);
+        } catch {
+          canDeny = false;
+        }
+      }
+
+      if (!canDeny) {
+        // Drop the pause: the lapsed requests are expired, the ones still open are withdrawn with them
+        const closed = await this.closePause(fresh.id, owner, {
+          status: (action) => (isExpired(action, now) ? "expired" : "cancelled"),
+          by: "system:timeout",
+          channel: "timeout",
+          moreEvents: [{ type: EVENT_TYPES.statusIdle, data: { stop_reason: "cancelled", detail: "action_expired" } }],
+          emit: (events) => {
+            run.emit({ events: events.map((e) => ({ type: e.type, data: e.data ?? {} })) });
+          },
+        });
+        await run.flush();
+        result.expired += closed.actions.filter((action) => isExpired(action, now)).length;
+        dropped = closed.actions.length > 0;
+        return true;
+      }
+
+      // Answer every lapsed request as a refusal; the answer that closes the pause lets the agent carry on
+      const dueIds = due.map((action) => action.id);
+      handedOver = true;
+      this.launch(run, routeCtx, async () => {
+        let outcome: TurnOutcome = { content: "", stopReason: "requires_action", pendingActions: [], partial: true };
+        for (const id of dueIds) {
+          const current = await storage.getConversation(fresh.id, owner);
+          const currentStore = current ? readHitl(current.state) : undefined;
+          const action = currentStore?.pending?.actions.find((a) => a.id === id);
+          if (!current || !currentStore?.pending || !action) continue;
+          const resolution: ActionResolution =
+            action.type === "tool_approval"
+              ? { type: "tool_approval", decision: "deny", comment: "timed out" }
+              : { type: "user_question", answers: {}, cancelled: true };
+          const nextSdkState = sdkAgent
+            ? applySdkResolution(sdkAgent as HitlSdkAgent, jsonSafe(currentStore.pending.sdkState), action, resolution, "system:timeout")
+            : undefined;
+          const lastOpen = currentStore.pending.actions.length === 1;
+          const plan = lastOpen || !sdkAgent ? this.planTurnBudget(current, agent!, (nextSdkState as { usage?: unknown } | undefined)?.usage) : undefined;
+          outcome = await this.executeResolve(
+            run,
+            {
+              ctx: routeCtx,
+              conversation: current,
+              agent: agent!,
+              store: currentStore,
+              action,
+              resolution,
+              nextSdkState,
+              actor: "system:timeout",
+              channel: "timeout",
+              edited: false,
+              expired: true,
+            },
+            plan ?? budget
+          );
+          result.denied++;
+        }
+        if (!outcome.partial) result.continued++;
+        return outcome;
+      });
+      continuing.push(run.done);
+      return true;
+    } finally {
+      if (!handedOver) {
+        await run.flush().catch(() => undefined);
+        await this.endRun(run);
+        // (a task whose request lapsed under "cancel" ends cancelled)
+        if (dropped && run.taskId) {
+          await this.syncTask(run, { content: "", stopReason: "cancelled", pendingActions: [], partial: false }, owner).catch(() => undefined);
+        }
       }
     }
   }
@@ -4423,6 +5448,11 @@ export class AgentServer {
     if (outcome.stopReason === "cancelled") {
       await storage.updateTask(taskId, { status: "cancelled", completedAt: new Date() }, rc);
       await callback("cancelled");
+      return;
+    }
+    if (outcome.stopReason === "budget_reached" && outcome.status === "incomplete") {
+      // The budget cut the task short and nobody is there to raise it (a task that only crossed it finished its answer: it completes)
+      await this.failTask(task, "The budget of the conversation the task runs in was reached before the task was done", rc);
       return;
     }
 

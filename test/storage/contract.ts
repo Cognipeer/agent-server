@@ -109,6 +109,9 @@ export function runStorageContract(
         expect(typeof c.events).toBe("boolean");
         expect(typeof c.leases).toBe("boolean");
         expect(c.fileIndex).toBe(true);
+        // every built-in provider can compare-and-set a conversation and find the ones with a lapsed action
+        expect(c.atomicUpdate).toBe(true);
+        expect(c.actionDeadlines).toBe(true);
       });
 
       it("is connected, and refuses work once disconnected", async () => {
@@ -1312,6 +1315,231 @@ export function runStorageContract(
     });
 
     // ------------------------------------------------------------------------
+    describe("compare-and-set updates", () => {
+      const cas = (id: string, version: number, params: Parameters<StorageProvider["updateConversation"]>[1]) =>
+        s().updateConversationIf!(id, version, params);
+
+      it("counts updates in the conversation's version, and a message is not one", async () => {
+        const created = await newConversation();
+        expect(created.version).toBe(0);
+        const one = await s().updateConversation(created.id, { title: "one" });
+        expect(one.version).toBe(1);
+        // a message touches updatedAt but is not a change to the conversation record
+        await s().createMessage({ conversationId: created.id, role: "user", content: "hi" });
+        expect((await s().getConversation(created.id))!.version).toBe(1);
+        const two = await s().updateConversation(created.id, { state: { a: 1 } });
+        expect(two.version).toBe(2);
+        expect((await s().getConversation(created.id))!.version).toBe(2);
+        expect((await s().getConversations({ agentId: created.agentId })).data[0]!.version).toBe(2);
+      });
+
+      it("updates when the version matches and says so with the new record", async () => {
+        const created = await newConversation({ title: "t", state: { n: 0 } });
+        const updated = await cas(created.id, 0, { state: { n: 1 }, title: "u" });
+        expect(updated).toMatchObject({ id: created.id, title: "u", state: { n: 1 }, version: 1 });
+        expect(await s().getConversation(created.id)).toEqual(updated);
+        // each field is optional, like a plain update
+        const again = await cas(created.id, 1, { metadata: { m: 1 } });
+        expect(again).toMatchObject({ title: "u", state: { n: 1 }, metadata: { m: 1 }, version: 2 });
+      });
+
+      it("changes nothing and answers null when somebody else updated first", async () => {
+        const created = await newConversation({ state: { n: 0 } });
+        await s().updateConversation(created.id, { state: { n: 1 } });
+        expect(await cas(created.id, 0, { state: { n: 99 }, title: "lost" })).toBeNull();
+        const now = (await s().getConversation(created.id))!;
+        expect(now).toMatchObject({ state: { n: 1 }, version: 1 });
+        expect(now.title).toBeUndefined();
+        // a version from the future does not match either
+        expect(await cas(created.id, 5, { title: "future" })).toBeNull();
+      });
+
+      it("an unknown conversation is a 404, a bad version a 400, a state too large a 413", async () => {
+        await expect(cas("conv_nope", 0, { title: "x" })).rejects.toBeInstanceOf(NotFoundError);
+        const created = await newConversation();
+        await expect(cas(created.id, -1, { title: "x" })).rejects.toBeInstanceOf(ValidationError);
+        await expect(cas(created.id, 1.5, { title: "x" })).rejects.toBeInstanceOf(ValidationError);
+        const tooBig = { blob: "x".repeat(Math.min(caps().maxStateBytes + 1024, 40 * MiB)) };
+        if (Buffer.byteLength(JSON.stringify(tooBig)) > caps().maxStateBytes) {
+          await expect(cas(created.id, 0, { state: tooBig })).rejects.toMatchObject({ statusCode: 413 });
+          expect((await s().getConversation(created.id))!.version).toBe(0);
+        }
+      });
+
+      it("of 20 writers that read the same version exactly one wins", async () => {
+        const created = await newConversation({ state: { n: 0 } });
+        const results = await Promise.all(
+          Array.from({ length: 20 }, (_, i) => cas(created.id, 0, { state: { winner: i }, title: `w${i}` }))
+        );
+        const winners = results.filter((r) => r !== null);
+        expect(winners).toHaveLength(1);
+        const stored = (await s().getConversation(created.id))!;
+        expect(stored.version).toBe(1);
+        expect(stored.state).toEqual(winners[0]!.state);
+        expect(stored.title).toBe(winners[0]!.title);
+      });
+
+      it("read-modify-write with a retry loses no update", async () => {
+        const created = await newConversation({ state: { count: 0 } });
+        const bump = async () => {
+          for (;;) {
+            const fresh = (await s().getConversation(created.id))!;
+            const done = await s().updateConversationIf!(created.id, fresh.version!, {
+              state: { count: (fresh.state as { count: number }).count + 1 },
+            });
+            if (done) return;
+          }
+        };
+        await Promise.all(Array.from({ length: 15 }, bump));
+        const stored = (await s().getConversation(created.id))!;
+        expect((stored.state as { count: number }).count).toBe(15);
+        expect(stored.version).toBe(15);
+      });
+
+      it("a plain update and a conditional one are ordered by the version too", async () => {
+        const created = await newConversation();
+        const read = (await s().getConversation(created.id))!;
+        await s().updateConversation(created.id, { title: "plain" });
+        expect(await cas(created.id, read.version!, { title: "stale" })).toBeNull();
+        expect((await s().getConversation(created.id))!.title).toBe("plain");
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    describe("action deadlines", () => {
+      const minute = 60_000;
+
+      it("stores the moment the earliest action lapses, and clears it", async () => {
+        const created = await newConversation();
+        expect(created.actionDueAt).toBeUndefined();
+        const due = new Date(Date.now() + 5 * minute);
+        const set = await s().updateConversation(created.id, { actionDueAt: due, state: { x: 1 } });
+        expect(set.actionDueAt!.getTime()).toBe(due.getTime());
+        expect((await s().getConversation(created.id))!.actionDueAt!.getTime()).toBe(due.getTime());
+        // another update leaves it alone
+        expect((await s().updateConversation(created.id, { title: "t" })).actionDueAt!.getTime()).toBe(due.getTime());
+        // a conditional update sets and clears it too
+        const read = (await s().getConversation(created.id))!;
+        const moved = await s().updateConversationIf!(created.id, read.version!, { actionDueAt: new Date(due.getTime() + minute) });
+        expect(moved!.actionDueAt!.getTime()).toBe(due.getTime() + minute);
+        const cleared = await s().updateConversation(created.id, { actionDueAt: null });
+        expect(cleared.actionDueAt).toBeUndefined();
+        expect((await s().getConversation(created.id))!.actionDueAt).toBeUndefined();
+      });
+
+      it("lists the conversations that are due, earliest first, and not the rest", async () => {
+        const agentId = uniq("agent");
+        const base = Date.now();
+        const a = await s().createConversation({ agentId });
+        const b = await s().createConversation({ agentId });
+        const c = await s().createConversation({ agentId });
+        const none = await s().createConversation({ agentId });
+        await s().updateConversation(a.id, { actionDueAt: new Date(base - 1 * minute) });
+        await s().updateConversation(b.id, { actionDueAt: new Date(base - 3 * minute) });
+        await s().updateConversation(c.id, { actionDueAt: new Date(base + 10 * minute) });
+
+        const due = await s().getConversations({ actionDueBefore: new Date(base), limit: 500 });
+        const ours = due.data.filter((conv) => conv.agentId === agentId).map((conv) => conv.id);
+        expect(ours).toEqual([b.id, a.id]);
+        expect(due.total).toBeGreaterThanOrEqual(2);
+
+        // the boundary is inclusive
+        const exact = await s().getConversations({ actionDueBefore: new Date(base - 1 * minute), limit: 500 });
+        expect(exact.data.filter((conv) => conv.agentId === agentId).map((conv) => conv.id)).toEqual([b.id, a.id]);
+        const later = await s().getConversations({ actionDueBefore: new Date(base + 11 * minute), limit: 500 });
+        expect(later.data.filter((conv) => conv.agentId === agentId).map((conv) => conv.id)).toEqual([b.id, a.id, c.id]);
+        expect(later.data.some((conv) => conv.id === none.id)).toBe(false);
+
+        // answering clears the deadline and the conversation drops out
+        await s().updateConversation(b.id, { actionDueAt: null });
+        const after = await s().getConversations({ actionDueBefore: new Date(base), limit: 500 });
+        expect(after.data.filter((conv) => conv.agentId === agentId).map((conv) => conv.id)).toEqual([a.id]);
+      });
+
+      it("pages through the due conversations without a gap or a repeat", async () => {
+        const agentId = uniq("agent");
+        const base = Date.now() - 10 * minute;
+        const ids: string[] = [];
+        for (let i = 0; i < 5; i++) {
+          const conv = await s().createConversation({ agentId });
+          ids.push(conv.id);
+          // the same instant for three of them: the order inside a tie must still be stable
+          await s().updateConversation(conv.id, { actionDueAt: new Date(base + (i < 3 ? 0 : i) * 1000) });
+        }
+        const seen: string[] = [];
+        for (let offset = 0; offset < 5; offset += 2) {
+          const page = await s().getConversations({ actionDueBefore: new Date(), agentId, limit: 2, offset });
+          seen.push(...page.data.map((conv) => conv.id));
+          expect(page.total).toBe(5);
+        }
+        expect(seen).toEqual(ids);
+      });
+
+      it("rejects a deadline that is not a date", async () => {
+        const created = await newConversation();
+        await expect(s().updateConversation(created.id, { actionDueAt: "tomorrow" as unknown as Date })).rejects.toBeInstanceOf(ValidationError);
+        await expect(s().getConversations({ actionDueBefore: "now" as unknown as Date })).rejects.toBeInstanceOf(ValidationError);
+      });
+    });
+
+    // ------------------------------------------------------------------------
+    describe("updating a message", () => {
+      it("replaces the metadata and leaves everything else as it was", async () => {
+        await withFrozenDate(T0, async (clock) => {
+          const conv = await newConversation();
+          const first = await s().createMessage({ conversationId: conv.id, role: "assistant", content: "paused", metadata: { requiresAction: true, pendingActions: [{ id: "a1", status: "pending" }] } });
+          const second = await s().createMessage({ conversationId: conv.id, role: "user", content: "next" });
+          clock.set(T0 + 5000);
+          const updated = await s().updateMessage!(first.id, {
+            metadata: { requiresAction: true, pendingActions: [{ id: "a1", status: "resolved", resolvedBy: "u1" }] },
+          });
+          expect(updated).toMatchObject({
+            id: first.id,
+            conversationId: conv.id,
+            role: "assistant",
+            content: "paused",
+            metadata: { requiresAction: true, pendingActions: [{ id: "a1", status: "resolved", resolvedBy: "u1" }] },
+          });
+          expect(updated.createdAt.getTime()).toBe(T0);
+          expect(updated.updatedAt.getTime()).toBe(T0 + 5000);
+          expect(await s().getMessage(first.id)).toEqual(updated);
+          // the history keeps its order, and the other message is untouched
+          expect((await s().getMessages(conv.id)).data.map((m) => m.id)).toEqual([first.id, second.id]);
+          expect(await s().getMessage(second.id)).toEqual(second);
+        });
+      });
+
+      it("replaces the content when asked, text or parts", async () => {
+        const conv = await newConversation();
+        const message = await s().createMessage({ conversationId: conv.id, role: "assistant", content: "old", metadata: { keep: 1 } });
+        const text = await s().updateMessage!(message.id, { content: "new" });
+        expect(text).toMatchObject({ content: "new", metadata: { keep: 1 } });
+        const parts = [{ type: "text", text: "p" }];
+        expect((await s().updateMessage!(message.id, { content: parts })).content).toEqual(parts);
+        // an empty update still moves updatedAt and changes nothing else
+        expect(await s().updateMessage!(message.id, {})).toMatchObject({ content: parts, metadata: { keep: 1 } });
+      });
+
+      it("round-trips awkward metadata as JSON", async () => {
+        const conv = await newConversation();
+        const message = await s().createMessage({ conversationId: conv.id, role: "assistant", content: "x" });
+        const input = awkwardJson();
+        const updated = await s().updateMessage!(message.id, { metadata: input });
+        expect(updated.metadata).toEqual(jsonRoundTrip(input));
+        expect((await s().getMessage(message.id))!.metadata).toEqual(jsonRoundTrip(input));
+      });
+
+      it("an unknown message is a 404, and it is not a way to touch the conversation", async () => {
+        await expect(s().updateMessage!("msg_nope", { metadata: {} })).rejects.toBeInstanceOf(NotFoundError);
+        const conv = await newConversation();
+        const message = await s().createMessage({ conversationId: conv.id, role: "assistant", content: "x" });
+        const before = (await s().getConversation(conv.id))!;
+        await s().updateMessage!(message.id, { metadata: { a: 1 } });
+        expect((await s().getConversation(conv.id))!.version).toBe(before.version);
+      });
+    });
+
+    // ------------------------------------------------------------------------
     describe("tasks that run in a conversation", () => {
       it("links a task to a conversation, filters by it, and updates the link", async () => {
         const conv = await newConversation();
@@ -1350,6 +1578,9 @@ export function runStorageContract(
           agentId: conv.agentId,
           expiresAt,
         });
+        const due = new Date(Date.now() + 3_600_000);
+        await s().updateConversation(conv.id, { actionDueAt: due });
+        const edited = await s().updateMessage!(message.id, { metadata: { settled: { id: "a1", status: "resolved" } } });
         const task = await s().createTask({ agentId: conv.agentId, input: "again" });
         const comment = { id: "c1", taskId: task.id, role: "user" as const, content: "hi", createdAt: new Date(T0) };
         await s().updateTask(task.id, { comments: [comment] });
@@ -1360,6 +1591,13 @@ export function runStorageContract(
         const read = await reopened.getConversation(conv.id);
         expect(read).toMatchObject({ title: "kept", userId: "u-restart" });
         expect(read!.state).toEqual(jsonRoundTrip({ a: awkwardJson() }));
+        // the version counts on after a restart, and so does the deadline the expiry sweep looks for
+        expect(read!.version).toBe(1);
+        expect(read!.actionDueAt!.getTime()).toBe(due.getTime());
+        expect((await reopened.getConversations({ actionDueBefore: new Date(due.getTime() + 1000), agentId: conv.agentId })).data.map((c) => c.id)).toEqual([conv.id]);
+        expect(await reopened.updateConversationIf!(conv.id, 0, { title: "stale" })).toBeNull();
+        expect((await reopened.updateConversationIf!(conv.id, 1, { title: "fresh" }))!.version).toBe(2);
+        expect((await reopened.getMessage(message.id))!.metadata).toEqual(edited.metadata);
         expect((await reopened.getMessage(message.id))!.content).toBe(AWKWARD_TEXTS.nul);
         expect((await reopened.getFileContent(file.id))!.equals(content)).toBe(true);
         const reread = await reopened.getFile(file.id);

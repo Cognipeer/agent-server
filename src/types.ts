@@ -61,10 +61,31 @@ export interface Conversation {
   createdAt: Date;
   updatedAt: Date;
   /**
+   * Storage only: how many times the record was updated (`0` when created). A provider that reports
+   * `capabilities().atomicUpdate` bumps it on every update and honours it in `updateConversationIf`.
+   * Never sent to clients.
+   */
+  version?: number;
+  /**
+   * Storage only: the earliest `expiresAt` among the actions the conversation waits on. The server writes
+   * it together with the pause and the sweep finds due conversations with `getConversations({ actionDueBefore })`.
+   * Never sent to clients.
+   */
+  actionDueAt?: Date;
+  /**
    * Where the conversation is in its run lifecycle. Computed by the server for
    * the API (`GET /conversations`, `GET /conversations/:id`); never stored.
    */
   runtime?: ConversationRuntime;
+  /**
+   * The spend limit of the conversation, when it has one (API only; the server keeps it in the
+   * conversation's hidden state). `null`: the agent's default was removed.
+   */
+  budget?: SessionBudget | null;
+  /** What the conversation's turns cost so far, in USD (API only; counted when the agent has a `pricing` function). */
+  spentUsd?: number;
+  /** Tools the person asked not to be asked about again in this conversation (API only). */
+  rememberedTools?: string[];
 }
 
 /** Why a turn stopped. Stored on the assistant message (`metadata.stopReason`) and in `session.status_idle` events. */
@@ -191,6 +212,8 @@ export interface UserQuestionOption {
   label: string;
   value?: string;
   description?: string;
+  /** A code or ASCII preview shown while the option is focused (agent-sdk `UserQuestionOption.preview`). */
+  preview?: string;
 }
 
 export interface UserQuestion {
@@ -202,7 +225,11 @@ export interface UserQuestion {
   options?: UserQuestionOption[];
 }
 
-/** Something the agent is waiting on before it can continue. */
+/**
+ * Something the agent is waiting on before it can continue. `expiresAt` (ISO 8601) is when the request
+ * lapses: taken from the agent's own entry, else stamped by the server from `hitl.timeoutMinutes`. After it
+ * the action answers `410 action_expired` and `hitl.onTimeout` decides what happens (see {@link HitlConfig}).
+ */
 export type PendingAction =
   | {
       id: string;
@@ -210,6 +237,7 @@ export type PendingAction =
       toolName: string;
       toolCallId?: string;
       title?: string;
+      /** A one-line description of what approving does (`metadata.summary` of the agent's entry). */
       summary?: string;
       args?: Record<string, unknown>;
       expiresAt?: string;
@@ -221,6 +249,23 @@ export type PendingAction =
       allowFreeText?: boolean;
       expiresAt?: string;
     };
+
+/**
+ * How an action ended, as the snapshot on the paused assistant message (`metadata.pendingActions`) records it:
+ * `resolved` (approved, denied or answered - see `resolution`), `cancelled` (nobody answered; a new message or
+ * `POST .../cancel` withdrew it) or `expired` (it lapsed under `hitl.onTimeout: "cancel"`).
+ */
+export type ActionStatus = "pending" | "resolved" | "cancelled" | "expired";
+
+/** One action on the paused assistant message: the action as it was asked, and - once it ended - how. */
+export type ActionSnapshot = PendingAction & {
+  status: ActionStatus;
+  /** What the person (or the timeout) answered. */
+  resolution?: ActionResolution;
+  /** Who answered: the user id, `system:timeout`, or `system` for a withdrawn request. */
+  resolvedBy?: string;
+  resolvedAt?: string;
+};
 
 /** The human's answer to a {@link PendingAction}. */
 export type ActionResolution =
@@ -301,11 +346,11 @@ export interface ProcessMessageResult {
   files?: FileAttachment[];
   state?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
-  usage?: {
-    inputTokens?: number;
-    outputTokens?: number;
-    totalTokens?: number;
-  };
+  /**
+   * What the turn used. `costUsd` (and `model`, to price the tokens with the `pricing` function) lets a
+   * handler take part in budgets; without it a handler's turns cost nothing as far as the budget knows.
+   */
+  usage?: UsageInfo & { model?: string };
   /** Set to `"requires_action"` (with `pendingActions`) to pause the turn. */
   status?: MessageStatus;
   /** Everything the turn is waiting on. Replaces the conversation's pending set. */
@@ -332,6 +377,15 @@ export interface AgentRegistration {
   responsesApi?: import("./providers/ai/responses.js").ResponsesApiConfig;
   /** Attachment settings of this agent; each field overrides the server's `files` option. */
   files?: AgentFilesConfig;
+  /** Approval and question settings of this agent; each field overrides the server's `hitl` option. */
+  hitl?: AgentHitlConfig;
+  /**
+   * The spend limit new conversations with this agent start with. Overrides the server's `budget`;
+   * `null` says this agent has none. Needs a `pricing` function (this agent's or the server's).
+   */
+  budget?: SessionBudget | null;
+  /** Prices the tokens this agent uses (overrides the server's `pricing`). */
+  pricing?: PricingFn;
 }
 
 // ============================================================================
@@ -362,12 +416,32 @@ export interface StorageProvider {
   getConversation(id: string, ctx?: RequestContext): Promise<Conversation | null>;
   getConversations(params: GetConversationsParams, ctx?: RequestContext): Promise<PaginatedResult<Conversation>>;
   updateConversation(id: string, params: UpdateConversationParams, ctx?: RequestContext): Promise<Conversation>;
+  /**
+   * Optional (`capabilities().atomicUpdate`): the update only happens when the conversation is still at
+   * `ifVersion` (the `version` you read it at); resolves the updated conversation, or `null` when someone
+   * else updated it in between (read it again and redo your change). An unknown conversation is a
+   * `NotFoundError`. This is what keeps two writers of one conversation's state - two answers to one
+   * pause, a sweep and an answer, a budget change and a turn - from overwriting each other.
+   */
+  updateConversationIf?(
+    id: string,
+    ifVersion: number,
+    params: UpdateConversationParams,
+    ctx?: RequestContext
+  ): Promise<Conversation | null>;
   deleteConversation(id: string, ctx?: RequestContext): Promise<void>;
 
   // Messages
   createMessage(params: CreateMessageParams, ctx?: RequestContext): Promise<Message>;
   getMessages(conversationId: string, params?: GetMessagesParams, ctx?: RequestContext): Promise<PaginatedResult<Message>>;
   getMessage(id: string, ctx?: RequestContext): Promise<Message | null>;
+  /**
+   * Optional: replaces a stored message's `content` and / or `metadata`. The server uses it to record
+   * how an action ended on the assistant message that asked for it (`metadata.pendingActions`), so a
+   * history shows approved / denied / answered / expired / cancelled; without it the message keeps
+   * showing the request as it was asked. An unknown message is a `NotFoundError`.
+   */
+  updateMessage?(id: string, params: UpdateMessageParams, ctx?: RequestContext): Promise<Message>;
   deleteMessage(id: string, ctx?: RequestContext): Promise<void>;
 
   // Files
@@ -558,8 +632,14 @@ export interface StorageCapabilities {
    * `Number.MAX_SAFE_INTEGER` when only memory / disk bound it.
    */
   maxStateBytes: number;
-  /** Compare-and-set conversation updates (`updateConversationIf`). */
+  /** Compare-and-set conversation updates (`updateConversationIf`, `Conversation.version`). */
   atomicUpdate: boolean;
+  /**
+   * `getConversations({ actionDueBefore })` finds the conversations whose pending actions are due
+   * (`Conversation.actionDueAt`). Without it the server cannot sweep expired actions by itself: they are
+   * still refused with `410 action_expired`, and `server.expirePendingActions({ conversationId })` handles one on demand.
+   */
+  actionDeadlines?: boolean;
   /** A durable per-conversation event log (`events`). */
   events: boolean;
   /** Per-conversation leases (`acquireLease` / `releaseLease`). */
@@ -583,12 +663,25 @@ export interface GetConversationsParams {
   offset?: number;
   orderBy?: "createdAt" | "updatedAt";
   order?: "asc" | "desc";
+  /**
+   * Only conversations whose `actionDueAt` is at or before this moment, earliest first (`orderBy` /
+   * `order` are ignored). Needs `capabilities().actionDeadlines`.
+   */
+  actionDueBefore?: Date;
 }
 
 export interface UpdateConversationParams {
   title?: string;
   metadata?: Record<string, unknown>;
   state?: Record<string, unknown>;
+  /** When the earliest open action lapses; `null` clears it. */
+  actionDueAt?: Date | null;
+}
+
+export interface UpdateMessageParams {
+  content?: string | ContentPart[];
+  /** Replaces the message's metadata. */
+  metadata?: Record<string, unknown>;
 }
 
 export interface CreateMessageParams {
@@ -845,6 +938,115 @@ export interface AgentServerConfig {
    * Every agent can override each field with `AgentRegistration.files`. Every value has a default.
    */
   files?: FilesConfig;
+
+  /**
+   * Approvals and questions: how long a request waits, what happens when it lapses, who may answer, how edited
+   * arguments are checked. Every agent can override the timeouts with `AgentRegistration.hitl`. Every value has a default.
+   */
+  hitl?: HitlConfig;
+
+  /**
+   * The spend limit new conversations start with, for every agent that does not say otherwise
+   * (`AgentRegistration.budget`). Needs `pricing`. Absent: conversations have no limit unless one is set on them.
+   */
+  budget?: SessionBudget;
+
+  /**
+   * What a token costs, by model name; turns the usage of a turn into `costUsd` and a conversation's
+   * `spentUsd`. `AgentRegistration.pricing` overrides it for one agent. Without any pricing, nothing is
+   * priced and budgets cannot be used. See {@link costEstimatorFromPricing} to give agent-sdk the same
+   * prices, so its own `limits.maxCostUsd` can stop a turn in the middle.
+   */
+  pricing?: PricingFn;
+
+  /**
+   * Decides whether a conversation's budget may be raised or removed (lowering it is always allowed to the
+   * conversation's owner). Default: deny - nobody but the host's code can lift a limit.
+   */
+  authorizeBudget?: (ctx: RequestContext, change: BudgetChange) => boolean | Promise<boolean>;
+}
+
+/** Approval and question settings. */
+export interface HitlConfig {
+  /**
+   * Minutes a request waits for an answer before `onTimeout` applies (default 1440, one day; `0`: never).
+   * A request that comes with its own `expiresAt` (from the agent) keeps it.
+   */
+  timeoutMinutes?: number;
+  /**
+   * What happens to a request nobody answered in time: `"deny"` (default) answers it as a refusal (a question
+   * as skipped) and - once nothing else is open - lets the agent carry on, as a run of its own; `"cancel"` drops
+   * the request and ends the turn (`stopReason: "cancelled"`).
+   */
+  onTimeout?: "deny" | "cancel";
+  /**
+   * Who may answer a request. Default: the conversation's owner (the rule that guards every conversation route).
+   * When set, this decides for everyone - the owner too - and the owner check is not applied to the
+   * resolve route, so an approver who does not own the conversation can answer. Answer `false` for 403 `action_forbidden`.
+   */
+  authorizeResolve?: (
+    ctx: RequestContext,
+    input: { conversation: Conversation; action: PendingAction }
+  ) => boolean | Promise<boolean>;
+  /**
+   * Check `approvedArgs` against the tool's schema (a zod schema or a JSON Schema on the agent-sdk tool) before
+   * the tool runs; a bad edit is 400 `invalid_approved_args`. Default true.
+   */
+  validateApprovedArgs?: boolean;
+  /**
+   * An answer that arrives while another answer to the same conversation is being recorded waits this long
+   * (milliseconds) for it instead of failing with 409 `conversation_busy` (default 3000). Answers to the several
+   * actions of one pause can therefore be sent at the same time.
+   */
+  resolveWaitMs?: number;
+}
+
+/** The per-agent form of {@link HitlConfig}: the settings that make sense for one agent. */
+export type AgentHitlConfig = Pick<HitlConfig, "timeoutMinutes" | "onTimeout" | "validateApprovedArgs">;
+
+/** A spend limit. */
+export interface SessionBudget {
+  /** Largest total cost of the conversation's turns, in USD. */
+  maxCostUsd: number;
+  /**
+   * What reaching it does: `"pause"` (default): the conversation waits - raise the budget and `POST .../continue`
+   * carries the stopped turn on; `"stop"`: it ends, and every further message is refused.
+   */
+  onReach: "pause" | "stop";
+}
+
+/** What a token costs, in USD. */
+export interface ModelPricing {
+  inputPerToken: number;
+  outputPerToken: number;
+  /** Price of an input token that was served from the provider's cache (default: `inputPerToken`). */
+  cachedInputPerToken?: number;
+}
+
+/** Looks a model up by the name agent-sdk reports it under. `undefined`: this model is not priced. */
+export type PricingFn = (model: string) => ModelPricing | undefined;
+
+/** A change to a conversation's budget, as `authorizeBudget` sees it. */
+export interface BudgetChange {
+  /** The conversation (absent when a conversation is being created with a budget of its own). */
+  conversation?: Conversation;
+  current: SessionBudget | null;
+  requested: SessionBudget | null;
+  spentUsd: number;
+}
+
+/**
+ * What a turn used. SDK agents report their usage cumulatively and per model; the server turns it into
+ * these totals for the turn alone (a resumed turn counts only what it used after the resume).
+ */
+export interface UsageInfo {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  /** Input tokens the provider served from its cache (included in `inputTokens`). */
+  cachedInputTokens?: number;
+  /** What the turn cost, in USD, when the agent's models are priced (`pricing`). */
+  costUsd?: number;
 }
 
 /** What an extractor is told about a file. */
@@ -1141,11 +1343,7 @@ export interface SendMessageResponse {
   response: Message;
   /** Auto-generated conversation title (only present on the first message) */
   conversationTitle?: string;
-  usage?: {
-    inputTokens?: number;
-    outputTokens?: number;
-    totalTokens?: number;
-  };
+  usage?: UsageInfo;
   /** Present (as `"requires_action"`) when the turn paused for a human. */
   status?: MessageStatus;
   pendingActions?: PendingAction[];
@@ -1155,6 +1353,9 @@ export interface SendMessageResponse {
   stopReason?: StopReason;
   /** The run that executed the turn; its events carry it as `run_id`. */
   runId?: string;
+  /** The conversation's budget and what it has spent, when it has a budget. */
+  budget?: SessionBudget;
+  spentUsd?: number;
 }
 
 /**
@@ -1264,17 +1465,15 @@ export interface StreamDoneEvent extends StreamEventBase {
   content: string;
   /** Auto-generated conversation title (only present on the first message) */
   title?: string;
-  usage?: {
-    inputTokens?: number;
-    outputTokens?: number;
-    totalTokens?: number;
-  };
+  usage?: UsageInfo;
   /** Only set when the turn did not simply complete (e.g. `"requires_action"`). */
   status?: MessageStatus;
   pendingActions?: PendingAction[];
   warnings?: TurnWarning[];
   stopReason?: StopReason;
   runId?: string;
+  budget?: SessionBudget;
+  spentUsd?: number;
 }
 
 /**
@@ -1299,6 +1498,8 @@ export interface StreamActionResolvedEvent extends StreamEventBase {
     type: ActionResolution["type"];
     decision?: "allow" | "deny";
     cancelled?: boolean;
+    /** The request lapsed and `hitl.onTimeout` answered it. */
+    expired?: boolean;
   };
 }
 
@@ -1386,6 +1587,35 @@ export interface CreateConversationRequest {
   userId?: string;
   title?: string;
   metadata?: Record<string, unknown>;
+  /**
+   * A spend limit for this conversation. Without one it starts with the agent's (`AgentRegistration.budget`,
+   * else the server's `budget`). A limit above the default is refused (403 `budget_forbidden`) unless
+   * `authorizeBudget` allows it.
+   */
+  budget?: { maxCostUsd: number; onReach?: "pause" | "stop" };
+}
+
+/** `PATCH /conversations/:id`. */
+export interface UpdateConversationRequest {
+  title?: string;
+  metadata?: Record<string, unknown>;
+  /**
+   * Sets the conversation's spend limit; `null` removes it. Lowering it is the owner's to do; raising or removing
+   * it goes through `authorizeBudget` (403 `budget_forbidden` when it is not set). The new limit must be above what
+   * the conversation has spent (400 `invalid_budget`).
+   */
+  budget?: { maxCostUsd: number; onReach?: "pause" | "stop" } | null;
+}
+
+/** `POST /conversations/:id/continue`. */
+export interface ContinueConversationRequest {
+  /** Stream the continuation as SSE, like `POST .../messages` with `stream: true`. */
+  stream?: boolean;
+}
+
+/** `GET /conversations/:id/remembered-tools` and the answer of `DELETE .../remembered-tools/:tool`. */
+export interface RememberedToolsResponse {
+  tools: string[];
 }
 
 export interface CreateConversationResponse {

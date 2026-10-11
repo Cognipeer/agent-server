@@ -9,6 +9,7 @@ import type {
   StorageProvider,
 } from "../src/index.js";
 import { fakeSdkAgent, parseSse, spyStorage } from "./helpers.js";
+import { withCall } from "./sdk-stubs.js";
 import { PROVIDER_NAMES, describeProvider, useProvider } from "./storage/providers.js";
 import type { OpenedProvider } from "./storage/providers.js";
 
@@ -82,10 +83,11 @@ function stubSdkAgent(mode: Mode = "approval", opts: { pausesEveryTime?: boolean
         : resolved?.approvedArgs ? `deployed:${JSON.stringify(resolved.approvedArgs)}`
         : "deployed";
       config?.onStream?.({ text: verdict });
+      // (usage the way agent-sdk reports it: a ledger of model calls with totals per model)
       return {
         content: verdict,
         messages: [],
-        metadata: { usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } },
+        metadata: { usage: withCall(input.usage, "stub-model", 1, 2) },
         state: { messages: [], pendingApprovals: [], pendingUserQuestions: [] },
       };
     },

@@ -68,8 +68,26 @@ interface AgentServerConfig {
 
   // Attachments: limits, how agents read them, images, retention - see guide/file-management
   files?: FilesConfig;
+
+  // Approvals and questions: timeouts, who may answer, edited arguments - see guide/human-in-the-loop
+  hitl?: HitlConfig;
+
+  // Spend: what a token costs, the limit new conversations start with, who may raise it - see guide/budgets
+  pricing?: (model: string) => ModelPricing | undefined;
+  budget?: { maxCostUsd: number; onReach: 'pause' | 'stop' };
+  authorizeBudget?: (ctx: RequestContext, change: BudgetChange) => boolean | Promise<boolean>;
 }
 ```
+
+`HitlConfig` (every field optional; an agent overrides `timeoutMinutes`, `onTimeout` and `validateApprovedArgs`, see [Approvals & Questions](../guide/human-in-the-loop)):
+
+| Field | Default | |
+| --- | --- | --- |
+| `timeoutMinutes` | 1440 | Minutes a request waits for an answer; `0`: never. A request that comes with its own `expiresAt` keeps it |
+| `onTimeout` | `'deny'` | A request nobody answered in time: answered as a refusal and the agent carries on, or (`'cancel'`) dropped and the turn ends |
+| `authorizeResolve(ctx, { conversation, action })` | the conversation's owner | Decides who may answer; `false` is `403 action_forbidden` |
+| `validateApprovedArgs` | `true` | Check edited arguments against the tool's schema (`400 invalid_approved_args`) |
+| `resolveWaitMs` | 3000 | How long an answer waits for another answer to the same conversation instead of `409 conversation_busy` |
 
 `FilesConfig` (every field optional; an agent overrides each but `extractCacheBytes` and `purgeIntervalMs`, see [Files](../guide/file-management#settings)):
 
@@ -140,7 +158,7 @@ agentServer.registerSDKAgent(id, agent, info?, options?);
 | id | `string` | Unique agent identifier |
 | agent | `SmartAgent` | Agent from agent-sdk |
 | info | `Partial<AgentInfo>` | Optional agent metadata |
-| options | `{ files?: AgentFilesConfig }` | Attachment settings of this agent, overriding the server's `files` (`registerCustomAgent`, `registerChatCompletionsAgent` and `registerResponsesAgent` take the same last argument) |
+| options | `{ files?, hitl?, budget?, pricing? }` | Settings of this agent, overriding the server's `files`, `hitl`, `budget` (`null`: none) and `pricing` (`registerCustomAgent`, `registerChatCompletionsAgent` and `registerResponsesAgent` take the same last argument). A `budget` needs prices: this agent's or the server's |
 
 ```typescript
 import { createSmartAgent } from '@cognipeer/agent-sdk';
@@ -225,6 +243,16 @@ const { conversations, tasks } = await server.recoverStaleRuns();
 
 Closes the runs whose server died (`session.error` + `session.status_idle` with `stop_reason: "error"`) and fails the tasks that were left `running`.
 It runs by itself at the first request and every `runs.sweepIntervalMs`; call it to run it on demand. See [Runs](../guide/runs#recovery).
+
+#### expirePendingActions
+
+```typescript
+const { conversations, expired, denied, continued } = await server.expirePendingActions();
+await server.expirePendingActions({ conversationId: 'conv_1' }); // one conversation, also for a store that cannot search for lapsed requests
+```
+
+Handles the approvals and questions nobody answered in time (`hitl.onTimeout`): answers them as refusals and lets the agent carry on, or drops the pause. It runs by itself at the first
+request and every `runs.sweepIntervalMs`; call it to run it on demand. Resolves when the continuations it started have finished. See [Requests that lapse](../guide/human-in-the-loop#requests-that-lapse).
 
 #### purgeExpiredFiles / maxUploadBytes
 
@@ -345,18 +373,21 @@ interface ProcessMessageResult {
   // Response metadata
   metadata?: Record<string, unknown>;
 
-  // Token usage
+  // Token usage. Add costUsd (what the turn cost), or model (so the server prices the tokens with `pricing`), to take part in budgets
   usage?: {
     inputTokens?: number;
     outputTokens?: number;
     totalTokens?: number;
+    cachedInputTokens?: number;
+    costUsd?: number;
+    model?: string;
   };
 
   // 'requires_action' + pendingActions to pause the turn (see guide/human-in-the-loop)
   status?: MessageStatus;
   pendingActions?: PendingAction[];
 
-  // Why the turn stopped when it was not simply 'end_turn': 'max_turns' | 'limit' | 'budget_reached'
+  // Why the turn stopped when it was not simply 'end_turn': 'max_turns' | 'limit' ('budget_reached' is the server's own, see guide/budgets)
   stopReason?: StopReason;
 }
 ```

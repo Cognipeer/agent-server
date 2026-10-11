@@ -32,6 +32,7 @@ import type {
   UpdateConversationParams,
   CreateMessageParams,
   GetMessagesParams,
+  UpdateMessageParams,
   SaveFileParams,
   CreateTaskParams,
   GetTasksParams,
@@ -87,9 +88,11 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
     return {
       ...super.capabilities(),
       maxFileBytes: Math.min(this.config.maxFileStorage || DEFAULT_MAX_FILE_STORAGE, MAX_BUFFER_BYTES),
+      atomicUpdate: true,
       events: true,
       leases: true,
       fileIndex: true,
+      actionDeadlines: true,
     };
   }
 
@@ -169,6 +172,7 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
       state: params.state || {},
       createdAt: now,
       updatedAt: now,
+      version: 0,
     };
 
     this.conversations.set(id, conversation);
@@ -197,10 +201,18 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
     if (params.userId) {
       conversations = conversations.filter((c) => c.userId === params.userId);
     }
+    if (params.actionDueBefore) {
+      const before = params.actionDueBefore.getTime();
+      conversations = conversations.filter((c) => c.actionDueAt !== undefined && c.actionDueAt.getTime() <= before);
+    }
 
-    // Sort
-    const orderBy = params.orderBy === "updatedAt" ? "updatedAt" : "createdAt";
-    this.sortByTime(conversations, (c) => c[orderBy].getTime(), params.order === "asc" ? 1 : -1);
+    // Sort: the conversations whose actions lapsed first when asked for those, else by time
+    if (params.actionDueBefore) {
+      this.sortByTime(conversations, (c) => c.actionDueAt!.getTime(), 1);
+    } else {
+      const orderBy = params.orderBy === "updatedAt" ? "updatedAt" : "createdAt";
+      this.sortByTime(conversations, (c) => c[orderBy].getTime(), params.order === "asc" ? 1 : -1);
+    }
 
     const total = conversations.length;
 
@@ -227,11 +239,26 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
       metadata:
         params.metadata !== undefined ? params.metadata : conversation.metadata,
       state: params.state !== undefined ? params.state : conversation.state,
+      actionDueAt:
+        params.actionDueAt === undefined ? conversation.actionDueAt : params.actionDueAt === null ? undefined : params.actionDueAt,
       updatedAt: new Date(),
+      version: (conversation.version ?? 0) + 1,
     };
 
     this.conversations.set(id, updated);
     return copy(updated);
+  }
+
+  protected async _updateConversationIf(
+    id: string,
+    ifVersion: number,
+    params: UpdateConversationParams
+  ): Promise<Conversation | null> {
+    const conversation = this.conversations.get(id);
+    if (!conversation) throw new NotFoundError("Conversation", id);
+    // (nothing awaits between the check and the write, so no other update can come in between)
+    if ((conversation.version ?? 0) !== ifVersion) return null;
+    return this._updateConversation(id, params);
   }
 
   protected async _deleteConversation(id: string): Promise<void> {
@@ -338,6 +365,16 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
       ? this.messages.get(conversationId)?.find((m) => m.id === id)
       : undefined;
     return message ? copy(message) : null;
+  }
+
+  protected async _updateMessage(id: string, params: UpdateMessageParams): Promise<Message> {
+    const conversationId = this.messageOwner.get(id);
+    const message = conversationId ? this.messages.get(conversationId)?.find((m) => m.id === id) : undefined;
+    if (!message) throw new NotFoundError("Message", id);
+    if (params.content !== undefined) message.content = params.content;
+    if (params.metadata !== undefined) message.metadata = params.metadata;
+    message.updatedAt = new Date();
+    return copy(message);
   }
 
   protected async _deleteMessage(id: string): Promise<void> {

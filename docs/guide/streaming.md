@@ -111,7 +111,8 @@ With `maskServerErrors: true` only errors the host marked for the client keep th
 
 When the agent pauses for a tool approval or a question, `stream.action_required` (with the `actions`) precedes the final `stream.done`,
 which carries `status: "requires_action"`. `stream.action_resolved` is the first event after `stream.start` of the stream returned
-by `POST /conversations/:id/actions/:actionId`. See [Approvals & Questions](./human-in-the-loop.md).
+by `POST /conversations/:id/actions/:actionId` (with `resolution.expired: true` when it is the sweep answering a lapsed request, which has no stream to speak of). The stream of `POST /conversations/:id/continue` starts with
+`stream.start` and ends with `stream.done` the same way. See [Approvals & Questions](./human-in-the-loop.md) and [Usage & Budgets](./budgets.md).
 
 ### stream.done
 
@@ -122,7 +123,9 @@ interface StreamDoneEvent {
   messageId: string;                 // the assistant message
   content: string;
   title?: string;                    // generated on the first exchange
-  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cachedInputTokens?: number; costUsd?: number };   // this turn only
+  budget?: { maxCostUsd: number; onReach: 'pause' | 'stop' };   // when the conversation has a budget ...
+  spentUsd?: number;                                            // ... and what it has spent, this turn included
   status?: 'requires_action' | 'incomplete' | 'cancelled';   // only when the turn did not simply complete
   pendingActions?: PendingAction[];
   warnings?: TurnWarning[];

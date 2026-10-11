@@ -177,6 +177,8 @@ Each task gets a conversation of its own (`task.conversationId`, created when it
 - When the agent pauses for a tool approval or a question, the task becomes `waiting_for_input` and `GET /tasks/:id` lists the `pendingActions`. Answer them with
   `POST /conversations/:conversationId/actions/:actionId`; when the turn finishes, the task is `completed` with the result (or `waiting_for_input` again if it pauses again).
   A comment on a task that waits on an action is a `409 action_pending`; a comment on a task that is `running` is a `409 task_busy`.
+  A request nobody answers lapses ([`hitl.timeoutMinutes`](/guide/human-in-the-loop#requests-that-lapse)): under `onTimeout: 'deny'` (the default) the agent is told the tool was refused and the task carries on; under `'cancel'` the task ends `cancelled`.
+  A task runs in an ordinary conversation, so the agent's [budget](/guide/budgets) applies: a task the budget cuts short fails ("... budget ... was reached"); one that only crossed it completes.
 - A custom handler that asks for clarification the old way (`metadata.waitingForInput: true` in its result) still works: the question is added as an agent comment,
   and the next user comment is the answer. Handlers now receive the task's real conversation id (it used to be `task_<id>`), and `metadata.comments` as before.
 - Follow a task live with `GET /conversations/:conversationId/events/stream`; list a conversation's tasks with `GET /tasks?conversationId=`.

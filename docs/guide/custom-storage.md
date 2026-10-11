@@ -65,6 +65,8 @@ Hook signatures (all end with `ctx?: RequestContext`):
 | Tasks | `_createTask(id, params, ctx)`, `_getTask(id, ctx)`, `_getTasks(params, ctx)`, `_updateTask(id, params, ctx)`, `_deleteTask(id, ctx)` |
 | Task results | `_createTaskResult(id, params, ctx)`, `_getTaskResult(taskId, ctx)` |
 | File index *(optional)* | `_listFiles({ conversationId, limit, offset, order }, ctx)`, `_purgeExpiredFiles({ before, limit }, ctx)` |
+| Compare-and-set *(optional)* | `_updateConversationIf(id, ifVersion, params, ctx)` |
+| Message update *(optional)* | `_updateMessage(id, { content?, metadata? }, ctx)` |
 | Events *(optional)* | `_appendEvents(conversationId, events, ctx)`, `_listEvents(conversationId, query, ctx)`, `_eventSummaries(conversationIds, ctx)`, `_pruneEvents(before, ctx)` |
 | Leases *(optional)* | `_acquireLease(params, ctx)`, `_renewLease(params, ctx)`, `_releaseLease(params, ctx)`, `_getLeases(keys, now, ctx)`, `_markLeaseCancel(key, now, ctx)`, `_listExpiredLeases(params, ctx)` |
 
@@ -88,6 +90,9 @@ these rules behaves like them to the server and to every client:
 | Tasks | `createTaskResult` replaces the task's existing result (one per task). `updateTask` / `createTaskResult` for an unknown task throw `NotFoundError`; an update that changes nothing is not an error. `conversationId` is stored, updatable and a `getTasks` filter. |
 | Events | `append` is atomic and ordered: `seq` is 1, 2, 3 ... per conversation with no gaps or repeats, also for appenders running at the same time, and keeps counting after a restart or a `prune`. An unknown conversation is a `NotFoundError`. `list({ after, before, types, limit, order })` returns `{ events, hasMore, lastSeq }` (`lastSeq` = the last event returned, or `after` for an empty page). `summary` gives `lastSeq` and `stopReason` per conversation. The log is deleted with the conversation. |
 | Leases | `acquireLease` is atomic: free, expired or already yours is acquired (an expired one is returned as `takenOver`), otherwise `{ acquired: false, lease }` with the holder. `renewLease` / `releaseLease` only work for the owner, `renewLease` not once expired. `markLeaseCancel` flags a live lease, and the owner sees `cancelRequested` when it renews. `getLeases` returns the live ones, `listExpiredLeases` the expired, oldest first, by key prefix. |
+| Version | `Conversation.version` is `0` when created and goes up by one with every `updateConversation` (not with a new message). `updateConversationIf(id, ifVersion, params)` does the same update only if the stored version is `ifVersion`, in one atomic step, and resolves `null` otherwise (an unknown conversation is a `NotFoundError`). Of 20 writers that read the same version exactly one wins. |
+| Deadlines | `UpdateConversationParams.actionDueAt` (a `Date`, or `null` to clear) is stored on the conversation and read back as `Conversation.actionDueAt`; `getConversations({ actionDueBefore })` returns the conversations whose `actionDueAt` is at or before it, earliest first (ties in insertion order), with the usual paging. Index `actionDueAt` (only rows that have one). |
+| Message update | `updateMessage(id, { content?, metadata? })` replaces what it is given, moves the message's `updatedAt` and nothing else (not its place in the history, not the conversation); an unknown message is a `NotFoundError`. |
 | Limits | Throw `StorageLimitError` (413) for a file or a state you cannot hold, `ValidationError` (400) for a value a column cannot hold, `NotFoundError` (404) for a missing parent. Not a driver error. |
 | Capabilities | Implement `capabilities()` so the server can refuse a bad configuration at startup and skip a pause that would not fit. |
 
@@ -103,7 +108,8 @@ class MyStorage extends BaseStorageProvider {
     return {
       maxFileBytes: 5 * 1024 * 1024 * 1024, // largest single file you store
       maxStateBytes: 4 * 1024 * 1024,       // largest conversation state (UTF-8 bytes of its JSON)
-      atomicUpdate: false,                   // compare-and-set conversation updates
+      atomicUpdate: false,                   // compare-and-set conversation updates (implement `_updateConversationIf`, keep `version`)
+      actionDeadlines: false,                // `getConversations({ actionDueBefore })` and `actionDueAt`: lets the sweep find lapsed approvals
       events: false,                         // a durable per-conversation event log (implement `_appendEvents` / `_listEvents`)
       leases: false,                         // per-conversation leases (implement the `_...Lease` hooks)
       fileIndex: false,                      // `listFiles` / `purgeExpiredFiles` (implement `_listFiles` / `_purgeExpiredFiles`)
@@ -163,6 +169,18 @@ class ExistingStoreAdapter implements StorageProvider {
   // ...
 }
 ```
+
+### Compare-and-set, deadlines and message updates (optional)
+
+These make [approvals](./human-in-the-loop.md) safe when several things write one conversation at once - two answers to one pause, a sweep and an answer, a budget change and a turn:
+
+- `updateConversationIf(id, ifVersion, params)` + `Conversation.version` (`capabilities().atomicUpdate`). The server reads the conversation, decides what to write, and writes it only if nobody changed it in between; otherwise
+  it reads again and redoes the change. Without it the server writes plainly (fine for one node and one writer at a time).
+- `actionDueAt` / `getConversations({ actionDueBefore })` (`capabilities().actionDeadlines`). The server stores the earliest `expiresAt` of the open actions here, and the expiry sweep lists the due ones. Without it lapsed
+  requests are still refused with `410`, but only `server.expirePendingActions({ conversationId })` handles them.
+- `updateMessage(id, { content?, metadata? })`. The server records how an action ended on the paused assistant message (`metadata.pendingActions`). Without it the history keeps showing the request as it was asked.
+
+`BaseStorageProvider` validates the arguments and normalises the result; implement the `_` hooks and bump `version` in `_updateConversation` as well.
 
 ### The file index (optional)
 

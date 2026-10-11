@@ -18,11 +18,13 @@ import type {
   MessageStatus,
   NewConversationEvent,
   RequestContext,
+  SessionBudget,
   StopReason,
   StorageProvider,
+  UsageInfo,
 } from "./types.js";
 
-export type RunKind = "message" | "resolve";
+export type RunKind = "message" | "resolve" | "continue";
 
 /** Why a run started, as `session.status_running` reports it. */
 export type RunTrigger = "message" | "resume" | "timeout";
@@ -94,7 +96,10 @@ export interface TurnOutcome {
   userMessage?: import("./types.js").Message;
   assistant?: import("./types.js").Message;
   content: string;
-  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+  usage?: UsageInfo;
+  /** The conversation's budget and what it has spent after the turn, when it has a budget. */
+  budget?: SessionBudget;
+  spentUsd?: number;
   /** The legacy status: absent when the turn simply completed. */
   status?: MessageStatus;
   stopReason: StopReason;
@@ -139,18 +144,24 @@ export class ActiveRun {
   lastSeq = 0;
   /** Resolves when the run has finished, persisted and released the conversation. Never rejects. */
   done: Promise<TurnOutcome> = Promise.resolve({ content: "", stopReason: "error", pendingActions: [] });
+  /** Resolves once the run has given the conversation back - also for a run that never got to start. */
+  readonly released: Promise<void>;
   lease?: LeaseKeeper;
 
   private subscribers = new Set<(item: RunItem) => void>();
   private chain: Promise<void> = Promise.resolve();
   private warned = false;
   private finished = false;
+  private release!: () => void;
 
   constructor(private deps: RunDeps) {
     this.conversationId = deps.conversationId;
     this.kind = deps.kind;
     this.trigger = deps.trigger;
     this.streaming = deps.streaming;
+    this.released = new Promise<void>((resolve) => {
+      this.release = resolve;
+    });
   }
 
   get signal(): AbortSignal {
@@ -226,6 +237,7 @@ export class ActiveRun {
     this.finished = true;
     for (const subscriber of [...this.subscribers]) subscriber({ kind: "end" });
     this.subscribers.clear();
+    this.release();
   }
 
   /**

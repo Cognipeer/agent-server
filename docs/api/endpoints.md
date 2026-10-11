@@ -112,9 +112,13 @@ POST /conversations
 {
   "agentId": "assistant",
   "title": "New Chat",
-  "metadata": {}
+  "metadata": {},
+  "budget": { "maxCostUsd": 2, "onReach": "pause" }
 }
 ```
+
+`budget` is optional: a spend limit for this conversation (`null`: none). Without it the conversation starts with the agent's (`AgentRegistration.budget`, else the server's `budget`). A limit above that default needs
+the `authorizeBudget` option (`403 budget_forbidden`); a malformed one is `400 invalid_budget`, an agent that cannot price its calls `400 budget_unavailable`. See [Usage & Budgets](../guide/budgets).
 
 **Response:**
 
@@ -193,20 +197,24 @@ PATCH /conversations/:id
 ```json
 {
   "title": "Updated Title",
-  "metadata": { "favorite": true }
+  "metadata": { "favorite": true },
+  "budget": { "maxCostUsd": 20, "onReach": "pause" }
 }
 ```
 
-**Response:**
+Every field is optional. `budget` sets the conversation's spend limit (`null` removes it); lowering it is the owner's to do, raising or removing it goes through the
+`authorizeBudget` option (`403 budget_forbidden` without it), and it has to be above what the conversation has spent (`400 invalid_budget`). See [Usage & Budgets](../guide/budgets).
+
+**Response:** the conversation (with its `runtime` when `budget` was changed, so a client sees `budget_paused` become `idle`).
 
 ```json
 {
-  "conversation": {
-    "id": "conv_123",
-    "title": "Updated Title",
-    "metadata": { "favorite": true },
-    "updatedAt": "2025-01-01T00:00:02.000Z"
-  }
+  "id": "conv_123",
+  "title": "Updated Title",
+  "metadata": { "favorite": true },
+  "budget": { "maxCostUsd": 20, "onReach": "pause" },
+  "spentUsd": 0.42,
+  "updatedAt": "2025-01-01T00:00:02.000Z"
 }
 ```
 
@@ -291,6 +299,8 @@ POST /conversations/:id/messages
 }
 ```
 
+`usage` is what this turn used (`cachedInputTokens` and `costUsd` when known); a conversation with a budget also gets `budget` and `spentUsd` - see [Usage & Budgets](../guide/budgets).
+
 `status` (a top-level field of the response) appears only when the turn did not simply complete: `requires_action` (with `pendingActions`), `cancelled`
 or `incomplete`. `stopReason` is `end_turn`, `requires_action`, `cancelled`, `max_turns`, `limit`, `budget_reached` or `error`. `runId` is the run that
 executed the turn; its [events](#events) carry it as `run_id`.
@@ -310,6 +320,7 @@ The turn runs detached from the connection: closing it does not stop it.
 | Status | Code | When |
 |--------|------|------|
 | 400 | `VALIDATION_ERROR` | No `message`; malformed `fileIds` / `files`; too many files in the message; a file over the size limit or empty |
+| 402 | `budget_reached` | The conversation's [budget](../guide/budgets) is used up (`error.details`: `spentUsd`, `maxCostUsd`, `onReach`); nothing was stored |
 | 403 | `attachments_disabled` | The message carries files and the agent takes none |
 | 404 | `NOT_FOUND` | Unknown conversation; a `fileIds` entry that is not a file of this conversation (or not the caller's) |
 | 409 | `too_many_files` | The files would take the conversation past `files.maxFiles` |
@@ -341,13 +352,27 @@ or `{ "resolution": { "type": "user_question", "answers": { "Which env?": "Produ
 | Status | Code | When |
 |--------|------|------|
 | 400 | `VALIDATION_ERROR` | Malformed resolution, wrong type for the action, invalid answers |
+| 400 | `invalid_approved_args` | `approvedArgs` that the tool's schema does not accept |
+| 402 | `budget_reached` | The answer would let the agent run again and the conversation's budget is used up; nothing was recorded |
+| 403 | `FORBIDDEN` / `action_forbidden` | Not your conversation / `hitl.authorizeResolve` says no |
 | 404 | `NOT_FOUND` | Unknown conversation, or the agent cannot resolve actions |
 | 409 | `action_not_pending` | Unknown or already resolved |
-| 409 | `conversation_busy` | A turn is running in the conversation, including another answer to the same pause |
+| 409 | `conversation_busy` | A message or a continuation is running in the conversation (another answer to the same pause is waited for, up to `hitl.resolveWaitMs`) |
+| 410 | `action_expired` | The request lapsed (`expiresAt`); the expiry sweep handles it per `hitl.onTimeout` |
 
 While a conversation has a pending action, `POST /conversations/:id/messages` answers `409 action_pending` (`error.details.pendingActionIds`), unless the server was configured with `pendingActionPolicy: 'cancel'`.
 
-`GET /conversations/:id` includes `pendingActions` (omitted when there are none) so a reloaded UI can render the open request.
+`GET /conversations/:id` includes `pendingActions` (omitted when there are none) so a reloaded UI can render the open request, and the paused message's `metadata.pendingActions` records how each action ended.
+
+### Remembered tools
+
+```
+GET    /conversations/:id/remembered-tools
+DELETE /conversations/:id/remembered-tools/:tool
+```
+
+The tools whose approval the person chose to remember for the conversation (`rememberForSession`), and a way to forget one. Both answer `{ "tools": ["deploy"] }`; `DELETE` is `404` for a tool that is not
+remembered. See [Remembered tools](../guide/human-in-the-loop#remembered-tools).
 
 ## Runs
 
@@ -375,6 +400,23 @@ Aborts the turn that is running, or cancels the actions a paused conversation wa
 ```
 
 `cancelled: false` when there was nothing to cancel. `404` for an unknown conversation, `403` for somebody else's.
+
+### Continue
+
+```
+POST /conversations/:id/continue
+```
+
+Carries on a turn the conversation's budget stopped, with no new message. Body `{ "stream": true }` is optional. Response: the same as [resolving an action](#resolve-a-pending-action).
+
+| Status | Code | When |
+|--------|------|------|
+| 402 | `budget_reached` | The budget is still used up: raise it first (`PATCH /conversations/:id`) |
+| 409 | `action_pending` | The conversation waits on a person |
+| 409 | `nothing_to_continue` | No turn was stopped by the budget (or it was carried on already) |
+| 409 | `conversation_busy` | A turn is running |
+
+See [Usage & Budgets](../guide/budgets).
 
 ### Events
 

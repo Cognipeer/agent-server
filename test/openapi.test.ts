@@ -55,4 +55,35 @@ describe("OpenAPI spec", () => {
     expect(schemas.Agent.properties.capabilities.properties.attachments).toEqual({ $ref: "#/components/schemas/AttachmentsCapability" });
     expect(schemas.ListFilesResponse.required).toContain("maxFiles");
   });
+
+  it("documents approvals that lapse, who may answer, budgets, continue and remembered tools", async () => {
+    const spec = generateOpenAPISpec({ basePath: "/api", storage: await memoryStorage() }, []);
+    for (const [path, method] of [
+      ["/conversations/{conversationId}/continue", "post"],
+      ["/conversations/{conversationId}/remembered-tools", "get"],
+      ["/conversations/{conversationId}/remembered-tools/{tool}", "delete"],
+      ["/conversations/{conversationId}", "patch"],
+    ] as const) {
+      expect((spec.paths[path] as Record<string, unknown>)?.[method], `${method} ${path}`).toBeDefined();
+    }
+    const paths = spec.paths as Record<string, any>;
+    expect(Object.keys(paths["/conversations/{conversationId}/actions/{actionId}"].post.responses)).toEqual(
+      expect.arrayContaining(["200", "400", "402", "403", "404", "409", "410"])
+    );
+    expect(Object.keys(paths["/conversations/{conversationId}/messages"].post.responses)).toContain("402");
+    expect(paths["/conversations/{conversationId}"].patch.requestBody.content["application/json"].schema).toEqual({
+      $ref: "#/components/schemas/UpdateConversationRequest",
+    });
+
+    const schemas = spec.components.schemas as Record<string, any>;
+    expect(Object.keys(schemas.Conversation.properties)).toEqual(expect.arrayContaining(["budget", "spentUsd", "rememberedTools"]));
+    expect(schemas.SessionBudget.properties.onReach.enum).toEqual(["pause", "stop"]);
+    expect(Object.keys(schemas.UsageInfo.properties)).toEqual(expect.arrayContaining(["cachedInputTokens", "costUsd"]));
+    expect(schemas.SendMessageResponse.properties.usage).toEqual({ $ref: "#/components/schemas/UsageInfo" });
+    expect(schemas.SendMessageResponse.properties.spentUsd).toBeDefined();
+    expect(schemas.CreateConversationRequest.properties.budget).toBeDefined();
+    expect(schemas.PendingAction.properties.questions.items.properties.options.items.properties.preview).toBeDefined();
+    expect(schemas.ActionSnapshot.properties.status.enum).toEqual(["pending", "resolved", "cancelled", "expired"]);
+    expect(schemas.StreamActionResolvedEvent.properties.resolution.properties.expired).toBeDefined();
+  });
 });

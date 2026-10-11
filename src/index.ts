@@ -103,6 +103,19 @@ export type {
   TurnWarning,
   ResolveActionParams,
   AgentCapabilities,
+  AgentHitlConfig,
+  HitlConfig,
+  ActionSnapshot,
+  ActionStatus,
+  SessionBudget,
+  ModelPricing,
+  PricingFn,
+  BudgetChange,
+  UsageInfo,
+  UpdateMessageParams,
+  UpdateConversationRequest,
+  ContinueConversationRequest,
+  RememberedToolsResponse,
   AttachmentsCapability,
   FilesConfig,
   AgentFilesConfig,
@@ -175,6 +188,9 @@ export {
   isRawUploadRequest,
 } from "./files/config.js";
 export { defaultExtractText } from "./files/extract.js";
+
+// Usage and budgets
+export { costEstimatorFromPricing } from "./usage.js";
 
 // Run lifecycle and the event log
 export { EVENT_TYPES, MemoryEventLog, nextStopReason } from "./events.js";

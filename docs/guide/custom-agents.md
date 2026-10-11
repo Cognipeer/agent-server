@@ -36,11 +36,15 @@ interface ProcessMessageResult {
     inputTokens?: number;
     outputTokens?: number;
     totalTokens?: number;
+    costUsd?: number;   // what the turn cost: counts toward the conversation's budget (see "Usage & Budgets")
+    model?: string;     // or name the model and let the server's `pricing` price the tokens
   };
   status?: 'completed' | 'requires_action' | 'incomplete' | 'cancelled';
-  pendingActions?: PendingAction[];  // see "Approvals & Questions"
+  pendingActions?: PendingAction[];  // see "Approvals & Questions"; give one an `expiresAt` of its own, or the server stamps hitl.timeoutMinutes
 }
 ```
+
+`state` is yours: it replaces the visible state of the conversation, and the server's own bookkeeping (pause state, remembered tools, spend) is kept next to it whatever you return.
 
 ## Basic Example
 

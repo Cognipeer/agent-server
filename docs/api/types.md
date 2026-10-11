@@ -74,6 +74,19 @@ interface Conversation {
   updatedAt: Date;
   /** Computed by the API on GET /conversations and GET /conversations/:id; never stored. */
   runtime?: ConversationRuntime;
+  /** The spend limit of the conversation (its own, or its agent's default) and what it has spent. See guide/budgets. */
+  budget?: SessionBudget | null;
+  spentUsd?: number;
+  /** Tools the person asked not to be asked about again. */
+  rememberedTools?: string[];
+  /** Storage only (never sent to clients): bumped by every update; the earliest deadline of the open actions. */
+  version?: number;
+  actionDueAt?: Date;
+}
+
+interface SessionBudget {
+  maxCostUsd: number;
+  onReach: 'pause' | 'stop';   // pause: the conversation waits and can be continued; stop: it ends
 }
 ```
 
@@ -119,16 +132,22 @@ interface SendMessageResponse {
   message: Message;              // the user message
   response: Message;             // the assistant message (status, metadata.stopReason)
   conversationTitle?: string;
-  usage?: {
-    inputTokens?: number;
-    outputTokens?: number;
-    totalTokens?: number;
-  };
+  usage?: UsageInfo;             // what this turn used
   status?: 'requires_action' | 'incomplete' | 'cancelled';   // only when the turn did not simply complete
   pendingActions?: PendingAction[];
   warnings?: TurnWarning[];
   stopReason?: StopReason;
   runId?: string;                // the run that executed the turn
+  budget?: SessionBudget;        // the conversation's budget and what it has spent, when it has one
+  spentUsd?: number;
+}
+
+interface UsageInfo {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  cachedInputTokens?: number;    // included in inputTokens
+  costUsd?: number;              // when the agent's models are priced (the server's `pricing`)
 }
 ```
 
@@ -180,6 +199,13 @@ interface CreateConversationRequest {
   agentId: string;
   title?: string;
   metadata?: Record<string, unknown>;
+  budget?: { maxCostUsd: number; onReach?: 'pause' | 'stop' } | null;
+}
+
+interface UpdateConversationRequest {            // PATCH /conversations/:id
+  title?: string;
+  metadata?: Record<string, unknown>;
+  budget?: { maxCostUsd: number; onReach?: 'pause' | 'stop' } | null;   // null removes it; raising needs authorizeBudget
 }
 ```
 
@@ -321,8 +347,16 @@ interface UserQuestion {
   multiSelect?: boolean;
   placeholder?: string;
   required?: boolean;
-  options?: Array<{ label: string; value?: string; description?: string }>;
+  options?: Array<{ label: string; value?: string; description?: string; preview?: string }>;
 }
+
+/** An action on the paused message (metadata.pendingActions): as it was asked, and how it ended. */
+type ActionSnapshot = PendingAction & {
+  status: 'pending' | 'resolved' | 'cancelled' | 'expired';
+  resolution?: ActionResolution;
+  resolvedBy?: string;           // a user id, 'system:timeout' or 'system'
+  resolvedAt?: string;
+};
 ```
 
 ### ActionResolution
@@ -448,6 +482,12 @@ interface UpdateConversationParams {
   title?: string;
   metadata?: Record<string, unknown>;
   state?: Record<string, unknown>;
+  actionDueAt?: Date | null;     // when the earliest open approval lapses; null clears it
+}
+
+interface UpdateMessageParams {
+  content?: string | ContentPart[];
+  metadata?: Record<string, unknown>;   // replaces the message's metadata
 }
 ```
 

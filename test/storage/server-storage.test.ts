@@ -285,13 +285,16 @@ for (const name of PROVIDER_NAMES) {
         const refusing = new Proxy(inner, {
           get(target, prop, receiver) {
             const value = Reflect.get(target, prop, receiver);
-            if (prop === "updateConversation") {
-              return async (id: string, params: { state?: Record<string, unknown> }, ctx: unknown) => {
+            // (a state write is a plain update or a compare-and-set one: the store refuses both)
+            if (prop === "updateConversation" || prop === "updateConversationIf") {
+              const conditional = prop === "updateConversationIf";
+              return async (id: string, ...rest: any[]) => {
+                const params = (conditional ? rest[1] : rest[0]) as { state?: Record<string, unknown> };
                 if (params.state && (params.state as any).__agentServerHitl?.pending) {
                   refused++;
                   throw Object.assign(new Error("too large for this store"), { statusCode: 413, code: "STORAGE_LIMIT_EXCEEDED" });
                 }
-                return target.updateConversation(id, params as any, ctx as any);
+                return (target as any)[prop](id, ...rest);
               };
             }
             return typeof value === "function" ? value.bind(target) : value;
@@ -313,10 +316,12 @@ for (const name of PROVIDER_NAMES) {
         const broken = new Proxy(inner, {
           get(target, prop, receiver) {
             const value = Reflect.get(target, prop, receiver);
-            if (prop === "updateConversation") {
-              return async (id: string, params: { state?: Record<string, unknown> }, ctx: unknown) => {
+            if (prop === "updateConversation" || prop === "updateConversationIf") {
+              const conditional = prop === "updateConversationIf";
+              return async (id: string, ...rest: any[]) => {
+                const params = (conditional ? rest[1] : rest[0]) as { state?: Record<string, unknown> };
                 if ((params.state as any)?.__agentServerHitl?.pending) throw new Error("connection lost");
-                return target.updateConversation(id, params as any, ctx as any);
+                return (target as any)[prop](id, ...rest);
               };
             }
             return typeof value === "function" ? value.bind(target) : value;

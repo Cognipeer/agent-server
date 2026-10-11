@@ -206,7 +206,19 @@ const updated = await storage.updateConversation('conv-123', {
 });
 ```
 
-Throws `NotFoundError` if conversation doesn't exist.
+Throws `NotFoundError` if conversation doesn't exist. Every update bumps `conversation.version`; `params.actionDueAt` (a `Date`, `null` clears it) records when the earliest open approval lapses.
+
+#### updateConversationIf(id, ifVersion, params)
+
+Compare-and-set (`capabilities().atomicUpdate`, all built-in providers): updates only if the conversation is still at `ifVersion`, resolves the updated conversation, or `null` when someone else updated it first.
+
+```typescript
+const fresh = await storage.getConversation('conv-123');
+const updated = await storage.updateConversationIf!('conv-123', fresh!.version!, { state: { ...fresh!.state, step: 2 } });
+if (!updated) {
+  // somebody was faster: read again and redo the change
+}
+```
 
 #### deleteConversation(id)
 

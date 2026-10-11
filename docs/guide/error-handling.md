@@ -28,6 +28,22 @@ class ServerError extends Error {
 }
 ```
 
+## Codes worth handling
+
+Besides `400` / `401` / `404`, these have a meaning of their own (the code is `error.code` of the response):
+
+| Status | Code | Meaning |
+|--------|------|---------|
+| 402 | `budget_reached` | The conversation's [budget](./budgets.md) is used up (`details`: `spentUsd`, `maxCostUsd`, `onReach`); raise it to carry on |
+| 403 | `action_forbidden` | `hitl.authorizeResolve` says you may not answer this request |
+| 403 | `budget_forbidden` | Raising or removing a budget needs `authorizeBudget` |
+| 400 | `invalid_approved_args` | The edited arguments are not accepted by the tool's schema |
+| 400 | `invalid_budget` / `budget_unavailable` | Not a budget / the agent has no pricing to count a budget against |
+| 409 | `action_pending` / `action_not_pending` | A message while a request is open / an answer to a request that is gone |
+| 409 | `conversation_busy` | A turn is already running in the conversation |
+| 409 | `nothing_to_continue` | No turn was stopped by the budget |
+| 410 | `action_expired` | The approval or question lapsed |
+
 ## Error Responses
 
 All errors are returned as JSON:

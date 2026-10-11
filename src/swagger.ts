@@ -109,10 +109,92 @@ function generateSchemas(): Record<string, unknown> {
         metadata: { type: "object", additionalProperties: true },
         state: { type: "object", additionalProperties: true },
         runtime: { $ref: "#/components/schemas/ConversationRuntime" },
+        budget: {
+          $ref: "#/components/schemas/SessionBudget",
+          description: "The conversation's spend limit, when it has one (its own, or the agent's default).",
+        },
+        spentUsd: {
+          type: "number",
+          description: "What the conversation's turns cost so far, in USD. Counted when the agent has a pricing function.",
+        },
+        rememberedTools: {
+          type: "array",
+          items: { type: "string" },
+          description: "Tools the person asked not to be asked about again in this conversation (GET / DELETE .../remembered-tools).",
+        },
         createdAt: { type: "string", format: "date-time" },
         updatedAt: { type: "string", format: "date-time" },
       },
       required: ["id", "agentId", "createdAt", "updatedAt"],
+    },
+    SessionBudget: {
+      type: "object",
+      description:
+        "A spend limit for one conversation. Reaching it ends the turn that crossed it (stopReason budget_reached) and event budget.reached; " +
+        "every further message is refused with 402 budget_reached until the limit is raised.",
+      properties: {
+        maxCostUsd: { type: "number", exclusiveMinimum: 0, description: "Largest total cost of the conversation's turns, in USD." },
+        onReach: {
+          type: "string",
+          enum: ["pause", "stop"],
+          default: "pause",
+          description:
+            "pause: the conversation waits (runtime.status budget_paused); raise the budget and POST .../continue carries the stopped turn on. " +
+            "stop: it ends (runtime.status idle) and nothing is kept to carry on from.",
+        },
+      },
+      required: ["maxCostUsd"],
+    },
+    UsageInfo: {
+      type: "object",
+      description:
+        "What a turn used. An agent-sdk agent's usage is turned into the totals of this turn alone: a turn resumed after an approval counts only what it used after the resume.",
+      properties: {
+        inputTokens: { type: "integer" },
+        outputTokens: { type: "integer" },
+        totalTokens: { type: "integer" },
+        cachedInputTokens: { type: "integer", description: "Input tokens the provider served from its cache (included in inputTokens)." },
+        costUsd: { type: "number", description: "What the turn cost, in USD, when the agent's models are priced (the server's pricing option)." },
+      },
+    },
+    ActionSnapshot: {
+      type: "object",
+      description:
+        "An action on the paused assistant message (metadata.pendingActions): the PendingAction as it was asked, plus how it ended. " +
+        "status is pending while it waits, resolved (approved, denied or answered - see resolution), cancelled (withdrawn by a new message " +
+        "or POST .../cancel) or expired (it lapsed under hitl.onTimeout: cancel).",
+      allOf: [{ $ref: "#/components/schemas/PendingAction" }],
+      properties: {
+        status: { type: "string", enum: ["pending", "resolved", "cancelled", "expired"] },
+        resolution: { type: "object", additionalProperties: true, description: "What was answered (the ActionResolution)." },
+        resolvedBy: { type: "string", description: "The user id, system:timeout for a request that lapsed, system for a withdrawn one." },
+        resolvedAt: { type: "string", format: "date-time" },
+      },
+      required: ["status"],
+    },
+    UpdateConversationRequest: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        metadata: { type: "object", additionalProperties: true },
+        budget: {
+          oneOf: [{ $ref: "#/components/schemas/SessionBudget" }, { type: "null" }],
+          description:
+            "Sets the conversation's spend limit; null removes it. Lowering it is the owner's to do; raising or removing it goes through the " +
+            "authorizeBudget option (403 budget_forbidden when it is not set). It must be above what the conversation has spent (400 invalid_budget).",
+        },
+      },
+    },
+    ContinueConversationRequest: {
+      type: "object",
+      properties: {
+        stream: { type: "boolean", default: false, description: "Stream the continuation as SSE." },
+      },
+    },
+    RememberedToolsResponse: {
+      type: "object",
+      properties: { tools: { type: "array", items: { type: "string" } } },
+      required: ["tools"],
     },
     ConversationRuntime: {
       type: "object",
@@ -280,6 +362,11 @@ function generateSchemas(): Record<string, unknown> {
         userId: { type: "string", description: "User ID for the conversation owner. If not provided, resolved from auth token or resolveUserId callback." },
         title: { type: "string" },
         metadata: { type: "object", additionalProperties: true },
+        budget: {
+          oneOf: [{ $ref: "#/components/schemas/SessionBudget" }, { type: "null" }],
+          description:
+            "A spend limit for this conversation (null: none). Without one it starts with the agent's. Above the default needs authorizeBudget (403 budget_forbidden).",
+        },
       },
       required: ["agentId"],
     },
@@ -321,14 +408,7 @@ function generateSchemas(): Record<string, unknown> {
       properties: {
         message: { $ref: "#/components/schemas/Message" },
         response: { $ref: "#/components/schemas/Message" },
-        usage: {
-          type: "object",
-          properties: {
-            inputTokens: { type: "integer" },
-            outputTokens: { type: "integer" },
-            totalTokens: { type: "integer" },
-          },
-        },
+        usage: { $ref: "#/components/schemas/UsageInfo" },
         status: {
           type: "string",
           enum: ["completed", "requires_action", "incomplete", "cancelled"],
@@ -341,6 +421,8 @@ function generateSchemas(): Record<string, unknown> {
         warnings: { type: "array", items: { $ref: "#/components/schemas/TurnWarning" } },
         stopReason: { $ref: "#/components/schemas/StopReason" },
         runId: { type: "string", description: "The run that executed the turn; its events carry it as run_id." },
+        budget: { $ref: "#/components/schemas/SessionBudget" },
+        spentUsd: { type: "number", description: "What the conversation has spent after this turn (only with a budget)." },
       },
       required: ["message", "response"],
     },
@@ -378,7 +460,7 @@ function generateSchemas(): Record<string, unknown> {
         toolName: { type: "string" },
         toolCallId: { type: "string" },
         title: { type: "string" },
-        summary: { type: "string" },
+        summary: { type: "string", description: "A one-line description of what approving does." },
         args: { type: "object", additionalProperties: true },
         questions: {
           type: "array",
@@ -398,6 +480,7 @@ function generateSchemas(): Record<string, unknown> {
                     label: { type: "string" },
                     value: { type: "string" },
                     description: { type: "string" },
+                    preview: { type: "string", description: "A code or ASCII preview shown while the option is focused." },
                   },
                   required: ["label"],
                 },
@@ -407,7 +490,13 @@ function generateSchemas(): Record<string, unknown> {
           },
         },
         allowFreeText: { type: "boolean" },
-        expiresAt: { type: "string", format: "date-time" },
+        expiresAt: {
+          type: "string",
+          format: "date-time",
+          description:
+            "When the request lapses (the agent's own, else now + hitl.timeoutMinutes; absent when the timeout is 0). After it the action " +
+            "answers 410 action_expired and hitl.onTimeout decides what happens.",
+        },
       },
       required: ["id", "type"],
     },
@@ -452,19 +541,14 @@ function generateSchemas(): Record<string, unknown> {
       type: "object",
       properties: {
         response: { $ref: "#/components/schemas/Message" },
-        usage: {
-          type: "object",
-          properties: {
-            inputTokens: { type: "integer" },
-            outputTokens: { type: "integer" },
-            totalTokens: { type: "integer" },
-          },
-        },
+        usage: { $ref: "#/components/schemas/UsageInfo" },
         status: { type: "string", enum: ["completed", "requires_action", "incomplete", "cancelled"] },
         pendingActions: { type: "array", items: { $ref: "#/components/schemas/PendingAction" } },
         warnings: { type: "array", items: { $ref: "#/components/schemas/TurnWarning" } },
         stopReason: { $ref: "#/components/schemas/StopReason" },
         runId: { type: "string" },
+        budget: { $ref: "#/components/schemas/SessionBudget" },
+        spentUsd: { type: "number" },
       },
       required: ["response"],
     },
@@ -608,19 +692,14 @@ function generateSchemas(): Record<string, unknown> {
         conversationId: { type: "string" },
         messageId: { type: "string" },
         content: { type: "string" },
-        usage: {
-          type: "object",
-          properties: {
-            inputTokens: { type: "integer" },
-            outputTokens: { type: "integer" },
-            totalTokens: { type: "integer" },
-          },
-        },
+        usage: { $ref: "#/components/schemas/UsageInfo" },
         status: { type: "string", enum: ["completed", "requires_action", "incomplete", "cancelled"] },
         pendingActions: { type: "array", items: { $ref: "#/components/schemas/PendingAction" } },
         warnings: { type: "array", items: { $ref: "#/components/schemas/TurnWarning" } },
         stopReason: { $ref: "#/components/schemas/StopReason" },
         runId: { type: "string" },
+        budget: { $ref: "#/components/schemas/SessionBudget" },
+        spentUsd: { type: "number" },
       },
     },
     StreamActionRequiredEvent: {
@@ -650,6 +729,7 @@ function generateSchemas(): Record<string, unknown> {
             type: { type: "string", enum: ["tool_approval", "user_question"] },
             decision: { type: "string", enum: ["allow", "deny"] },
             cancelled: { type: "boolean" },
+            expired: { type: "boolean", description: "The request lapsed and hitl.onTimeout answered it." },
           },
         },
       },
@@ -981,12 +1061,16 @@ function generatePaths(
             },
           },
           400: {
-            description: "Validation error",
+            description: "Validation error (invalid_budget: not a budget; budget_unavailable: the agent has no pricing)",
             content: {
               "application/json": {
                 schema: { $ref: "#/components/schemas/Error" },
               },
             },
+          },
+          403: {
+            description: "budget_forbidden: a budget above the default needs the authorizeBudget option",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
         },
       },
@@ -1088,24 +1172,26 @@ function generatePaths(
           required: true,
           content: {
             "application/json": {
-              schema: {
-                type: "object",
-                properties: {
-                  title: { type: "string" },
-                  metadata: { type: "object", additionalProperties: true },
-                },
-              },
+              schema: { $ref: "#/components/schemas/UpdateConversationRequest" },
             },
           },
         },
         responses: {
           200: {
-            description: "Conversation updated",
+            description: "Conversation updated (with its runtime when the budget was changed)",
             content: {
               "application/json": {
                 schema: { $ref: "#/components/schemas/Conversation" },
               },
             },
+          },
+          400: {
+            description: "invalid_budget: not a budget, or not above what the conversation has spent. budget_unavailable: the agent has no pricing.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+          403: {
+            description: "Not your conversation, or budget_forbidden: raising or removing a budget needs the authorizeBudget option.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
           404: {
             description: "Conversation not found",
@@ -1220,6 +1306,11 @@ function generatePaths(
               },
             },
           },
+          402: {
+            description:
+              "budget_reached: the conversation's budget is used up (details.spentUsd / maxCostUsd / onReach). Nothing was stored; raise the budget (PATCH /conversations/{id}).",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
           404: {
             description: "Conversation not found",
             content: {
@@ -1271,15 +1362,90 @@ function generatePaths(
             description: "Validation error (bad resolution or answers)",
             content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
+          402: {
+            description: "budget_reached: this answer would let the agent run again, and the conversation's budget is used up. Nothing was recorded.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+          403: {
+            description: "Not your conversation (or, with hitl.authorizeResolve, action_forbidden: you may not answer this request)",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
           404: {
             description: "Conversation not found, or the agent cannot resolve actions",
             content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
           409: {
             description:
-              "action_not_pending: unknown or already resolved action. conversation_busy: a turn is already running in the conversation.",
+              "action_not_pending: unknown or already resolved action. conversation_busy: a turn is already running in the conversation " +
+              "(an answer that meets another answer waits for it up to hitl.resolveWaitMs first).",
             content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
+          410: {
+            description: "action_expired: the request lapsed (expiresAt). It is handled by the expiry sweep, per hitl.onTimeout.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+        },
+      },
+    },
+    "/conversations/{conversationId}/continue": {
+      post: {
+        tags: ["Runs"],
+        summary: "Carry on a turn the conversation's budget stopped",
+        description:
+          "Resumes the agent from the state the budget stopped it in, with no new message (JSON, or SSE when stream is true). Raise the budget " +
+          "first (PATCH /conversations/{id}). 402 budget_reached while it is still used up; 409 action_pending while the conversation waits on a " +
+          "person; 409 nothing_to_continue when no turn was stopped by the budget (onReach: stop keeps nothing to carry on from, and a turn that " +
+          "only crossed the budget finished its answer).",
+        operationId: "continueConversation",
+        parameters: [{ name: "conversationId", in: "path", required: true, schema: { type: "string" } }],
+        requestBody: {
+          required: false,
+          content: { "application/json": { schema: { $ref: "#/components/schemas/ContinueConversationRequest" } } },
+        },
+        responses: {
+          200: {
+            description: "The continuation; JSON, or text/event-stream when stream is true",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/ResolveActionResponse" } } },
+          },
+          402: { description: "budget_reached", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+          403: { description: "Not your conversation", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+          404: { description: "Conversation not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+          409: {
+            description: "conversation_busy, action_pending or nothing_to_continue",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+        },
+      },
+    },
+    "/conversations/{conversationId}/remembered-tools": {
+      get: {
+        tags: ["Messages"],
+        summary: "Tools approved \"for the session\"",
+        description:
+          "The tools whose approval the person chose to remember (rememberForSession): later calls of them in this conversation run without asking, " +
+          "and are logged as action.resolved with resolved_by remembered.",
+        operationId: "listRememberedTools",
+        parameters: [{ name: "conversationId", in: "path", required: true, schema: { type: "string" } }],
+        responses: {
+          200: { description: "The tools", content: { "application/json": { schema: { $ref: "#/components/schemas/RememberedToolsResponse" } } } },
+          403: { description: "Not your conversation", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+          404: { description: "Conversation not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+        },
+      },
+    },
+    "/conversations/{conversationId}/remembered-tools/{tool}": {
+      delete: {
+        tags: ["Messages"],
+        summary: "Forget a remembered tool: it asks for approval again",
+        operationId: "revokeRememberedTool",
+        parameters: [
+          { name: "conversationId", in: "path", required: true, schema: { type: "string" } },
+          { name: "tool", in: "path", required: true, schema: { type: "string" } },
+        ],
+        responses: {
+          200: { description: "The tools that are still remembered", content: { "application/json": { schema: { $ref: "#/components/schemas/RememberedToolsResponse" } } } },
+          403: { description: "Not your conversation", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+          404: { description: "Conversation not found, or the tool is not remembered", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
         },
       },
     },

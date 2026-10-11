@@ -32,6 +32,7 @@ import type {
   UpdateConversationParams,
   CreateMessageParams,
   GetMessagesParams,
+  UpdateMessageParams,
   SaveFileParams,
   CreateTaskParams,
   GetTasksParams,
@@ -152,9 +153,11 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       // GridFS: bounded only by what one Buffer can hold
       maxFileBytes: MAX_BUFFER_BYTES,
       maxStateBytes: this.maxStateBytes,
+      atomicUpdate: true,
       events: true,
       leases: true,
       fileIndex: true,
+      actionDeadlines: true,
     };
   }
 
@@ -250,6 +253,8 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
     await conversations.createIndex({ userId: 1, createdAt: -1, seq: -1 });
     await conversations.createIndex({ createdAt: -1, seq: -1 });
     await conversations.createIndex({ updatedAt: -1, seq: -1 });
+    // The expiry sweep only looks at conversations that wait on an action with a deadline
+    await conversations.createIndex({ actionDueAt: 1 }, { partialFilterExpression: { actionDueAt: { $type: "date" } } });
 
     const messages = this.db.collection(this.collections.messages);
     await messages.createIndex({ conversationId: 1, createdAt: 1, seq: 1 });
@@ -349,6 +354,7 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       state: params.state || {},
       createdAt: now,
       updatedAt: now,
+      version: 0,
       seq: nextSeq(),
     };
 
@@ -381,6 +387,7 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
     const filter: Record<string, unknown> = {};
     if (params.agentId) filter.agentId = params.agentId;
     if (params.userId) filter.userId = params.userId;
+    if (params.actionDueBefore) filter.actionDueAt = { $type: "date", $lte: params.actionDueBefore };
 
     const collection = this.db.collection<MongoConversation>(this.collections.conversations);
 
@@ -390,7 +397,7 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
     // Get paginated results
     const docs = await collection
       .find(filter)
-      .sort({ [orderBy]: order, seq: order })
+      .sort(params.actionDueBefore ? { actionDueAt: 1, seq: 1 } : { [orderBy]: order, seq: order })
       .skip(normalized.offset)
       .limit(normalized.limit)
       .toArray();
@@ -410,15 +417,10 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
     if (!this.db) throw new Error("Database not initialized");
     this.assertStateFits(params.state);
 
-    const update: Record<string, unknown> = { updatedAt: new Date() };
-    if (params.title !== undefined) update.title = params.title;
-    if (params.metadata !== undefined) update.metadata = params.metadata;
-    if (params.state !== undefined) update.state = params.state;
-
     const result = await this.guarded(() =>
       this.db!.collection<MongoConversation>(this.collections.conversations).updateOne(
         { _id: id },
-        { $set: update }
+        this.conversationUpdate(params)
       )
     );
 
@@ -429,6 +431,38 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
     const updated = await this._getConversation(id);
     if (!updated) throw new NotFoundError("Conversation", id);
     return updated;
+  }
+
+  /** The update document of a conversation update (every update bumps `version`). */
+  private conversationUpdate(params: UpdateConversationParams): Record<string, unknown> {
+    const set: Record<string, unknown> = { updatedAt: new Date() };
+    if (params.title !== undefined) set.title = params.title;
+    if (params.metadata !== undefined) set.metadata = params.metadata;
+    if (params.state !== undefined) set.state = params.state;
+    const update: Record<string, unknown> = { $inc: { version: 1 } };
+    if (params.actionDueAt instanceof Date) set.actionDueAt = params.actionDueAt;
+    else if (params.actionDueAt === null) update.$unset = { actionDueAt: "" };
+    update.$set = set;
+    return update;
+  }
+
+  protected async _updateConversationIf(
+    id: string,
+    ifVersion: number,
+    params: UpdateConversationParams
+  ): Promise<Conversation | null> {
+    if (!this.db) throw new Error("Database not initialized");
+    this.assertStateFits(params.state);
+
+    // A conversation written before versions existed has none: that is version 0
+    const versionIs = ifVersion === 0 ? { $or: [{ version: 0 }, { version: { $exists: false } }] } : { version: ifVersion };
+    const collection = this.db.collection<MongoConversation>(this.collections.conversations);
+    const doc = await this.guarded(() =>
+      collection.findOneAndUpdate({ _id: id, ...versionIs }, this.conversationUpdate(params), { returnDocument: "after" })
+    );
+    if (doc) return this.mapConversation(doc);
+    if (!(await collection.findOne({ _id: id }, { projection: { _id: 1 } }))) throw new NotFoundError("Conversation", id);
+    return null;
   }
 
   protected async _deleteConversation(id: string): Promise<void> {
@@ -546,6 +580,19 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       .findOne({ _id: id });
 
     return doc ? this.mapMessage(doc) : null;
+  }
+
+  protected async _updateMessage(id: string, params: UpdateMessageParams): Promise<Message> {
+    if (!this.db) throw new Error("Database not initialized");
+    const set: Record<string, unknown> = { updatedAt: new Date() };
+    if (params.content !== undefined) set.content = params.content;
+    if (params.metadata !== undefined) set.metadata = params.metadata;
+    const collection = this.db.collection<MongoMessage>(this.collections.messages);
+    const result = await this.guarded(() => collection.updateOne({ _id: id }, { $set: set }));
+    if (result.matchedCount === 0) throw new NotFoundError("Message", id);
+    const doc = await collection.findOne({ _id: id });
+    if (!doc) throw new NotFoundError("Message", id);
+    return this.mapMessage(doc);
   }
 
   protected async _deleteMessage(id: string): Promise<void> {
@@ -1119,6 +1166,8 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       state: doc.state,
       createdAt: doc.createdAt,
       updatedAt: doc.updatedAt,
+      version: doc.version ?? 0,
+      actionDueAt: doc.actionDueAt ?? undefined,
     };
   }
 
@@ -1201,6 +1250,10 @@ interface MongoConversation {
   state: Record<string, unknown>;
   createdAt: Date;
   updatedAt: Date;
+  /** Bumped by every update (compare-and-set); absent on documents written before it existed. */
+  version?: number;
+  /** When the earliest pending action lapses. */
+  actionDueAt?: Date;
   /** Insertion sequence: breaks ties between rows created in the same millisecond. */
   seq?: number;
 }
