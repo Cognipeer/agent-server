@@ -243,6 +243,36 @@ export function runStorageContract(
         });
       });
 
+      it("lists pinned conversations first, across pages, each group in the requested order", async () => {
+        expect(caps().pinnedFirst).toBe(true);
+        await withFrozenDate(T0, async (clock) => {
+          const agentId = uniq("agent");
+          const ids: string[] = [];
+          for (let i = 0; i < 7; i++) {
+            clock.set(T0 + i * 1000);
+            ids.push((await s().createConversation({ agentId, userId: "pinner", metadata: i % 3 === 0 ? { pinned: true, n: i } : { n: i } })).id);
+          }
+          // pinned: 0, 3, 6 - the rest: 1, 2, 4, 5. A conversation that says `pinned: false` is not pinned
+          await s().updateConversation(ids[2]!, { metadata: { pinned: false } });
+          const order = (rows: Array<{ id: string }>) => rows.map((row) => ids.indexOf(row.id));
+          const newestFirst = await s().getConversations({ agentId, userId: "pinner", pinnedFirst: true, limit: 50 });
+          expect(order(newestFirst.data)).toEqual([6, 3, 0, 5, 4, 2, 1]);
+          expect(newestFirst.total).toBe(7);
+          const oldestFirst = await s().getConversations({ agentId, userId: "pinner", pinnedFirst: true, order: "asc", limit: 50 });
+          expect(order(oldestFirst.data)).toEqual([0, 3, 6, 1, 2, 4, 5]);
+
+          // the groups hold across pages: every conversation exactly once
+          const seen: number[] = [];
+          for (let offset = 0; offset < 7; offset += 3) {
+            seen.push(...order((await s().getConversations({ agentId, userId: "pinner", pinnedFirst: true, limit: 3, offset })).data));
+          }
+          expect(seen).toEqual([6, 3, 0, 5, 4, 2, 1]);
+
+          // without the flag nothing changes
+          expect(order((await s().getConversations({ agentId, userId: "pinner", limit: 50 })).data)).toEqual([6, 5, 4, 3, 2, 1, 0]);
+        });
+      });
+
       it("round-trips awkward metadata and state exactly as JSON", async () => {
         const input = awkwardJson();
         const expected = jsonRoundTrip(input);

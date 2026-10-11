@@ -19,6 +19,7 @@ export type {
   // Message types
   ContentPart,
   Message,
+  MessageFeedback,
   ToolCall,
   FileAttachment,
 
@@ -38,6 +39,11 @@ export type {
 
   // Agent types
   AgentInfo,
+  AgentInfoMetadata,
+  AgentExperience,
+  ResolvedExperience,
+  ConversationStarter,
+  TurnMode,
   AgentHandler,
   ProcessMessageParams,
   ProcessMessageResult,
@@ -54,6 +60,7 @@ export type {
   HostCancelInput,
   HostCancelReason,
   HostTurnResult,
+  FeedbackEvent,
 
   // Storage provider types
   StorageProvider,
@@ -97,6 +104,15 @@ export type {
   // Configuration types
   AgentServerConfig,
   TitleGenerationConfig,
+  TitleInput,
+  TitleResult,
+  FeedbackConfig,
+  ExportConfig,
+  ExportLabels,
+  RateLimitOperation,
+  RateLimitRequest,
+  RateLimitDecision,
+  AuditEntry,
   AuthConfig,
   SwaggerConfig,
   CorsConfig,
@@ -105,6 +121,12 @@ export type {
   // Request/Response types
   SendMessageRequest,
   SendMessageResponse,
+  RegenerateMessageRequest,
+  EditMessageRequest,
+  FeedbackRequest,
+  FeedbackResponse,
+  BulkDeleteRequest,
+  BulkDeleteResponse,
   ResolveActionRequest,
   ResolveActionResponse,
   PendingAction,
@@ -173,6 +195,9 @@ export type {
   StreamActionResolvedEvent,
   StreamDoneEvent,
 } from "./types.js";
+
+// Constants of the chat experience
+export { DEFAULT_FEEDBACK_REASONS, MAX_STARTERS } from "./types.js";
 
 // Error exports
 export {

@@ -60,7 +60,10 @@ export function hostAgentRegistration(definition: HostAgentDefinition): AgentReg
   if (definition.cancel !== undefined && typeof definition.cancel !== "function") {
     throw new Error(`Host agent "${id}": cancel has to be a function`);
   }
-  const { info, files, hitl, budget, pricing } = definition;
+  if (definition.feedback !== undefined && typeof definition.feedback !== "function") {
+    throw new Error(`Host agent "${id}": feedback has to be a function`);
+  }
+  const { info, files, hitl, budget, pricing, experience, titleGeneration } = definition;
   return {
     info: { ...info, name: info.name || id },
     // (called as methods of the definition, so a class instance keeps its `this`)
@@ -68,11 +71,14 @@ export function hostAgentRegistration(definition: HostAgentDefinition): AgentReg
       invoke: (input, io) => definition.invoke(input, io),
       ...(definition.resolveAction && { resolveAction: (input, io) => definition.resolveAction!(input, io) }),
       ...(definition.cancel && { cancel: (input) => definition.cancel!(input) }),
+      ...(definition.feedback && { feedback: (input) => definition.feedback!(input) }),
     },
     ...(files && { files }),
     ...(hitl && { hitl }),
     ...(budget !== undefined && { budget }),
     ...(pricing && { pricing }),
+    ...(experience && { experience }),
+    ...(titleGeneration !== undefined && { titleGeneration }),
   };
 }
 
@@ -163,7 +169,34 @@ function readAction(raw: unknown, where: string): Checked<PendingAction> {
       },
     };
   }
-  return fail(`${where}.type must be "tool_approval" or "user_question"`);
+  if (raw.type === "client_tool") {
+    if (!isText(raw.toolName)) return fail(`${where}.toolName must be a non-empty string`);
+    if (raw.args !== undefined && !isObject(raw.args)) return fail(`${where}.args must be an object`);
+    if (raw.argsSchema !== undefined && !isObject(raw.argsSchema)) return fail(`${where}.argsSchema must be a JSON Schema object`);
+    if (
+      raw.timeoutSeconds !== undefined &&
+      (typeof raw.timeoutSeconds !== "number" || !Number.isFinite(raw.timeoutSeconds) || raw.timeoutSeconds <= 0)
+    ) {
+      return fail(`${where}.timeoutSeconds must be a positive number`);
+    }
+    return {
+      ok: true,
+      value: {
+        id: raw.id,
+        type: "client_tool",
+        toolName: raw.toolName,
+        ...(optionalText(raw.toolCallId) !== undefined && { toolCallId: raw.toolCallId as string }),
+        ...(optionalText(raw.title) !== undefined && { title: raw.title as string }),
+        ...(raw.args !== undefined && { args: raw.args as Record<string, unknown> }),
+        ...(raw.argsSchema !== undefined && { argsSchema: raw.argsSchema as Record<string, unknown> }),
+        ...(raw.timeoutSeconds !== undefined && { timeoutSeconds: raw.timeoutSeconds as number }),
+        // (stamped by the server when the request is stored; one a host sends is kept)
+        ...(typeof raw.requestedAt === "string" && !Number.isNaN(Date.parse(raw.requestedAt)) && { requestedAt: raw.requestedAt }),
+        ...(expiresAt && { expiresAt }),
+      },
+    };
+  }
+  return fail(`${where}.type must be "tool_approval", "user_question" or "client_tool"`);
 }
 
 /** The pending actions a host reported, cleaned to the fields the API knows. Ids are unique within the list. */

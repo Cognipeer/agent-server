@@ -87,9 +87,26 @@ import type {
   HostCancelReason,
   HostFiles,
   HostRunIo,
+  AgentExperience,
+  AuditEntry,
+  BulkDeleteRequest,
+  BulkDeleteResponse,
+  EditMessageRequest,
+  FeedbackEvent,
+  FeedbackRequest,
+  FeedbackResponse,
+  MessageFeedback,
+  RateLimitDecision,
+  RateLimitRequest,
+  RegenerateMessageRequest,
+  ResolvedExperience,
+  TitleGenerationConfig,
+  TurnMode,
 } from "./types.js";
 import {
   BUDGET_STATE_KEY,
+  CLIENT_TOOL_MAX_OUTPUT_BYTES,
+  CLIENT_TOOL_UNANSWERED,
   HITL_STATE_KEY,
   applySdkResolution,
   earliestDeadline,
@@ -99,6 +116,7 @@ import {
   portableState,
   publicState,
   readBudget,
+  recordableResolution,
   readHitl,
   runSdkTurn,
   settleSnapshot,
@@ -174,6 +192,24 @@ import {
   type ImageSource,
 } from "./files/images.js";
 import { runWithTurnFiles, type TurnFiles } from "./files/turn.js";
+import { NotFoundError as NotFoundErrorClass } from "./types.js";
+import { experienceMetadata, resolveExperience, type ResolveInputs } from "./experience.js";
+import { assertTitleGeneration, generateConversationTitle } from "./titles.js";
+import {
+  DEFAULT_EXPORT_MAX_MESSAGES,
+  EXPORT_FORMATS,
+  exportFileName,
+  exportable,
+  htmlContentSecurityPolicy,
+  messageText,
+  renderHtml,
+  renderJson,
+  renderMarkdown,
+  resolveLabels,
+  type ExportFormat,
+  type ExportTool,
+  type Transcript,
+} from "./export.js";
 import { isDeepStrictEqual } from "node:util";
 import { nanoid } from "nanoid";
 
@@ -398,8 +434,9 @@ const cancelledStep = (content: string): AgentStep => ({ content, pending: [], c
 
 /** The same request, whatever deadline the server stamped on it. */
 const sameRequest = (a: PendingAction, b: PendingAction): boolean => {
-  const { expiresAt: _a, ...left } = a;
-  const { expiresAt: _b, ...right } = b;
+  // (the deadline and the moment a client tool was recorded are the server's stamps, not part of what was asked)
+  const { expiresAt: _a, requestedAt: _ra, ...left } = a as PendingAction & { requestedAt?: string };
+  const { expiresAt: _b, requestedAt: _rb, ...right } = b as PendingAction & { requestedAt?: string };
   return isDeepStrictEqual(left, right);
 };
 
@@ -465,6 +502,54 @@ interface PreparedAttachments {
 }
 
 /**
+ * A turn that is not a plain new message: a regeneration re-runs the user message it answers (the answers after it are replaced once
+ * the new one is stored), an edit stores a new user message in place of the old one (the old one and everything after it is removed first).
+ */
+interface TurnVariant {
+  mode: TurnMode;
+  /** The message the request named (the answer being replaced / the user message being edited). */
+  fromMessageId: string;
+  /** Regenerate: the stored user message that is answered again. */
+  user?: Message;
+  /** The messages the turn removes, oldest first: the answers a regeneration replaces / the edited message and everything after it. */
+  remove: Message[];
+  /** Edit: the user message being replaced. */
+  previousUser?: Message;
+}
+
+/** `previousContent` of a message: what it said before, newest last, at most {@link MAX_PREVIOUS_CONTENT} entries. */
+const MAX_PREVIOUS_CONTENT = 5;
+
+/** Keys of a conversation's `metadata` that only the server writes (a client's `metadata` can neither set nor drop them). */
+const SERVER_METADATA_KEYS = ["pinned", "pinnedAt", "titleGenerated"] as const;
+
+/** The longest title a rename accepts. */
+const MAX_TITLE_LENGTH = 200;
+
+interface PreviousContent {
+  content: string;
+  createdAt: string;
+  stopReason?: string;
+}
+
+function previousContentOf(old: Message): PreviousContent[] {
+  const kept = Array.isArray(old.metadata?.previousContent) ? (old.metadata!.previousContent as PreviousContent[]) : [];
+  const text = typeof old.content === "string" ? old.content : JSON.stringify(old.content);
+  return [
+    ...kept,
+    ...(text !== ""
+      ? [
+          {
+            content: text,
+            createdAt: new Date(old.createdAt).toISOString(),
+            ...(typeof old.metadata?.stopReason === "string" ? { stopReason: old.metadata.stopReason } : {}),
+          },
+        ]
+      : []),
+  ].slice(-MAX_PREVIOUS_CONTENT);
+}
+
+/**
  * The content of a stored message as a model API takes it: a user message with files is the turn the files make
  * (text plus what they add); anything else is passed as it was stored - text, or parts for a message that has them.
  */
@@ -497,6 +582,10 @@ export interface AgentRegistrationOptions {
   budget?: SessionBudget | null;
   /** Prices the tokens this agent uses (overrides the server's `pricing`). */
   pricing?: PricingFn;
+  /** What a chat client shows around this agent: welcome text, starters, message actions, history, feedback, export. Each field overrides the server's `experience`. */
+  experience?: AgentExperience;
+  /** Generated titles for this agent's conversations: its own settings, or `false` for none. Overrides the server's `titleGeneration`. */
+  titleGeneration?: TitleGenerationConfig | false;
 }
 
 /** The fields of {@link AgentRegistrationOptions} as an {@link AgentRegistration} holds them. */
@@ -506,6 +595,8 @@ function registrationExtras(options?: AgentRegistrationOptions): Partial<AgentRe
     ...(options?.hitl && { hitl: options.hitl }),
     ...(options?.budget !== undefined && { budget: options.budget }),
     ...(options?.pricing && { pricing: options.pricing }),
+    ...(options?.experience && { experience: options.experience }),
+    ...(options?.titleGeneration !== undefined && { titleGeneration: options.titleGeneration }),
   };
 }
 
@@ -583,7 +674,12 @@ function publicMessage<T extends Message>(message: T): T {
   const status =
     (message.metadata?.status as MessageStatus | undefined) ??
     (message.metadata?.requiresAction === true ? "requires_action" : "completed");
-  return { ...message, status };
+  const feedback = message.metadata?.feedback as MessageFeedback | undefined;
+  return {
+    ...message,
+    status,
+    ...(feedback && (feedback.rating === "up" || feedback.rating === "down") ? { feedback } : {}),
+  };
 }
 
 export class AgentServer {
@@ -621,6 +717,7 @@ export class AgentServer {
       for (const registration of config.agents) this.addAgent(registration.info.id, registration);
     }
     this.validateBudgets();
+    assertTitleGeneration(config.titleGeneration, "titleGeneration");
     // Token auth that is switched on but has nobody to check tokens would let every request in
     if (config.auth?.enabled && !config.auth.provider) {
       throw new Error(
@@ -713,6 +810,7 @@ export class AgentServer {
   /** Registers an agent, refusing a budget that nothing can price. */
   private addAgent(id: string, registration: AgentRegistration): void {
     this.assertBudgetUsable(registration);
+    assertTitleGeneration(registration.titleGeneration, `Agent "${registration.info.id}" titleGeneration`);
     this.agents.set(id, registration);
   }
 
@@ -890,11 +988,102 @@ export class AgentServer {
       ...(attachments.allowedMimeTypes?.length ? { allowedFileTypes: attachments.allowedMimeTypes } : {}),
       acceptsImages: attachments.acceptsImages,
     };
+    // What a chat client shows around the agent: welcome, starters, and the switches the routes enforce
+    const experience = experienceMetadata(registration.info, this.experienceInputs(registration));
     return {
       ...registration.info,
       capabilities: { ...registration.info.capabilities, attachments },
-      metadata: { ...legacy, ...registration.info.metadata },
+      metadata: { ...legacy, ...registration.info.metadata, ...experience },
     };
+  }
+
+  // ============================================================================
+  // Experience: titles, message actions, history, feedback, export
+  // ============================================================================
+
+  /** The title settings in effect for an agent: its own, else the server's; `undefined` when titles are off. */
+  private titleConfigFor(agent?: Pick<AgentRegistration, "titleGeneration">): TitleGenerationConfig | undefined {
+    if (agent?.titleGeneration === false) return undefined;
+    return agent?.titleGeneration ?? this.config.titleGeneration;
+  }
+
+  private experienceInputs(registration?: Pick<AgentRegistration, "info" | "experience" | "titleGeneration">): ResolveInputs {
+    return {
+      config: this.config,
+      agentExperience: registration?.experience,
+      metadata: registration?.info.metadata,
+      titles: !!this.titleConfigFor(registration),
+      pdf: typeof this.config.export?.renderPdf === "function",
+    };
+  }
+
+  /** The switches in effect for an agent (an agent that cannot be resolved any more gets the server's). */
+  private experienceFor(registration?: Pick<AgentRegistration, "info" | "experience" | "titleGeneration">): ResolvedExperience {
+    return resolveExperience(this.experienceInputs(registration));
+  }
+
+  /** 403 `action_disabled` when the agent's experience switches the action off. */
+  private assertExperience(
+    registration: Pick<AgentRegistration, "info" | "experience" | "titleGeneration"> | undefined,
+    group: "messageActions" | "history",
+    key: string,
+    what: string
+  ): void {
+    const flags = this.experienceFor(registration)[group] as unknown as Record<string, boolean>;
+    if (flags[key] === false) {
+      throw {
+        statusCode: 403,
+        code: "action_disabled",
+        message: `${what} is switched off for this agent`,
+        details: { setting: `experience.${group}.${key}` },
+      };
+    }
+  }
+
+  /**
+   * Asks the `rateLimit` hook whether an operation may start (429 `rate_limited` + `Retry-After` when it may not). Resolves the
+   * function to call when the operation is over (a turn: when its run has finished); calling it more than once does no harm.
+   */
+  private async admit(ctx: RouteContext, request: RateLimitRequest): Promise<() => void> {
+    const hook = this.config.rateLimit;
+    if (!hook) return () => undefined;
+    const userId = request.userId ?? (await this.effectiveUserId(ctx));
+    const decision: RateLimitDecision = await hook(ctx.context!, { ...request, ...(userId ? { userId } : {}) });
+    const object = decision && typeof decision === "object" ? decision : undefined;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      try {
+        object?.release?.();
+      } catch (error) {
+        console.error("[AgentServer] The release function of a rateLimit decision failed:", error);
+      }
+    };
+    if (decision === false || object?.allowed === false) {
+      release();
+      const retry = object?.retryAfterSeconds;
+      const seconds = typeof retry === "number" && Number.isFinite(retry) && retry > 0 ? Math.ceil(retry) : undefined;
+      throw {
+        statusCode: 429,
+        code: "rate_limited",
+        message: object?.message || "Too many requests. Try again in a moment.",
+        ...(seconds !== undefined ? { details: { retryAfterSeconds: seconds }, headers: { "Retry-After": String(seconds) } } : {}),
+      };
+    }
+    return release;
+  }
+
+  /** Tells the `audit` hook what happened. Never fails the request. */
+  private async recordAudit(ctx: RouteContext, entry: Omit<AuditEntry, "at" | "userId"> & { userId?: string }): Promise<void> {
+    const hook = this.config.audit;
+    if (!hook) return;
+    try {
+      const userId = entry.userId ?? (await this.effectiveUserId(ctx));
+      await hook(ctx.context!, { ...entry, ...(userId ? { userId } : {}), at: new Date() });
+    } catch (error) {
+      console.error("[AgentServer] The audit hook failed:", error);
+    }
   }
 
   /** The current caller is `ownerId` (same rule as for conversations: strict with `resolveContext`, lenient when no identity is known). */
@@ -1054,54 +1243,6 @@ export class AgentServer {
         code: "FORBIDDEN",
         message: "You do not have access to this task",
       };
-    }
-  }
-
-  /**
-   * Auto-generate a short conversation title from the first user message
-   * using the configured OpenAI-compatible provider. Returns undefined if
-   * titleGeneration is not configured or the call fails.
-   */
-  private async generateTitle(userMessage: string, signal?: AbortSignal): Promise<string | undefined> {
-    const cfg = this.config.titleGeneration;
-    if (!cfg) return undefined;
-    // The call is bounded: it gives up after `timeoutMs` and when the run is cancelled (the turn holds the conversation while it waits)
-    const controller = new AbortController();
-    const abort = () => controller.abort();
-    const timer = setTimeout(abort, typeof cfg.timeoutMs === "number" && cfg.timeoutMs > 0 ? cfg.timeoutMs : 10_000);
-    if (signal?.aborted) abort();
-    else signal?.addEventListener("abort", abort, { once: true });
-    try {
-      const path = cfg.path ?? "/v1/chat/completions";
-      const prompt =
-        `Generate a conversation title for the following message using a maximum of 3-4 words. ` +
-        `The title must be in the same language as the message. ` +
-        `Return only the exact title — no quotes, no extra text.\n\n${userMessage}`;
-      const res = await fetch(`${cfg.baseUrl.replace(/\/$/, "")}${path}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {}),
-        },
-        body: JSON.stringify({
-          model: cfg.model,
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0.5,
-          max_tokens: 20,
-        }),
-        signal: controller.signal,
-      });
-      if (!res.ok) return undefined;
-      const data = await res.json() as { choices?: Array<{ message?: { content?: string } }> };
-      const raw = data.choices?.[0]?.message?.content?.trim();
-      if (!raw) return undefined;
-      // Strip surrounding quotes if the model wraps the title
-      return raw.replace(/^["""''']|["""''']$/g, "").trim() || undefined;
-    } catch {
-      return undefined;
-    } finally {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", abort);
     }
   }
 
@@ -1336,6 +1477,7 @@ export class AgentServer {
     // Conversation routes
     this.addRoute("GET", "/conversations", this.handleListConversations.bind(this));
     this.addRoute("POST", "/conversations", this.handleCreateConversation.bind(this));
+    this.addRoute("POST", "/conversations/bulk-delete", this.handleBulkDelete.bind(this));
     this.addRoute(
       "GET",
       "/conversations/:conversationId",
@@ -1363,6 +1505,20 @@ export class AgentServer {
       "/conversations/:conversationId/messages",
       this.handleSendMessage.bind(this)
     );
+
+    // Message actions: ask for the newest answer again, edit a message and re-run from it, rate an answer, download the conversation
+    this.addRoute(
+      "POST",
+      "/conversations/:conversationId/messages/:messageId/regenerate",
+      this.handleRegenerate.bind(this)
+    );
+    this.addRoute("POST", "/conversations/:conversationId/messages/:messageId/edit", this.handleEdit.bind(this));
+    this.addRoute(
+      "POST",
+      "/conversations/:conversationId/messages/:messageId/feedback",
+      this.handleFeedback.bind(this)
+    );
+    this.addRoute("GET", "/conversations/:conversationId/export", this.handleExport.bind(this));
 
     // Human-in-the-loop: answer a pending action (tool approval / question)
     this.addRoute(
@@ -1560,6 +1716,8 @@ export class AgentServer {
       code?: string;
       message?: string;
       details?: Record<string, unknown>;
+      /** Headers the answer carries (`Retry-After` of a 429). */
+      headers?: Record<string, string>;
     } | null;
 
     // Errors are thrown both as Error instances and as plain
@@ -1579,6 +1737,7 @@ export class AgentServer {
             details: exposed ? err.details : undefined,
           },
         },
+        ...(exposed && err.headers ? { headers: err.headers } : {}),
       };
     }
 
@@ -1678,6 +1837,9 @@ export class AgentServer {
     // Newest created first by default; `orderBy=updatedAt` lists by last activity, `order=asc` reverses
     const orderBy = ctx.query.orderBy === "updatedAt" ? "updatedAt" : "createdAt";
     const order = ctx.query.order === "asc" ? "asc" : "desc";
+    // Pinned conversations lead (`pinned=none` lists by time alone). A provider that cannot order them across pages moves them to the top of the page
+    const pinnedFirst = ctx.query.pinned !== "none";
+    const nativePins = this.config.storage.capabilities?.().pinnedFirst === true;
 
     const result = await this.config.storage.getConversations({
       agentId,
@@ -1686,7 +1848,11 @@ export class AgentServer {
       offset,
       orderBy,
       order,
+      ...(pinnedFirst && nativePins ? { pinnedFirst: true } : {}),
     }, ctx.context);
+    if (pinnedFirst && !nativePins) {
+      result.data = [...result.data.filter((c) => c.metadata?.pinned === true), ...result.data.filter((c) => c.metadata?.pinned !== true)];
+    }
 
     const runtimes = await this.runtimesFor(result.data, ctx.context);
 
@@ -1730,6 +1896,8 @@ export class AgentServer {
 
     // Resolve userId: from body, ctx.user (token), or resolveUserId callback
     const userId = await this.effectiveUserId(ctx, body.userId);
+
+    (await this.admit(ctx, { operation: "conversation.create", agentId: body.agentId, ...(userId ? { userId } : {}) }))();
 
     // A budget of its own: lower than the agent's default is the caller's to ask for, higher needs `authorizeBudget`
     let state: Record<string, unknown> | undefined;
@@ -1884,10 +2052,34 @@ export class AgentServer {
     // Verify user has access to this conversation
     await this.verifyConversationAccess(existing, ctx);
 
-    let conversation = existing;
+    // A rename and a pin are checked before anything is written
+    let title: string | undefined;
+    if (body?.title !== undefined) {
+      if (typeof body.title !== "string") {
+        throw { statusCode: 400, code: "VALIDATION_ERROR", message: "title must be a string" } as ValidationError;
+      }
+      title = body.title.trim();
+      if (title.length > MAX_TITLE_LENGTH) {
+        throw {
+          statusCode: 400,
+          code: "VALIDATION_ERROR",
+          message: `title can have at most ${MAX_TITLE_LENGTH} characters`,
+          details: { maxLength: MAX_TITLE_LENGTH },
+        };
+      }
+    }
+    if (body?.pinned !== undefined && typeof body.pinned !== "boolean") {
+      throw { statusCode: 400, code: "VALIDATION_ERROR", message: "pinned must be true or false" } as ValidationError;
+    }
     let agent: AgentRegistration | undefined;
+    if (title !== undefined || body?.pinned !== undefined || body?.budget !== undefined) {
+      agent = await this.getAgentFor(existing.agentId, ctx.context).catch(() => undefined);
+      if (title !== undefined && title !== (existing.title ?? "")) this.assertExperience(agent, "history", "rename", "Renaming a conversation");
+      if (body?.pinned !== undefined) this.assertExperience(agent, "history", "pin", "Pinning a conversation");
+    }
+
+    let conversation = existing;
     if (body?.budget !== undefined) {
-      agent = await this.getAgentFor(existing.agentId, ctx.context);
       const requested = this.parseBudgetRequest(body.budget, agent);
       const done = await this.mutateConversation(conversationId, ctx.context, async (fresh) => {
         const current = this.effectiveBudget(fresh, agent);
@@ -1913,11 +2105,35 @@ export class AgentServer {
       conversation = done.conversation;
     }
 
-    if (body?.budget === undefined || body.title !== undefined || body.metadata !== undefined) {
-      conversation = await this.config.storage.updateConversation(conversationId, {
-        title: body?.title,
-        metadata: this.clientMetadata(body?.metadata, conversation.metadata),
-      }, ctx.context);
+    if (body?.budget === undefined || title !== undefined || body.metadata !== undefined || body.pinned !== undefined) {
+      // (built from the conversation as it is when the write happens, so a pin never undoes a title another request just stored)
+      const done = await this.mutateConversation(conversationId, ctx.context, (fresh) => {
+        let metadata = body?.metadata !== undefined ? this.clientMetadata(body.metadata, fresh.metadata) : undefined;
+        if (body?.pinned !== undefined) {
+          metadata = { ...(metadata ?? fresh.metadata ?? {}) };
+          if (body.pinned) {
+            metadata.pinned = true;
+            metadata.pinnedAt = (fresh.metadata?.pinned === true && fresh.metadata.pinnedAt) || new Date().toISOString();
+          } else {
+            delete metadata.pinned;
+            delete metadata.pinnedAt;
+          }
+        }
+        // A title the person wrote is theirs: it is no longer one the server may replace
+        if (title !== undefined && fresh.metadata?.titleGenerated !== undefined) {
+          metadata = { ...(metadata ?? fresh.metadata ?? {}) };
+          delete metadata.titleGenerated;
+        }
+        return { title, metadata };
+      });
+      conversation = done.conversation;
+      if (body?.pinned !== undefined && (existing.metadata?.pinned === true) !== body.pinned) {
+        await this.recordAudit(ctx, {
+          action: body.pinned ? "conversation.pin" : "conversation.unpin",
+          conversationId,
+          agentId: existing.agentId,
+        });
+      }
     }
 
     const runtime = body?.budget !== undefined ? (await this.runtimesFor([conversation], ctx.context)).get(conversation.id) : undefined;
@@ -1927,21 +2143,9 @@ export class AgentServer {
     };
   }
 
-  private async handleDeleteConversation(ctx: RouteContext): Promise<RouteResult> {
-    const { conversationId } = ctx.params;
-
-    const existing = await this.config.storage.getConversation(conversationId, ctx.context);
-    if (!existing) {
-      throw {
-        statusCode: 404,
-        code: "NOT_FOUND",
-        message: `Conversation not found: ${conversationId}`,
-      } as NotFoundError;
-    }
-
-    // Verify user has access to this conversation
-    await this.verifyConversationAccess(existing, ctx);
-
+  /** Stops a conversation's turn, tells a host agent its requests are gone, and deletes the conversation. 409 when it runs on another node. */
+  private async deleteConversationNow(existing: Conversation, ctx: RouteContext): Promise<void> {
+    const conversationId = existing.id;
     // A turn that is running is stopped first; one running on another node cannot be
     const active = this.runs.get(conversationId);
     if (active) {
@@ -1963,8 +2167,90 @@ export class AgentServer {
     await this.config.storage.deleteConversation(conversationId, ctx.context);
     this.fallbackEvents?.deleteConversation(conversationId);
     this.bus.publish(conversationId, { kind: "closed" });
+  }
+
+  private async handleDeleteConversation(ctx: RouteContext): Promise<RouteResult> {
+    const { conversationId } = ctx.params;
+
+    const existing = await this.config.storage.getConversation(conversationId, ctx.context);
+    if (!existing) {
+      throw {
+        statusCode: 404,
+        code: "NOT_FOUND",
+        message: `Conversation not found: ${conversationId}`,
+      } as NotFoundError;
+    }
+
+    // Verify user has access to this conversation
+    await this.verifyConversationAccess(existing, ctx);
+
+    await this.deleteConversationNow(existing, ctx);
+    await this.recordAudit(ctx, { action: "conversation.delete", conversationId, agentId: existing.agentId });
 
     return { status: 204 };
+  }
+
+  /**
+   * `POST /conversations/bulk-delete`: deletes several of the caller's conversations. Each id is judged by itself: one that is not the
+   * caller's is `not_found`, like one that does not exist, and one that runs on another node is `busy`; the others are deleted.
+   */
+  private async handleBulkDelete(ctx: RouteContext): Promise<RouteResult<BulkDeleteResponse>> {
+    const body = ctx.body as BulkDeleteRequest | undefined;
+    const configured = this.config.limits?.maxBulkDelete;
+    const max = typeof configured === "number" && Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 100;
+    const ids = body?.ids;
+    if (!Array.isArray(ids) || ids.length === 0 || ids.some((id) => typeof id !== "string" || id.length === 0)) {
+      throw { statusCode: 400, code: "VALIDATION_ERROR", message: "ids must be a non-empty array of conversation ids" } as ValidationError;
+    }
+    const unique = [...new Set(ids)];
+    if (unique.length > max) {
+      throw {
+        statusCode: 400,
+        code: "VALIDATION_ERROR",
+        message: `At most ${max} conversations can be deleted at once`,
+        details: { maxIds: max },
+      };
+    }
+    const release = await this.admit(ctx, { operation: "conversation.bulk_delete" });
+    try {
+      const results: BulkDeleteResponse["results"] = [];
+      const registry = await this.resolveRegistry(ctx.context!);
+      for (const id of unique) {
+        try {
+          const existing = await this.config.storage.getConversation(id, ctx.context);
+          if (!existing) {
+            results.push({ id, status: "not_found" });
+            continue;
+          }
+          try {
+            await this.verifyConversationAccess(existing, ctx);
+          } catch {
+            // (someone else's conversation looks exactly like one that is not there)
+            results.push({ id, status: "not_found" });
+            continue;
+          }
+          this.assertExperience(registry.get(existing.agentId), "history", "bulkDelete", "Deleting several conversations");
+          await this.deleteConversationNow(existing, ctx);
+          results.push({ id, status: "deleted" });
+        } catch (error) {
+          const err = error as { code?: string; message?: string } | null;
+          if (err?.code === "conversation_busy") results.push({ id, status: "busy", message: err.message });
+          else if (err?.code === "action_disabled") {
+            results.push({ id, status: "error", message: err.message });
+          } else {
+            console.error(`[AgentServer] Could not delete conversation ${id}:`, error);
+            results.push({ id, status: "error", message: this.isExposedError(error as { statusCode?: number }) ? err?.message : "The conversation could not be deleted" });
+          }
+        }
+      }
+      const deleted = results.filter((result) => result.status === "deleted").length;
+      if (deleted > 0) {
+        await this.recordAudit(ctx, { action: "conversation.bulk_delete", details: { requested: unique.length, deleted } });
+      }
+      return { status: 200, body: { results, deleted } };
+    } finally {
+      release();
+    }
   }
 
   private async handleListMessages(ctx: RouteContext): Promise<RouteResult> {
@@ -2004,6 +2290,289 @@ export class AgentServer {
   }
 
   // ============================================================================
+  // Feedback
+  // ============================================================================
+
+  /**
+   * `POST /conversations/:id/messages/:messageId/feedback`: a person rates an answer (or withdraws the rating with `null`). The rating is
+   * stored on the message (`metadata.feedback`, shown as `feedback` by the API), then the agent's `feedback` hook and the server's
+   * `feedback.onFeedback` hear it. One rating per message: a new one replaces the old.
+   */
+  private async handleFeedback(ctx: RouteContext): Promise<RouteResult<FeedbackResponse>> {
+    const { conversationId, messageId } = ctx.params;
+    const body = ctx.body as FeedbackRequest | undefined;
+    const conversation = await this.config.storage.getConversation(conversationId, ctx.context);
+    if (!conversation) {
+      throw { statusCode: 404, code: "NOT_FOUND", message: `Conversation not found: ${conversationId}` } as NotFoundError;
+    }
+    await this.verifyConversationAccess(conversation, ctx);
+    const agent = await this.getAgentFor(conversation.agentId, ctx.context).catch(() => undefined);
+    const settings = this.experienceFor(agent).feedback;
+    if (!settings.enabled) {
+      throw { statusCode: 403, code: "feedback_disabled", message: "Feedback is switched off for this agent" };
+    }
+
+    const invalid = (message: string, details?: Record<string, unknown>) => ({ statusCode: 400, code: "invalid_feedback", message, ...(details ? { details } : {}) });
+    const rating = body?.rating;
+    if (rating !== "up" && rating !== "down" && rating !== null) throw invalid('rating must be "up", "down" or null');
+    let reasons: string[] = [];
+    if (body?.reasons !== undefined) {
+      if (!Array.isArray(body.reasons) || body.reasons.some((reason) => typeof reason !== "string")) throw invalid("reasons must be an array of reason codes");
+      if (rating !== "down" && body.reasons.length > 0) throw invalid('reasons go with a "down" rating');
+      reasons = [...new Set(body.reasons.map((reason) => reason.trim().toLowerCase()).filter(Boolean))];
+      const unknown = reasons.filter((reason) => !settings.reasons.includes(reason));
+      if (unknown.length > 0) throw invalid(`Unknown reasons: ${unknown.join(", ")}`, { allowed: settings.reasons });
+    }
+    let comment: string | undefined;
+    if (body?.comment !== undefined && body.comment !== null) {
+      if (typeof body.comment !== "string") throw invalid("comment must be a string");
+      if (rating === null && body.comment.trim() !== "") throw invalid("A withdrawn rating has no comment");
+      comment = body.comment.trim() || undefined;
+      if (comment && settings.maxCommentLength === 0) throw invalid("Comments are not accepted for this agent");
+      if (comment && comment.length > settings.maxCommentLength) {
+        throw invalid(`comment can have at most ${settings.maxCommentLength} characters`, { maxLength: settings.maxCommentLength });
+      }
+    }
+
+    const message = await this.messageOf(conversationId, messageId, ctx);
+    if (message.role !== "assistant") throw this.invalidTarget("Only an answer can be rated", "not_an_answer");
+
+    const release = await this.admit(ctx, { operation: "message.feedback", conversationId, agentId: conversation.agentId });
+    try {
+      const userId = await this.effectiveUserId(ctx);
+      const previous = (message.metadata?.feedback as MessageFeedback | undefined) ?? undefined;
+      const hadPrevious = !!previous && (previous.rating === "up" || previous.rating === "down");
+      if (rating === null && !hadPrevious) return { status: 200, body: { feedback: null, messageId } };
+
+      const now = new Date().toISOString();
+      const next: MessageFeedback | null =
+        rating === null
+          ? null
+          : {
+              rating,
+              ...(reasons.length > 0 ? { reasons } : {}),
+              ...(comment ? { comment } : {}),
+              ...(userId ? { userId } : {}),
+              createdAt: hadPrevious && previous!.createdAt ? previous!.createdAt : now,
+              updatedAt: now,
+            };
+
+      // Stored on the message, so a reload shows the rating (a store that cannot update messages only tells the hooks)
+      if (typeof this.config.storage.updateMessage === "function") {
+        const { feedback: _old, ...rest } = message.metadata ?? {};
+        await this.config.storage.updateMessage(message.id, { metadata: { ...rest, ...(next ? { feedback: next } : {}) } }, ctx.context);
+      }
+
+      const event = await this.feedbackEvent(ctx, { conversation, message, rating, reasons, comment, previous: hadPrevious ? previous : undefined, next, now });
+      await agent?.host?.feedback?.(event);
+      await this.config.feedback?.onFeedback?.(ctx.context!, event);
+      await this.recordAudit(ctx, {
+        action: "message.feedback",
+        conversationId,
+        agentId: conversation.agentId,
+        messageId,
+        details: { rating, ...(reasons.length > 0 ? { reasons } : {}) },
+      });
+      return { status: 200, body: { feedback: next, messageId } };
+    } finally {
+      release();
+    }
+  }
+
+  private async feedbackEvent(
+    ctx: RouteContext,
+    x: {
+      conversation: Conversation;
+      message: Message;
+      rating: "up" | "down" | null;
+      reasons: string[];
+      comment?: string;
+      previous?: MessageFeedback;
+      next: MessageFeedback | null;
+      now: string;
+    }
+  ): Promise<FeedbackEvent> {
+    // Where the answer sits in the transcript, and the message it answered (best effort: a store that cannot say leaves them out)
+    let messageIndex = -1;
+    let question: Message | undefined;
+    try {
+      const older = await this.config.storage.getMessages(x.conversation.id, { before: x.message.id, order: "desc", limit: 20 }, ctx.context);
+      messageIndex = older.total;
+      question = older.data.find((message) => message.role === "user");
+    } catch {
+      // (the hooks still hear the rating)
+    }
+    const userId = x.next?.userId ?? (await this.effectiveUserId(ctx));
+    return {
+      conversationId: x.conversation.id,
+      messageId: x.message.id,
+      messageIndex,
+      agentId: x.conversation.agentId,
+      ...(userId ? { userId } : {}),
+      rating: x.rating,
+      reasons: x.reasons,
+      ...(x.comment ? { comment: x.comment } : {}),
+      ...(x.previous ? { previous: x.previous } : {}),
+      createdAt: x.next?.createdAt ?? x.previous?.createdAt ?? x.now,
+      updatedAt: x.now,
+      message: publicMessage(x.message),
+      ...(question ? { question } : {}),
+      context: ctx.context!,
+    };
+  }
+
+  // ============================================================================
+  // Export
+  // ============================================================================
+
+  /** Tool calls by the assistant message that made them, from the event log (what it still holds: a pruned or in-memory log gives fewer). */
+  private async toolCallsByMessage(conversationId: string, ctx: RouteContext): Promise<Map<string, ExportTool[]>> {
+    const byRun = new Map<string, Map<string, ExportTool & { id: string }>>();
+    const runOfMessage = new Map<string, string>();
+    let after = 0;
+    for (let page = 0; page < 20; page++) {
+      const result = await this.eventStore.list(
+        conversationId,
+        { after, limit: 1000, types: [EVENT_TYPES.toolUse, EVENT_TYPES.toolResult, EVENT_TYPES.message] },
+        ctx.context
+      );
+      for (const event of result.events) {
+        if (!event.runId) continue;
+        const data = event.data;
+        if (event.type === EVENT_TYPES.message) {
+          if (typeof data.message_id === "string") runOfMessage.set(data.message_id, event.runId);
+          continue;
+        }
+        const id = typeof data.tool_call_id === "string" ? data.tool_call_id : `${event.seq}`;
+        const calls = byRun.get(event.runId) ?? new Map<string, ExportTool & { id: string }>();
+        byRun.set(event.runId, calls);
+        const call = calls.get(id) ?? { id, name: typeof data.name === "string" ? data.name : "tool" };
+        if (event.type === EVENT_TYPES.toolUse) {
+          if (data.args && typeof data.args === "object") call.args = data.args as Record<string, unknown>;
+        } else {
+          call.ok = data.ok !== false;
+          if (typeof data.error === "string") call.error = data.error;
+          if (typeof data.duration_ms === "number") call.durationMs = data.duration_ms;
+        }
+        calls.set(id, call);
+      }
+      if (!result.hasMore) break;
+      after = result.lastSeq;
+    }
+    const out = new Map<string, ExportTool[]>();
+    for (const [messageId, runId] of runOfMessage) {
+      const calls = byRun.get(runId);
+      if (calls?.size) out.set(messageId, [...calls.values()].map(({ id: _id, ...call }) => call));
+    }
+    return out;
+  }
+
+  /**
+   * `GET /conversations/:id/export?format=md|json|html|pdf&tools=0|1&locale=&print=0|1`: the conversation as a file. Markdown and JSON
+   * are made here; `html` is a print-friendly page (with `print=1` it opens the browser's print dialog, i.e. "Save as PDF"); `pdf`
+   * needs `export.renderPdf`. Tool calls are included only when asked for and allowed.
+   */
+  private async handleExport(ctx: RouteContext): Promise<RouteResult> {
+    const { conversationId } = ctx.params;
+    const one = (value: string | string[] | undefined) => (Array.isArray(value) ? value[0] : value) || undefined;
+    const conversation = await this.config.storage.getConversation(conversationId, ctx.context);
+    if (!conversation) {
+      throw { statusCode: 404, code: "NOT_FOUND", message: `Conversation not found: ${conversationId}` } as NotFoundError;
+    }
+    await this.verifyConversationAccess(conversation, ctx);
+    const agent = await this.getAgentFor(conversation.agentId, ctx.context).catch(() => undefined);
+    const settings = this.experienceFor(agent).export;
+    if (!settings.enabled) {
+      throw { statusCode: 403, code: "export_disabled", message: "Downloading conversations is switched off for this agent" };
+    }
+
+    const format = (one(ctx.query.format) ?? "md").toLowerCase() as ExportFormat;
+    if (!EXPORT_FORMATS.includes(format)) {
+      throw { statusCode: 400, code: "VALIDATION_ERROR", message: `format must be one of ${EXPORT_FORMATS.join(", ")}` } as ValidationError;
+    }
+    const wantTools = one(ctx.query.tools) === "1" || one(ctx.query.tools) === "true";
+    if (wantTools && !settings.includeTools) {
+      throw { statusCode: 403, code: "export_disabled", message: "Tool calls cannot be included in a download for this agent" };
+    }
+    const renderPdf = this.config.export?.renderPdf;
+    if (format === "pdf" && typeof renderPdf !== "function") {
+      throw {
+        statusCode: 501,
+        expose: true,
+        code: "export_format_unsupported",
+        message: "This server has no PDF renderer. Use format=html&print=1 and save the page as PDF from the print dialog.",
+      };
+    }
+
+    const release = await this.admit(ctx, { operation: "conversation.export", conversationId, agentId: conversation.agentId });
+    try {
+      const configured = this.config.export?.maxMessages;
+      const max = typeof configured === "number" && Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : DEFAULT_EXPORT_MAX_MESSAGES;
+      const all = exportable(await this.loadHistory(conversationId, ctx.context)).filter(
+        // (the husk a paused or stopped turn leaves behind says nothing)
+        (message) => !(message.role === "assistant" && messageText(message) === "" && !message.files?.length)
+      );
+      const truncated = all.length > max;
+      const locale = one(ctx.query.locale);
+      const transcript: Transcript = {
+        conversation,
+        agentName: agent?.info.name ?? conversation.agentId,
+        messages: truncated ? all.slice(all.length - max) : all,
+        ...(wantTools ? { tools: await this.toolCallsByMessage(conversationId, ctx) } : {}),
+        truncated,
+        labels: resolveLabels(locale, this.config.export?.labels),
+        exportedAt: new Date(),
+      };
+      const print = one(ctx.query.print) === "1" || one(ctx.query.print) === "true";
+      const html = format === "html" || format === "pdf" ? renderHtml(transcript, { print: format === "html" && print, lang: locale }) : "";
+
+      let bytes: Buffer;
+      let contentType: string;
+      switch (format) {
+        case "json":
+          bytes = Buffer.from(renderJson(transcript), "utf8");
+          contentType = "application/json; charset=utf-8";
+          break;
+        case "html":
+          bytes = Buffer.from(html, "utf8");
+          contentType = "text/html; charset=utf-8";
+          break;
+        case "pdf": {
+          const rendered = await renderPdf!({ html, conversation, context: ctx.context! });
+          bytes = Buffer.from(rendered);
+          contentType = "application/pdf";
+          break;
+        }
+        default:
+          bytes = Buffer.from(renderMarkdown(transcript), "utf8");
+          contentType = "text/markdown; charset=utf-8";
+      }
+
+      await this.recordAudit(ctx, {
+        action: "conversation.export",
+        conversationId,
+        agentId: conversation.agentId,
+        details: { format, includeTools: wantTools, messages: transcript.messages.length },
+      });
+      const inline = one(ctx.query.disposition) === "inline" || (format === "html" && print);
+      return {
+        status: 200,
+        headers: {
+          "Content-Type": contentType,
+          "Content-Disposition": contentDispositionHeader(inline ? "inline" : "attachment", exportFileName(conversation, format)),
+          "Content-Length": bytes.length.toString(),
+          "X-Content-Type-Options": "nosniff",
+          "Cache-Control": "private, no-store",
+          ...(format === "html" ? { "Content-Security-Policy": htmlContentSecurityPolicy(print) } : {}),
+        },
+        raw: bytes,
+      };
+    } finally {
+      release();
+    }
+  }
+
+  // ============================================================================
   // Human-in-the-loop (pending actions)
   // ============================================================================
 
@@ -2028,6 +2597,7 @@ export class AgentServer {
       ...(budget ? { budget } : {}),
       ...(budget || spent > 0 ? { spentUsd: spent } : {}),
       ...(remembered?.length ? { rememberedTools: [...remembered] } : {}),
+      ...(conversation.metadata?.pinned === true ? { pinned: true } : {}),
     } as T;
   }
 
@@ -2051,12 +2621,22 @@ export class AgentServer {
     extra: { cancelled?: boolean; expired?: boolean; remembered?: boolean; edited?: boolean } = {}
   ): Record<string, unknown> {
     const approval = resolution?.type === "tool_approval" ? resolution : undefined;
+    const clientTool = resolution?.type === "client_tool" ? resolution : undefined;
     const questionCancelled = resolution?.type === "user_question" && resolution.cancelled === true;
     const wasCancelled = extra.cancelled === true || questionCancelled;
+    const requested = action.type === "client_tool" && action.requestedAt ? Date.parse(action.requestedAt) : NaN;
     return {
       action_id: action.id,
       kind: action.type,
       ...(action.type === "tool_approval" && (extra.remembered || extra.expired) ? { tool_name: action.toolName } : {}),
+      // A client tool: which one, whether the page's call worked, and how long the page took
+      ...(action.type === "client_tool"
+        ? {
+            tool_name: action.toolName,
+            ...(clientTool ? { ok: !clientTool.error, ...(clientTool.error ? { error: clientTool.error } : {}) } : {}),
+            ...(Number.isFinite(requested) ? { duration_ms: Math.max(0, Date.now() - requested) } : {}),
+          }
+        : {}),
       ...(approval ? { decision: approval.decision } : {}),
       ...(wasCancelled ? { cancelled: true } : {}),
       ...(extra.expired ? { expired: true } : {}),
@@ -2072,7 +2652,9 @@ export class AgentServer {
               ? approval.decision === "allow"
                 ? "approved"
                 : "rejected"
-              : "answered",
+              : clientTool?.error
+                ? "failed"
+                : "answered",
       resolved_by: resolvedBy,
       channel,
     };
@@ -2592,9 +3174,18 @@ export class AgentServer {
     const { agent } = loaded;
     let { conversation } = loaded;
 
+    // Work that costs something is the host's to limit (429 rate_limited)
+    const release = await this.admit(ctx, { operation: "message.send", conversationId, agentId: conversation.agentId, streaming });
+
     // One turn at a time per conversation (409 conversation_busy), then: waiting on a human?
     // Reject (409) or cancel the pending actions, per config.
-    const run = await this.beginRun(ctx, conversation, "message", "message", streaming);
+    let run: ActiveRun;
+    try {
+      run = await this.beginRun(ctx, conversation, "message", "message", streaming);
+    } catch (error) {
+      release();
+      throw error;
+    }
     let budget: TurnBudget;
     try {
       // Read again under the lease: the turn that held the conversation before this one may have stored a pause (or spent
@@ -2609,31 +3200,223 @@ export class AgentServer {
       budget = this.planTurnBudget(conversation, agent);
       conversation = await this.guardPendingActions(conversation, ctx);
     } catch (error) {
+      release();
       await this.endRun(run);
       throw error;
     }
 
     const stream = streaming ? this.attachStream(run) : undefined;
     this.launch(run, ctx, () => this.executeMessage(run, { ctx, conversation, agent, body, attachments, budget }));
+    void run.done.then(release, release);
     if (stream) return { status: 200, headers: SSE_HEADERS, stream: stream.generator, close: stream.close };
 
     const outcome = await run.done;
     if (outcome.error) throw outcome.error;
+    return { status: 200, body: this.turnResponse(run, outcome) };
+  }
+
+  /** The JSON answer of a turn that started with a message (send, regenerate, edit). */
+  private turnResponse(run: ActiveRun, outcome: TurnOutcome): SendMessageResponse {
     return {
-      status: 200,
-      body: {
-        message: publicMessage(outcome.userMessage!),
-        response: publicMessage(outcome.assistant!),
-        conversationTitle: outcome.conversationTitle,
-        usage: outcome.usage,
-        ...(outcome.status && outcome.status !== "completed" && { status: outcome.status }),
-        ...(outcome.pendingActions.length > 0 && { pendingActions: outcome.pendingActions }),
-        ...(outcome.warnings && { warnings: outcome.warnings }),
-        stopReason: outcome.stopReason,
-        runId: run.id,
-        ...(outcome.budget && { budget: outcome.budget, spentUsd: outcome.spentUsd }),
-      },
+      message: publicMessage(outcome.userMessage!),
+      response: publicMessage(outcome.assistant!),
+      conversationTitle: outcome.conversationTitle,
+      usage: outcome.usage,
+      ...(outcome.status && outcome.status !== "completed" && { status: outcome.status }),
+      ...(outcome.pendingActions.length > 0 && { pendingActions: outcome.pendingActions }),
+      ...(outcome.warnings && { warnings: outcome.warnings }),
+      stopReason: outcome.stopReason,
+      runId: run.id,
+      ...(outcome.budget && { budget: outcome.budget, spentUsd: outcome.spentUsd }),
     };
+  }
+
+  // ---- regenerate / edit ------------------------------------------------------
+
+  private invalidTarget(message: string, reason: string) {
+    return { statusCode: 409, code: "invalid_message_target", message, details: { reason } };
+  }
+
+  /** A message of this conversation, else the 404 every message route answers. */
+  private async messageOf(conversationId: string, messageId: string, ctx: RouteContext): Promise<Message> {
+    const message = await this.config.storage.getMessage(messageId, ctx.context);
+    if (!message || message.conversationId !== conversationId) {
+      throw { statusCode: 404, code: "NOT_FOUND", message: `Message not found: ${messageId}` } as NotFoundError;
+    }
+    return message;
+  }
+
+  /** The messages after `anchorId`, oldest first. */
+  private async messagesAfter(conversationId: string, anchorId: string, ctx: RouteContext): Promise<Message[]> {
+    const out: Message[] = [];
+    let after = anchorId;
+    for (;;) {
+      const page = await this.config.storage.getMessages(conversationId, { after, order: "asc", limit: this.maxPageSize }, ctx.context);
+      out.push(...page.data);
+      if (!page.hasMore || page.data.length === 0) return out;
+      after = page.data[page.data.length - 1]!.id;
+    }
+  }
+
+  /**
+   * What a regeneration of `messageId` re-runs. Only the newest message can be regenerated: an answer (the turn that produced it is
+   * run again from the user message it answered; the answers after that message are replaced) or - after a turn that failed and
+   * left no answer - the user message itself.
+   */
+  private async regenerationVariant(
+    conversationId: string,
+    messageId: string,
+    ctx: RouteContext
+  ): Promise<TurnVariant & { user: Message }> {
+    const target = await this.messageOf(conversationId, messageId, ctx);
+    const newest = (await this.config.storage.getMessages(conversationId, { order: "desc", limit: 1 }, ctx.context)).data[0];
+    if (!newest || newest.id !== target.id) {
+      throw this.invalidTarget("Only the newest message of a conversation can be regenerated", "not_newest");
+    }
+    if (target.role === "user") return { mode: "regenerate", fromMessageId: target.id, user: target, remove: [] };
+    if (target.role !== "assistant") throw this.invalidTarget("Only an answer can be regenerated", "not_an_answer");
+
+    // The turn: the newest user message before the answer, and everything after it
+    const turn: Message[] = [target];
+    let before: string | undefined = target.id;
+    for (;;) {
+      const page = await this.config.storage.getMessages(conversationId, { before, order: "desc", limit: 50 }, ctx.context);
+      for (const message of page.data) {
+        if (message.role === "user") {
+          return { mode: "regenerate", fromMessageId: target.id, user: message, remove: turn.reverse() };
+        }
+        turn.push(message);
+      }
+      if (!page.hasMore || page.data.length === 0) break;
+      before = page.data[page.data.length - 1]!.id;
+    }
+    throw this.invalidTarget("There is no message of the person to answer again", "no_question");
+  }
+
+  /**
+   * A regeneration or an edit-and-resend: both go through the run registry like a message (409 `conversation_busy`), the budget
+   * (402) and the approvals (409 `action_pending`), and stream or answer like one. `prepare` runs under the conversation's lease and says
+   * what the turn is.
+   */
+  private async runMessageVariant(
+    ctx: RouteContext,
+    x: {
+      operation: "message.regenerate" | "message.edit";
+      loaded: { conversation: Conversation; agent: AgentRegistration };
+      streaming: boolean;
+      messageId: string;
+      prepare: (conversation: Conversation) => Promise<{ variant: TurnVariant; body: SendMessageRequest; attachments?: PreparedAttachments }>;
+    }
+  ): Promise<RouteResult<SendMessageResponse>> {
+    const { agent } = x.loaded;
+    const conversationId = x.loaded.conversation.id;
+    const release = await this.admit(ctx, { operation: x.operation, conversationId, agentId: x.loaded.conversation.agentId, streaming: x.streaming });
+
+    let run: ActiveRun;
+    try {
+      run = await this.beginRun(ctx, x.loaded.conversation, "message", "message", x.streaming);
+    } catch (error) {
+      release();
+      throw error;
+    }
+    let conversation: Conversation;
+    let budget: TurnBudget;
+    let prepared: Awaited<ReturnType<typeof x.prepare>>;
+    try {
+      const fresh = await this.config.storage.getConversation(conversationId, ctx.context);
+      if (!fresh) {
+        throw { statusCode: 404, code: "NOT_FOUND", message: `Conversation not found: ${conversationId}` } as NotFoundError;
+      }
+      budget = this.planTurnBudget(fresh, agent);
+      conversation = await this.guardPendingActions(fresh, ctx);
+      prepared = await x.prepare(conversation);
+    } catch (error) {
+      release();
+      await this.endRun(run);
+      throw error;
+    }
+
+    const stream = x.streaming ? this.attachStream(run) : undefined;
+    this.launch(run, ctx, () =>
+      this.executeMessage(run, { ctx, conversation, agent, body: prepared.body, attachments: prepared.attachments, budget, variant: prepared.variant })
+    );
+    void run.done.then(async (outcome) => {
+      release();
+      if (!outcome.error) {
+        await this.recordAudit(ctx, {
+          action: x.operation,
+          conversationId,
+          agentId: conversation.agentId,
+          messageId: x.messageId,
+          details: { removedMessages: prepared.variant.remove.length },
+        });
+      }
+    }, release);
+    if (stream) return { status: 200, headers: SSE_HEADERS, stream: stream.generator, close: stream.close };
+
+    const outcome = await run.done;
+    if (outcome.error) throw outcome.error;
+    return { status: 200, body: this.turnResponse(run, outcome) };
+  }
+
+  /** `POST /conversations/:id/messages/:messageId/regenerate`: the newest answer again, from the message it answered. */
+  private async handleRegenerate(ctx: RouteContext): Promise<RouteResult<SendMessageResponse>> {
+    const { conversationId, messageId } = ctx.params;
+    const body = (ctx.body ?? {}) as RegenerateMessageRequest;
+    const loaded = await this.loadForTurn(conversationId, ctx);
+    this.assertExperience(loaded.agent, "messageActions", "regenerate", "Regenerating an answer");
+    return this.runMessageVariant(ctx, {
+      operation: "message.regenerate",
+      loaded,
+      streaming: !!body.stream,
+      messageId,
+      prepare: async () => {
+        const variant = await this.regenerationVariant(conversationId, messageId, ctx);
+        return {
+          variant,
+          body: { message: messageText(variant.user), metadata: body.metadata, stream: !!body.stream },
+        };
+      },
+    });
+  }
+
+  /** `POST /conversations/:id/messages/:messageId/edit`: a user message replaced, everything after it removed, the conversation run again from it. */
+  private async handleEdit(ctx: RouteContext): Promise<RouteResult<SendMessageResponse>> {
+    const { conversationId, messageId } = ctx.params;
+    const body = (ctx.body ?? {}) as EditMessageRequest;
+    const text = typeof body.content === "string" ? body.content : body.message;
+    if (typeof text !== "string" || text.trim() === "") {
+      throw { statusCode: 400, code: "VALIDATION_ERROR", message: "content is required" } as ValidationError;
+    }
+    const loaded = await this.loadForTurn(conversationId, ctx);
+    this.assertExperience(loaded.agent, "messageActions", "edit", "Editing a message");
+
+    // The message has to be the person's own, and be there before the files of the edit are looked at
+    const target = await this.messageOf(conversationId, messageId, ctx);
+    if (target.role !== "user") throw this.invalidTarget("Only a message of the person can be edited", "not_a_user_message");
+
+    const changesFiles = body.fileIds !== undefined || (body.files !== undefined && body.files !== null);
+    const attachments: PreparedAttachments = changesFiles
+      ? await this.prepareAttachments(loaded, { message: text, fileIds: body.fileIds, files: body.files }, ctx)
+      : { refs: target.files ?? [], inline: [], cfg: this.filesConfigFor(loaded.agent) };
+
+    return this.runMessageVariant(ctx, {
+      operation: "message.edit",
+      loaded,
+      streaming: !!body.stream,
+      messageId,
+      prepare: async () => {
+        // (looked at again under the lease: the transcript may have moved on)
+        const current = await this.messageOf(conversationId, messageId, ctx);
+        if (current.role !== "user") throw this.invalidTarget("Only a message of the person can be edited", "not_a_user_message");
+        const after = await this.messagesAfter(conversationId, current.id, ctx);
+        return {
+          variant: { mode: "edit", fromMessageId: current.id, remove: [current, ...after], previousUser: current },
+          body: { message: text, metadata: body.metadata, stream: !!body.stream },
+          attachments,
+        };
+      },
+    });
   }
 
   /** Forgets the state a budget-stopped turn was to be carried on from: a new message supersedes it. Writes nothing when there is none. */
@@ -2647,7 +3430,11 @@ export class AgentServer {
     });
   }
 
-  /** One message turn: stores the user message, runs the agent, stores the answer (and what it waits on). */
+  /**
+   * One message turn: stores the user message, runs the agent, stores the answer (and what it waits on). With a `variant` it is a
+   * regeneration (the user message is already stored; the answers after it are replaced when the new one is stored) or an edit (the
+   * edited message and everything after it is removed once its replacement is stored).
+   */
   private async executeMessage(
     run: ActiveRun,
     x: {
@@ -2661,68 +3448,122 @@ export class AgentServer {
       handlerMetadata?: Record<string, unknown>;
       /** The money plan of the turn (made by the caller, which can answer 402 before anything starts; a task makes it here). */
       budget?: TurnBudget;
+      /** Set for a regeneration or an edit-and-resend. */
+      variant?: TurnVariant;
     }
   ): Promise<TurnOutcome> {
-    const { ctx, conversation, agent, body } = x;
+    const { ctx, agent, body, variant } = x;
+    let conversation = x.conversation;
     const conversationId = conversation.id;
     const cfg = x.attachments?.cfg ?? this.filesConfigFor(agent);
     const budget = x.budget ?? this.planTurnBudget(conversation, agent);
+    const removedIds = new Set((variant?.remove ?? []).map((message) => message.id));
 
-    // Which uploads were already sent is known from the conversation's history (only read early when it is needed)
-    const attachNewUploads = cfg.attachNewUploads && cfg.enabled;
-    const prior = attachNewUploads ? await this.loadHistory(conversationId, ctx.context) : undefined;
+    let userMessage: Message;
+    let files: FileAttachment[];
+    let history: Message[];
 
-    // Files sent inline are stored first, so the message carries real ids; then the ones attached by id, then
-    // - if the agent is set up for it - uploads no message has carried yet
-    const stored: FileAttachment[] = [];
-    for (const file of x.attachments?.inline ?? []) {
-      const record = await this.saveIncomingFile(ctx, { file, cfg, conversation });
-      stored.push(attachmentOf(record));
-    }
-    let files = uniqueAttachments([...(x.attachments?.refs ?? []), ...stored]);
-    if (prior) {
-      files = uniqueAttachments([...files, ...(await this.unsentUploads(conversationId, prior, files, ctx.context))]);
-    }
+    if (variant?.mode === "regenerate") {
+      // The person's message is already there; the answers after it are replaced by the new one
+      userMessage = variant.user!;
+      files = userMessage.files ?? [];
+      run.userMessage = { id: userMessage.id, content: body.message, files };
+      await this.abandonBudgetPause(conversation, ctx);
+      run.emit({
+        events: [{ type: EVENT_TYPES.statusRunning, data: { trigger: run.trigger, mode: "regenerate" } }],
+        frame: (seq) => ({
+          type: "stream.start",
+          timestamp: Date.now(),
+          conversationId,
+          messageId: userMessage.id,
+          seq,
+        } satisfies StreamStartEvent),
+      });
+      history = (await this.loadHistory(conversationId, ctx.context)).filter((message) => !removedIds.has(message.id));
+    } else {
+      // Which uploads were already sent is known from the conversation's history (only read early when it is needed)
+      const attachNewUploads = cfg.attachNewUploads && cfg.enabled;
+      const loadedHistory = attachNewUploads || variant ? await this.loadHistory(conversationId, ctx.context) : undefined;
+      const prior = loadedHistory?.filter((message) => !removedIds.has(message.id));
 
-    // Save user message
-    const userMessage = await this.config.storage.createMessage({
-      conversationId,
-      role: "user",
-      content: body.message,
-      files: files.length > 0 ? files : undefined,
-      metadata: body.metadata,
-    }, ctx.context);
+      // Files sent inline are stored first, so the message carries real ids; then the ones attached by id, then
+      // - if the agent is set up for it - uploads no message has carried yet
+      const stored: FileAttachment[] = [];
+      for (const file of x.attachments?.inline ?? []) {
+        const record = await this.saveIncomingFile(ctx, { file, cfg, conversation });
+        stored.push(attachmentOf(record));
+      }
+      files = uniqueAttachments([...(x.attachments?.refs ?? []), ...stored]);
+      // An edit that dropped a file of the old message does not get it back as an "unsent upload"
+      const dropped = variant
+        ? uniqueAttachments(variant.remove.flatMap((message) => (message.role === "user" ? message.files ?? [] : []))).filter(
+            (file) => !files.some((kept) => kept.id === file.id)
+          )
+        : [];
+      if (prior && attachNewUploads) {
+        files = uniqueAttachments([...files, ...(await this.unsentUploads(conversationId, prior, files, ctx.context, dropped))]);
+      }
 
-    // (a follower that joins from here on is shown the message even if it reads the stored history before the message was in it)
-    run.userMessage = { id: userMessage.id, content: body.message, files };
-
-    // A message goes on from the conversation as it is: a turn the budget cut short is given up, not left to be
-    // continued behind the person's back if this turn fails
-    await this.abandonBudgetPause(conversation, ctx);
-
-    run.emit({
-      events: [
-        {
-          type: EVENT_TYPES.userMessage,
-          data: {
-            content: body.message,
-            message_id: userMessage.id,
-            ...(files.length > 0 ? { files: files.map((f) => ({ id: f.id, name: f.name, mime_type: f.mimeType, size: f.size })) } : {}),
-          },
-        },
-        { type: EVENT_TYPES.statusRunning, data: { trigger: run.trigger } },
-      ],
-      frame: (seq) => ({
-        type: "stream.start",
-        timestamp: Date.now(),
+      userMessage = await this.config.storage.createMessage({
         conversationId,
-        messageId: userMessage.id,
-        seq,
-      } satisfies StreamStartEvent),
-    });
+        role: "user",
+        content: body.message,
+        files: files.length > 0 ? files : undefined,
+        metadata:
+          variant?.mode === "edit"
+            ? {
+                ...(body.metadata ?? {}),
+                edited: true,
+                editedFrom: variant.fromMessageId,
+                previousContent: previousContentOf(variant.previousUser!),
+              }
+            : body.metadata,
+      }, ctx.context);
 
-    // Get previous messages for context
-    const history = prior ? [...prior, userMessage] : await this.loadHistory(conversationId, ctx.context);
+      // (a follower that joins from here on is shown the message even if it reads the stored history before the message was in it)
+      run.userMessage = { id: userMessage.id, content: body.message, files };
+
+      // An edit replaces the old message: it and everything after it go, and the files the edit dropped with them
+      if (variant?.mode === "edit") {
+        await this.removeMessages(variant.remove, ctx);
+        for (const file of dropped) await this.config.storage.deleteFile(file.id, ctx.context).catch(() => undefined);
+        // A title made from the first message no longer describes the conversation
+        if (prior?.length === 0 && conversation.metadata?.titleGenerated === true && conversation.title) {
+          await this.config.storage.updateConversation(conversationId, { title: "" }, ctx.context).catch(() => undefined);
+          conversation = { ...conversation, title: undefined };
+        }
+      }
+
+      // A message goes on from the conversation as it is: a turn the budget cut short is given up, not left to be
+      // continued behind the person's back if this turn fails
+      await this.abandonBudgetPause(conversation, ctx);
+
+      run.emit({
+        events: [
+          ...(variant?.mode === "edit" ? [{ type: EVENT_TYPES.truncated, data: this.truncatedData("edit", variant.fromMessageId, variant.remove) }] : []),
+          {
+            type: EVENT_TYPES.userMessage,
+            data: {
+              content: body.message,
+              message_id: userMessage.id,
+              ...(variant?.mode === "edit" ? { edited: true, edited_from: variant.fromMessageId } : {}),
+              ...(files.length > 0 ? { files: files.map((f) => ({ id: f.id, name: f.name, mime_type: f.mimeType, size: f.size })) } : {}),
+            },
+          },
+          { type: EVENT_TYPES.statusRunning, data: { trigger: run.trigger, ...(variant?.mode === "edit" ? { mode: "edit" } : {}) } },
+        ],
+        frame: (seq) => ({
+          type: "stream.start",
+          timestamp: Date.now(),
+          conversationId,
+          messageId: userMessage.id,
+          seq,
+        } satisfies StreamStartEvent),
+      });
+
+      // Get previous messages for context
+      history = prior ? [...prior, userMessage] : await this.loadHistory(conversationId, ctx.context);
+    }
 
     const step = await this.runMessageStep(run, {
       ctx,
@@ -2734,6 +3575,7 @@ export class AgentServer {
       currentMessageId: userMessage.id,
       handlerMetadata: x.handlerMetadata,
       budget,
+      variant,
     });
     return this.finalizeTurn(run, {
       ctx,
@@ -2744,7 +3586,41 @@ export class AgentServer {
       // (a task's conversation gets no generated title: it is not a chat)
       firstExchange: history.length === 1 && !run.taskId ? body.message : undefined,
       budget,
+      // A regeneration replaces the answers it re-ran, once the new one is stored
+      replace: variant?.mode === "regenerate" && variant.remove.length > 0 ? { messages: variant.remove, fromMessageId: variant.fromMessageId } : undefined,
     });
+  }
+
+  /** What the answer of a regeneration remembers about the ones it replaced: `previousContent` (newest last, at most 5) and `regeneratedFrom`. */
+  private regenerationMetadata(replaced: Message[], fromMessageId: string): Record<string, unknown> {
+    const last = [...replaced].reverse().find((message) => message.role === "assistant");
+    const previousContent = last ? previousContentOf(last) : [];
+    return { regeneratedFrom: fromMessageId, ...(previousContent.length > 0 ? { previousContent } : {}) };
+  }
+
+  /** `session.truncated` event data: what was removed, in the wire's snake_case. At most 50 ids are listed. */
+  private truncatedData(reason: TurnMode, fromMessageId: string, removed: Message[]): Record<string, unknown> {
+    return {
+      reason,
+      from_message_id: fromMessageId,
+      removed_count: removed.length,
+      removed_message_ids: removed.slice(0, 50).map((message) => message.id),
+    };
+  }
+
+  /**
+   * Removes messages from a transcript, newest first, so an interruption never leaves a hole in the middle. A message that is
+   * already gone is fine: a host whose transcript lives elsewhere (and was cut back by its agent when it heard `mode`) has nothing left to remove.
+   */
+  private async removeMessages(messages: Message[], ctx: RouteContext): Promise<void> {
+    for (const message of [...messages].reverse()) {
+      try {
+        await this.config.storage.deleteMessage(message.id, ctx.context);
+      } catch (error) {
+        if (error instanceof NotFoundErrorClass || (error as { statusCode?: number } | null)?.statusCode === 404) continue;
+        throw error;
+      }
+    }
   }
 
   /**
@@ -2755,9 +3631,11 @@ export class AgentServer {
     conversationId: string,
     prior: Message[],
     already: FileAttachment[],
-    rc?: RequestContext
+    rc?: RequestContext,
+    /** Files that are not to ride along (an edit dropped them). */
+    exclude: FileAttachment[] = []
   ): Promise<FileAttachment[]> {
-    const taken = new Set(already.map((file) => file.id));
+    const taken = new Set([...already, ...exclude].map((file) => file.id));
     for (const message of prior) for (const file of message.files ?? []) taken.add(file.id);
     const room = Math.max(0, (this.config.limits?.maxFiles ?? FILES_DEFAULTS.maxFiles) - already.length);
     return (await this.conversationFiles(conversationId, rc))
@@ -2780,9 +3658,12 @@ export class AgentServer {
       currentMessageId?: string;
       handlerMetadata?: Record<string, unknown>;
       budget: TurnBudget;
+      /** Set for a regeneration or an edit-and-resend: host agents and handlers are told. */
+      variant?: TurnVariant;
     }
   ): Promise<AgentStep> {
     const { ctx, conversation, agent, history, body, files } = x;
+    const turnMode = x.variant ? { mode: x.variant.mode, fromMessageId: x.variant.fromMessageId } : {};
     const pricing = x.budget.pricing;
     const conversationId = conversation.id;
     const grace = this.runCfg.cancelGraceMs;
@@ -2922,6 +3803,7 @@ export class AgentServer {
                 conversationId,
                 runId: run.id,
                 message: body.message,
+                ...turnMode,
                 history,
                 files: files ?? [],
                 metadata: x.handlerMetadata ?? body.metadata,
@@ -2947,6 +3829,7 @@ export class AgentServer {
         const work = agent.handler.processMessage({
           conversationId,
           message: body.message,
+          ...turnMode,
           files,
           state: conversation.state,
           metadata: x.handlerMetadata ?? body.metadata,
@@ -3293,6 +4176,8 @@ export class AgentServer {
       rememberAdd?: string[];
       /** How this turn's answer ended the actions of the paused message it continues. */
       settled?: { messageId: string; entries: Map<string, SettledAction> };
+      /** A regeneration: the messages (the earlier answers) this turn's answer replaces once it is stored. */
+      replace?: { messages: Message[]; fromMessageId: string };
     }
   ): Promise<TurnOutcome> {
     const { ctx, conversation, step } = x;
@@ -3335,12 +4220,23 @@ export class AgentServer {
       onTimeout: hitl.onTimeout,
       spend: tb.pricing ? { turnCostUsd, budget: tb.budget } : undefined,
       settled: x.settled,
+      ...(x.replace ? { extraMetadata: this.regenerationMetadata(x.replace.messages, x.replace.fromMessageId) } : {}),
     });
     const assistant = saved.message;
     const stopReason = saved.stopReason;
     const pendingActions = saved.actions;
     let content = step.content;
     const events: Array<{ type: string; data: Record<string, unknown> }> = [];
+
+    // A regeneration: the answers it replaces are gone from the transcript (the new one is stored, so a failure above lost nothing)
+    if (x.replace) {
+      try {
+        await this.removeMessages(x.replace.messages, ctx);
+        events.push({ type: EVENT_TYPES.truncated, data: this.truncatedData("regenerate", x.replace.fromMessageId, x.replace.messages) });
+      } catch (error) {
+        console.error(`[AgentServer] Could not remove the answers a regeneration replaced in conversation ${conversationId}:`, error);
+      }
+    }
 
     // The turn could not pause and had said nothing: the stream gets the notice too
     let noticeFrame: ((seq: number) => Record<string, unknown>) | undefined;
@@ -3395,10 +4291,45 @@ export class AgentServer {
 
     // Auto-generate title on the first exchange
     let conversationTitle: string | undefined;
-    if (!conversation.title && x.firstExchange && !step.cancelled) {
-      conversationTitle = await this.generateTitle(x.firstExchange, run.signal);
-      if (conversationTitle) {
-        await this.config.storage.updateConversation(conversationId, { title: conversationTitle }, ctx.context);
+    const titleConfig = this.titleConfigFor(x.agent);
+    if (titleConfig && !conversation.title && x.firstExchange && !step.cancelled) {
+      const generated = await generateConversationTitle(titleConfig, {
+        conversation,
+        agent: x.agent.info,
+        user: x.firstExchange,
+        assistant: content,
+        context: ctx.context!,
+        pricing: this.pricingFor(x.agent),
+        signal: run.signal,
+      });
+      const stored = generated
+        ? await this.mutateConversation(conversationId, ctx.context, (fresh) => {
+            // (a person who named the conversation in the meantime keeps their title)
+            if (fresh.title) return null;
+            return { title: generated.title, metadata: { ...(fresh.metadata ?? {}), titleGenerated: true } };
+          }).then(
+            (result) => result.written,
+            (error) => {
+              console.error(`[AgentServer] Could not store the title of conversation ${conversationId}:`, error);
+              return false;
+            }
+          )
+        : false;
+      if (generated && stored) {
+        conversationTitle = generated.title;
+        run.emit({
+          events: [
+            {
+              type: EVENT_TYPES.title,
+              data: {
+                title: generated.title,
+                purpose: "title",
+                ...(generated.model ? { model: generated.model } : {}),
+                ...(generated.usage ? { usage: tokens(generated.usage), ...(generated.usage.costUsd !== undefined ? { cost_usd: generated.usage.costUsd } : {}) } : {}),
+              },
+            },
+          ],
+        });
       }
     }
 
@@ -3487,6 +4418,8 @@ export class AgentServer {
       spend?: { turnCostUsd: number; budget: SessionBudget | null };
       /** The actions of the message this turn continues that the turn's answer ended. */
       settled?: { messageId: string; entries: Map<string, SettledAction> };
+      /** More for the message's metadata (what a regeneration replaced). */
+      extraMetadata?: Record<string, unknown>;
     }
   ): Promise<{
     message: Message;
@@ -3549,6 +4482,7 @@ export class AgentServer {
           ...(warnings && { warnings }),
           // What was asked, so a history can show it - and, once it is answered, how
           ...(actions.length > 0 && { pendingActions: openSnapshot(actions) }),
+          ...(turn.extraMetadata ?? {}),
         },
       }, ctx.context);
       try {
@@ -3630,7 +4564,30 @@ export class AgentServer {
       }
       return r as unknown as ActionResolution;
     }
-    return bad('resolution.type must be "tool_approval" or "user_question"');
+    if (r.type === "client_tool") {
+      if (r.error !== undefined && typeof r.error !== "string") return bad("resolution.error must be a string");
+      const error = typeof r.error === "string" ? r.error.trim().slice(0, 2000) : "";
+      if (error) return { type: "client_tool", error };
+      if (!("output" in r) || r.output === undefined) return bad("resolution.output is required (or resolution.error)");
+      const limit = this.config.hitl?.clientToolMaxOutputBytes;
+      const max = typeof limit === "number" && Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : CLIENT_TOOL_MAX_OUTPUT_BYTES;
+      let bytes: number;
+      try {
+        bytes = Buffer.byteLength(JSON.stringify(r.output) ?? "");
+      } catch {
+        return bad("resolution.output has to be JSON");
+      }
+      if (bytes > max) {
+        throw {
+          statusCode: 400,
+          code: "invalid_client_tool_result",
+          message: `The tool result is ${bytes} bytes; at most ${max} are accepted`,
+          details: { bytes, maxBytes: max },
+        };
+      }
+      return { type: "client_tool", output: r.output };
+    }
+    return bad('resolution.type must be "tool_approval", "user_question" or "client_tool"');
   }
 
   /**
@@ -3695,7 +4652,14 @@ export class AgentServer {
     // Answering is a turn like any other: one at a time. An answer that meets another answer waits for it a moment;
     // a second answer to the same action then finds it answered.
     const streaming = !!body?.stream;
-    const run = await this.beginResolveRun(ctx, initial, "resume", streaming);
+    const release = await this.admit(ctx, { operation: "action.resolve", conversationId, agentId: initial.agentId, streaming });
+    let run: ActiveRun;
+    try {
+      run = await this.beginResolveRun(ctx, initial, "resume", streaming);
+    } catch (error) {
+      release();
+      throw error;
+    }
     let resolveRun!: ResolveRun;
     let budget: TurnBudget | undefined;
     try {
@@ -3766,12 +4730,14 @@ export class AgentServer {
       if (lastOpen || !useSdk) budget = this.planTurnBudget(conversation, agent, (nextSdkState as { usage?: unknown } | undefined)?.usage);
       resolveRun = { ctx, conversation, agent, store, action, resolution, nextSdkState, metadata: body?.metadata, actor, channel: "api", edited };
     } catch (error) {
+      release();
       await this.endRun(run);
       throw error;
     }
 
     const stream = streaming ? this.attachStream(run) : undefined;
     this.launch(run, ctx, () => this.executeResolve(run, resolveRun, budget));
+    void run.done.then(release, release);
     if (stream) return { status: 200, headers: SSE_HEADERS, stream: stream.generator, close: stream.close };
 
     const outcome = await run.done;
@@ -3918,6 +4884,7 @@ export class AgentServer {
             type: resolution.type,
             ...(resolution.type === "tool_approval" && { decision: resolution.decision }),
             ...(resolution.type === "user_question" && resolution.cancelled && { cancelled: true }),
+            ...(resolution.type === "client_tool" && { ok: !resolution.error }),
             ...(resolveRun.expired && { expired: true }),
           },
           seq,
@@ -3925,7 +4892,7 @@ export class AgentServer {
       ],
     });
 
-    const answered: SettledAction = { status: "resolved", resolution, resolvedBy: actor, resolvedAt: new Date() };
+    const answered: SettledAction = { status: "resolved", resolution: recordableResolution(resolution), resolvedBy: actor, resolvedAt: new Date() };
     const remaining = pending.actions.filter((a) => a.id !== action.id);
     const allowedTools = new Set(store.allowedTools ?? []);
     const rememberAdd: string[] = [];
@@ -4127,7 +5094,14 @@ export class AgentServer {
     const streaming = !!body.stream;
     const { conversation: initial, agent } = await this.loadForTurn(conversationId, ctx);
 
-    const run = await this.beginRun(ctx, initial, "continue", "resume", streaming);
+    const release = await this.admit(ctx, { operation: "turn.continue", conversationId, agentId: initial.agentId, streaming });
+    let run: ActiveRun;
+    try {
+      run = await this.beginRun(ctx, initial, "continue", "resume", streaming);
+    } catch (error) {
+      release();
+      throw error;
+    }
     let conversation: Conversation = initial;
     let budget!: TurnBudget;
     let carried: Record<string, unknown> | undefined;
@@ -4162,6 +5136,7 @@ export class AgentServer {
       fromMessageId = pause.messageId;
       budget = this.planTurnBudget(conversation, agent, carried?.usage);
     } catch (error) {
+      release();
       await this.endRun(run);
       throw error;
     }
@@ -4188,6 +5163,7 @@ export class AgentServer {
       }
       return this.finalizeTurn(run, { ctx, conversation, agent, step, budget });
     });
+    void run.done.then(release, release);
     if (stream) return { status: 200, headers: SSE_HEADERS, stream: stream.generator, close: stream.close };
 
     const outcome = await run.done;
@@ -4829,8 +5805,10 @@ export class AgentServer {
       }
       const sdkAgent = agent?.sdkAgent;
       let budget: TurnBudget | undefined;
+      // A client tool the page never answered is answered with an error the model reads, whatever `onTimeout` says for approvals
+      const answerLapsed = policy === "deny" || due.every((action) => action.type === "client_tool");
       let canDeny =
-        policy === "deny" &&
+        answerLapsed &&
         !!agent &&
         (sdkAgent
           ? supportsSdkPause(sdkAgent) && store.pending.sdkState !== undefined
@@ -4874,7 +5852,9 @@ export class AgentServer {
           const resolution: ActionResolution =
             action.type === "tool_approval"
               ? { type: "tool_approval", decision: "deny", comment: "timed out" }
-              : { type: "user_question", answers: {}, cancelled: true };
+              : action.type === "client_tool"
+                ? { type: "client_tool", error: CLIENT_TOOL_UNANSWERED }
+                : { type: "user_question", answers: {}, cancelled: true };
           const nextSdkState = sdkAgent
             ? applySdkResolution(sdkAgent as HitlSdkAgent, jsonSafe(currentStore.pending.sdkState), action, resolution, "system:timeout")
             : undefined;
@@ -5346,6 +6326,7 @@ export class AgentServer {
     if (!cfg.enabled) {
       throw { statusCode: 403, code: "attachments_disabled", message: "This agent does not take attachments." };
     }
+    (await this.admit(ctx, { operation: "file.upload", conversationId: conversation?.id, agentId: conversation?.agentId }))();
 
     let bytes: Buffer;
     if (typeof upload.content === "string") {
@@ -6005,6 +6986,11 @@ export class AgentServer {
     if (rest.source === "task") delete rest.source;
     if (existing?.taskId !== undefined) rest.taskId = existing.taskId;
     if (existing?.source === "task") rest.source = "task";
+    // Pins and the mark of a generated title are the server's: set through `pinned` and the title routes, never through `metadata`
+    for (const key of SERVER_METADATA_KEYS) {
+      delete rest[key];
+      if (existing?.[key] !== undefined) rest[key] = existing[key];
+    }
     return rest as T;
   }
 

@@ -112,14 +112,16 @@ snake_case types and data, `seq` unique and ascending within the conversation.
 | Type | `data` |
 | --- | --- |
 | `user.message` | `content`, `message_id`, `files?` (`id`, `name`, `mime_type`, `size` of each file the message carries) |
-| `session.status_running` | `trigger`: `message`, `resume` (an answer, or a [continuation](./budgets.md#raising-it-and-carrying-on)) or `timeout` (a request [lapsed](./human-in-the-loop.md#requests-that-lapse) and the agent carries on) |
+| `session.status_running` | `trigger`: `message`, `resume` (an answer, or a [continuation](./budgets.md#raising-it-and-carrying-on)) or `timeout` (a request [lapsed](./human-in-the-loop.md#requests-that-lapse) and the agent carries on); `mode?`: `regenerate` or `edit` for a [regeneration or an edit-and-resend](./chat-experience.md#message-actions) |
 | `agent.tool_use` | `tool_call_id`, `name`, `args` |
 | `agent.tool_result` | `tool_call_id`, `name`, `ok`, `duration_ms?`, `error?` |
 | `agent.message` | `content`, `message_id`, `stop_reason`, `usage?` (`input_tokens`, `output_tokens`, `total_tokens`, `cached_input_tokens?`, `cost_usd?`) |
 | `session.usage` | `input_tokens`, `output_tokens`, `total_tokens`, `cached_input_tokens?` and - with [pricing](./budgets.md#prices) - `turn_cost_usd`, `spent_usd`, `budget?` (`max_cost_usd`, `on_reach`) |
 | `budget.reached` | `spent_usd`, `max_cost_usd`, `on_reach`; just before the `session.status_idle` with `stop_reason: budget_reached` |
-| `action.required` | `action_id`, `kind` (`tool_approval` \| `user_question`), `tool_name?`, `summary?`, `args?`, `questions?`, `allow_free_text?`, `expires_at?` |
-| `action.resolved` | `action_id`, `kind`, `decision?`, `cancelled?`, `expired?`, `remembered?`, `edited_args?`, `status` (`approved`, `rejected`, `answered`, `cancelled`, `expired`), `resolved_by`, `channel` (`api`, `system`, `timeout` or `remembered`) |
+| `action.required` | `action_id`, `kind` (`tool_approval` \| `user_question` \| `client_tool`), `tool_name?`, `summary?`, `args?`, `questions?`, `allow_free_text?`, `timeout_seconds?`, `expires_at?` |
+| `action.resolved` | `action_id`, `kind`, `decision?`, `cancelled?`, `expired?`, `remembered?`, `edited_args?`, `ok?` / `error?` / `duration_ms?` (a [client tool](./human-in-the-loop.md#client-tools)), `status` (`approved`, `rejected`, `answered`, `failed`, `cancelled`, `expired`), `resolved_by`, `channel` (`api`, `system`, `timeout` or `remembered`) |
+| `session.truncated` | `reason` (`regenerate` \| `edit`), `from_message_id`, `removed_count`, `removed_message_ids` (at most 50): messages were removed from the transcript - **reload the history** |
+| `session.title` | `title`, `purpose: "title"`, `model?`, `usage?` (`input_tokens`, `output_tokens`, `total_tokens`), `cost_usd?`: a [generated title](./chat-experience.md#generated-titles) and what making it used |
 | `session.status_idle` | `stop_reason`, `pending_action_ids?`, `detail?` |
 | `session.work_done` | none; right after an idle with `stop_reason: end_turn` |
 | `session.error` | `message`, `code?` |

@@ -310,7 +310,8 @@ export function createNextRouteHandlers(
       headers["Access-Control-Allow-Methods"] =
         corsConfig.methods?.join(", ") || "GET, POST, PATCH, DELETE, OPTIONS";
       headers["Access-Control-Allow-Headers"] =
-        corsConfig.headers?.join(", ") || "Content-Type, Authorization";
+        corsConfig.headers?.join(", ") || "Content-Type, Authorization, Last-Event-ID";
+      headers["Access-Control-Expose-Headers"] = "Retry-After, Content-Disposition, Content-Length";
       headers["Access-Control-Max-Age"] = "86400";
     }
 
@@ -350,7 +351,8 @@ export function createNextMiddleware(
         "Access-Control-Allow-Methods":
           config.cors.methods?.join(", ") || "GET, POST, PATCH, DELETE, OPTIONS",
         "Access-Control-Allow-Headers":
-          config.cors.headers?.join(", ") || "Content-Type, Authorization",
+          config.cors.headers?.join(", ") || "Content-Type, Authorization, Last-Event-ID",
+        "Access-Control-Expose-Headers": "Retry-After, Content-Disposition, Content-Length",
         "Access-Control-Max-Age": "86400",
       };
 

@@ -18,6 +18,8 @@ interface AgentHandler {
 interface ProcessMessageParams {
   conversationId: string;
   message: string;                       // what the person typed
+  mode?: 'regenerate' | 'edit';          // set for a regeneration / an edit-and-resend (see "Chat experience"); absent for a new message
+  fromMessageId?: string;                // the message `mode` started from
   files?: FileAttachment[];              // the files the message carries (real ids)
   state?: Record<string, unknown>;
   metadata?: Record<string, unknown>;

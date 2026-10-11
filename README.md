@@ -18,6 +18,8 @@ Documentation: <https://docs.cognipeer.com/agent-server/guide/getting-started>
 - 📁 **Files the agent reads**: upload a file as itself or as JSON; it is owned by the uploader, limited per agent, deleted after `retentionDays` or with its conversation, and its text (PDF and Office with `@cognipeer/to-markdown`) or picture reaches the agent - inline, in pages with `session_files_read`, or as an image by reference
 - ✅ **Approvals that hold up**: several people can answer the actions of one pause at once without losing an answer, requests lapse (and are denied or dropped) instead of waiting for ever, you decide who may answer, edited arguments are checked against the tool's schema, and the paused message records who decided what
 - 💰 **Usage & budgets**: per-turn usage from agent-sdk's ledger (a resumed turn is never counted twice), cost from your price list, a spend limit per conversation that stops a turn, waits for a raise, and carries on (`POST /continue`)
+- 💬 **A chat around the conversation**: regenerate an answer, edit a message and resend, pin / rename / bulk-delete conversations, generated titles, starters and a welcome text, thumbs up / down with reasons, and export as Markdown, JSON or a print page - see [Chat experience](docs/guide/chat-experience.md)
+- 🪟 **Embeddable**: per-request bearer auth (no cookies), `client_tool` requests that run in the embedding page, a `rateLimit` hook with release for stream caps, and an `audit` hook - see [Embedding & limits](docs/guide/embedding.md)
 - ⏯️ **Runs that outlive the connection**: a turn keeps running when the client disconnects; cancel it, follow it from another client (event log + SSE), one turn at a time per conversation across server instances
 
 ## Installation

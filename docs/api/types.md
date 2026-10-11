@@ -20,6 +20,8 @@ interface Message {
   metadata?: Record<string, unknown>;
   /** API only (derived from `metadata.status`): how the turn that produced an assistant message ended. */
   status?: 'completed' | 'requires_action' | 'incomplete' | 'cancelled';
+  /** API only (derived from `metadata.feedback`): the rating the owner gave an assistant message. */
+  feedback?: MessageFeedback;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -85,6 +87,8 @@ interface Conversation {
   spentUsd?: number;
   /** Tools the person asked not to be asked about again. */
   rememberedTools?: string[];
+  /** The person pinned the conversation (`PATCH { pinned: true }`, stored as `metadata.pinned`); lists put pinned ones first. */
+  pinned?: boolean;
   /** Storage only (never sent to clients): bumped by every update; the earliest deadline of the open actions. */
   version?: number;
   actionDueAt?: Date;
@@ -360,7 +364,10 @@ interface StreamErrorEvent {
 type PendingAction =
   | { id: string; type: 'tool_approval'; toolName: string; toolCallId?: string; title?: string; summary?: string; args?: Record<string, unknown>;
       argsSchema?: Record<string, unknown> /* JSON Schema of the tool's arguments, when known */; expiresAt?: string }
-  | { id: string; type: 'user_question'; questions: UserQuestion[]; allowFreeText?: boolean; expiresAt?: string };
+  | { id: string; type: 'user_question'; questions: UserQuestion[]; allowFreeText?: boolean; expiresAt?: string }
+  | { id: string; type: 'client_tool'; toolName: string; toolCallId?: string; title?: string; args?: Record<string, unknown>;
+      argsSchema?: Record<string, unknown>; timeoutSeconds?: number /* the client's to enforce */;
+      requestedAt?: string /* stamped by the server */; expiresAt?: string };
 
 interface UserQuestion {
   question: string;
@@ -385,7 +392,8 @@ type ActionSnapshot = PendingAction & {
 ```typescript
 type ActionResolution =
   | { type: 'tool_approval'; decision: 'allow' | 'deny'; comment?: string; approvedArgs?: Record<string, unknown>; rememberForSession?: boolean }
-  | { type: 'user_question'; answers: Record<string, string | string[]>; cancelled?: boolean };
+  | { type: 'user_question'; answers: Record<string, string | string[]>; cancelled?: boolean }
+  | { type: 'client_tool'; output?: unknown; error?: string };   // output: any JSON, at most hitl.clientToolMaxOutputBytes; error: a message the model reads
 
 type MessageStatus = 'completed' | 'requires_action' | 'incomplete' | 'cancelled';
 ```
@@ -528,6 +536,7 @@ interface GetConversationsParams {
   orderBy?: 'createdAt' | 'updatedAt';   // default createdAt
   order?: 'asc' | 'desc';                // default desc: newest first
   actionDueBefore?: Date;                // only conversations whose earliest open approval lapses by then (the expiry sweep; needs capabilities().actionDeadlines)
+  pinnedFirst?: boolean;                 // conversations with metadata.pinned === true first, across pages (needs capabilities().pinnedFirst)
 }
 ```
 
@@ -635,13 +644,16 @@ For [`registerHostAgent`](./server#registerhostagent). The guide: [Host-backed a
 interface HostAgentDefinition extends HostAgent {
   info: AgentInfo;                          // id and name
   files?: AgentFilesConfig; hitl?: AgentHitlConfig; budget?: SessionBudget | null; pricing?: PricingFn;
+  experience?: AgentExperience; titleGeneration?: TitleGenerationConfig | false;
 }
 
 interface HostInvokeInput {
   conversationId: string;
   runId: string;                            // the run this turn executes as
   message: string;                          // what the person typed
-  history: Message[];                       // the conversation so far, including this message
+  mode?: 'regenerate' | 'edit';             // absent for a new message
+  fromMessageId?: string;                   // the message the regenerate / edit request named
+  history: Message[];                       // the conversation so far, including this message (already cut back for a regenerate / edit)
   files: FileAttachment[];                  // the files this message carries (stored; real ids)
   metadata?: Record<string, unknown>;
   context: RequestContext;
@@ -693,4 +705,84 @@ interface HostCancelInput {
   actions?: PendingAction[];
   context: RequestContext;
 }
+
+interface FeedbackEvent {                   // HostAgent.feedback(event) and FeedbackConfig.onFeedback(ctx, event)
+  conversationId: string;
+  messageId: string;                        // the rated answer
+  messageIndex: number;                     // its 0-based position in the transcript
+  agentId: string;
+  userId?: string;
+  rating: 'up' | 'down' | null;             // null: withdrawn
+  reasons: string[];
+  comment?: string;
+  previous?: MessageFeedback;               // the rating this one replaced
+  createdAt: string; updatedAt: string;     // ISO 8601
+  message: Message;                         // the answer
+  question?: Message;                       // the user message it answered
+  context: RequestContext;
+}
+```
+
+## Chat experience
+
+For [Chat experience](../guide/chat-experience) and [Embedding & limits](../guide/embedding).
+
+```typescript
+interface AgentExperience {
+  welcome?: string;                         // Markdown, at most 4000 characters
+  starters?: ConversationStarter[];         // at most 6
+  messageActions?: { copy?: boolean; regenerate?: boolean; edit?: boolean };
+  history?: { rename?: boolean; pin?: boolean; bulkDelete?: boolean };
+  feedback?: { enabled?: boolean; comments?: boolean; reasons?: string[] };
+  export?: { enabled?: boolean; includeTools?: boolean };
+}
+interface ConversationStarter { text: string; label?: string; autoSend?: boolean }
+
+/** What AgentInfo.metadata.experience holds: every switch resolved. */
+interface ResolvedExperience {
+  messageActions: { copy: boolean; regenerate: boolean; edit: boolean };
+  history: { rename: boolean; pin: boolean; bulkDelete: boolean };
+  feedback: { enabled: boolean; comments: boolean; reasons: string[]; maxCommentLength: number };
+  export: { enabled: boolean; includeTools: boolean; formats: string[] };   // formats: md, json, html (+ pdf when there is a renderer)
+  titles: boolean;
+}
+
+interface MessageFeedback { rating: 'up' | 'down'; reasons?: string[]; comment?: string; userId?: string; createdAt: string; updatedAt: string }
+
+interface TitleGenerationConfig {
+  baseUrl?: string; apiKey?: string; model?: string; path?: string; timeoutMs?: number;   // an OpenAI-compatible endpoint...
+  generate?: (input: TitleInput) => Promise<string | TitleResult | null | undefined> | string | TitleResult | null | undefined;  // ...or your own
+  maxWords?: number;                        // default 6
+  includeAnswer?: boolean;                  // default true
+  instructions?: string;
+}
+interface TitleInput { conversation: Conversation; agent: AgentInfo; user: string; assistant?: string; maxWords: number; context: RequestContext; signal: AbortSignal }
+interface TitleResult { title: string; usage?: UsageInfo; model?: string }
+
+type RateLimitOperation = 'conversation.create' | 'message.send' | 'message.regenerate' | 'message.edit' | 'action.resolve'
+  | 'turn.continue' | 'file.upload' | 'conversation.export' | 'message.feedback' | 'conversation.bulk_delete';
+interface RateLimitRequest { operation: RateLimitOperation; conversationId?: string; agentId?: string; userId?: string; streaming?: boolean }
+type RateLimitDecision = void | boolean | { allowed?: boolean; retryAfterSeconds?: number; message?: string; release?: () => void };
+
+interface AuditEntry {
+  action: 'conversation.export' | 'conversation.delete' | 'conversation.bulk_delete' | 'conversation.pin' | 'conversation.unpin'
+    | 'message.regenerate' | 'message.edit' | 'message.feedback';
+  conversationId?: string; agentId?: string; userId?: string; messageId?: string;
+  details?: Record<string, unknown>; at: Date;
+}
+
+interface FeedbackConfig { enabled?: boolean; reasons?: string[]; maxCommentLength?: number; onFeedback?: (ctx: RequestContext, event: FeedbackEvent) => void | Promise<void> }
+interface ExportConfig {
+  enabled?: boolean; includeTools?: boolean; maxMessages?: number;
+  labels?: Record<string, Partial<ExportLabels>>;
+  renderPdf?: (input: { html: string; conversation: Conversation; context: RequestContext }) => Promise<Buffer | Uint8Array> | Buffer | Uint8Array;
+}
+
+// Requests
+interface RegenerateMessageRequest { stream?: boolean; metadata?: Record<string, unknown> }
+interface EditMessageRequest { content?: string; message?: string; fileIds?: string[]; files?: Array<{ name: string; content: string; mimeType: string }>; metadata?: Record<string, unknown>; stream?: boolean }
+interface FeedbackRequest { rating: 'up' | 'down' | null; reasons?: string[]; comment?: string }
+interface FeedbackResponse { feedback: MessageFeedback | null; messageId: string }
+interface BulkDeleteRequest { ids: string[] }
+interface BulkDeleteResponse { results: Array<{ id: string; status: 'deleted' | 'not_found' | 'busy' | 'error'; message?: string }>; deleted: number }
 ```

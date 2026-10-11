@@ -29,6 +29,7 @@ data: {"type":"stream.text","text":" there!","isFinal":false,"timestamp":1234567
 data: {"type":"stream.done","conversationId":"conv_123","messageId":"msg_2","content":"Hello there!","stopReason":"end_turn","runId":"run_x1","timestamp":1234567894,"seq":5}
 ```
 
+`POST /conversations/:id/messages/:messageId/regenerate` and `.../edit` answer with `stream: true` in the same way (`stream.start` carries the id of the user message that is answered, or of the new user message of an edit).
 A request that cannot start is an HTTP status, not a stream: `404` for an unknown `fileIds`, `409 action_pending` while an
 action is pending, `409 conversation_busy` while the conversation is running another turn. (A streamed request for a
 conversation or agent that does not exist, or is not yours, answers `200` with a stream that carries one `stream.error`.)
@@ -109,7 +110,7 @@ With `maskServerErrors: true` only errors the host marked for the client keep th
 
 ### stream.action_required / stream.action_resolved
 
-When the agent pauses for a tool approval or a question, `stream.action_required` (with the `actions`) precedes the final `stream.done`,
+When the agent pauses for a tool approval, a question or a [client tool](./human-in-the-loop.md#client-tools) (`type: "client_tool"`: a client shows no card, it hands the call to the host page), `stream.action_required` (with the `actions`) precedes the final `stream.done`,
 which carries `status: "requires_action"`. `stream.action_resolved` is the first event after `stream.start` of the stream returned
 by `POST /conversations/:id/actions/:actionId` (with `resolution.expired: true` when it is the sweep answering a lapsed request, which has no stream to speak of). The stream of `POST /conversations/:id/continue` starts with
 `stream.start` and ends with `stream.done` the same way. See [Approvals & Questions](./human-in-the-loop.md) and [Usage & Budgets](./budgets.md).

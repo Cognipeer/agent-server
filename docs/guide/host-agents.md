@@ -48,7 +48,8 @@ a hook, and is handed the full answer to an approval.
 | --- | --- |
 | `conversationId`, `runId` | The conversation, and the run this turn executes as (the `runId` of the response and of the stored events) |
 | `message` | What the person typed. The files are not in it |
-| `history` | The conversation so far, oldest first, including this message (`Message[]`). A backend that keeps its own transcript ignores it |
+| `mode`, `fromMessageId` | Set when the turn is a [regeneration or an edit-and-resend](./chat-experience.md#message-actions): `mode` is `"regenerate"` (the newest answer is asked for again; `message` is the user message it answered, `fromMessageId` the answer being replaced) or `"edit"` (a message was changed; `message` is the new text, `fromMessageId` the user message it replaces). Absent for a new message. A backend that keeps its own transcript **rewinds it to that message and runs `message` again** |
+| `history` | The conversation so far, oldest first, including this message (`Message[]`) - already cut back for a regenerate or an edit. A backend that keeps its own transcript ignores it |
 | `files` | The files this message carries - stored, so every entry has a real id |
 | `metadata` | What the request put in `metadata` (a [task](../tasks.md) hands over its comments) |
 | `context` | The request context from `resolveContext`: the user and your own data (tenant, portal, ...) |
@@ -128,6 +129,29 @@ Without `resolveAction` the agent cannot pause: answering its actions is a `404`
 - `rememberForSession` arrives in the resolution; remembering the tool, and not asking again, is yours (`GET .../remembered-tools` lists what the server remembers for SDK agents).
 - `approvedArgs` are passed as they are; the server cannot check them against a schema it does not have.
 - `POST /conversations/:id/continue` carries on an agent-sdk turn the budget stopped. A host agent reports `stopReason: "budget_reached"` and decides what the next message does.
+
+### Client tools
+
+A request of `type: 'client_tool'` is for the page that embeds the chat, not for a person - return it in `pendingActions` like an approval and handle the page's result (`resolution: { type: 'client_tool', output }`, or `{ type: 'client_tool', error }` when the page failed or never answered) in `resolveAction`.
+See [Client tools](./human-in-the-loop.md#client-tools).
+
+## Feedback
+
+A person can rate an answer (`POST /conversations/:id/messages/:messageId/feedback`, see [Chat experience](./chat-experience.md#feedback)). The server stores the rating on the message; implement **`feedback(event)`** to keep your own record - an analytics table, an evaluation set:
+
+```typescript
+server.registerHostAgent({
+  info: { id: 'support', name: 'Support' },
+  async invoke(input, io) { /* ... */ return { content: '...' }; },
+  async feedback(event) {
+    // event: { conversationId, messageId, messageIndex, agentId, userId, rating: 'up' | 'down' | null (withdrawn), reasons, comment?,
+    //          previous?, message (the answer), question? (what it answered), createdAt, updatedAt, context }
+    await db.insert('answer_feedback', { ... });
+  },
+});
+```
+
+It runs after the rating is stored and before the server-wide `feedback.onFeedback`. A failure fails the request with its error - the rating stays, and sending the same request again is safe (a rating is replaced, never added).
 
 ## Cancel
 

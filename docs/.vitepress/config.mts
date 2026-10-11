@@ -46,6 +46,8 @@ export default defineConfig({
             { text: 'Streaming', link: '/guide/streaming' },
             { text: 'Runs, Cancel & Reattach', link: '/guide/runs' },
             { text: 'Approvals & Questions', link: '/guide/human-in-the-loop' },
+            { text: 'Chat Experience', link: '/guide/chat-experience' },
+            { text: 'Embedding & Limits', link: '/guide/embedding' },
             { text: 'Host-backed Agents', link: '/guide/host-agents' },
             { text: 'Usage & Budgets', link: '/guide/budgets' },
             { text: 'Swagger UI', link: '/guide/swagger' },

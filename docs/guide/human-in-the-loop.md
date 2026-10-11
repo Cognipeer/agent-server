@@ -23,7 +23,10 @@ type PendingAction =
       title?: string; summary?: string; args?: Record<string, unknown>;
       argsSchema?: Record<string, unknown>; expiresAt?: string }
   | { id: string; type: 'user_question'; questions: UserQuestion[];
-      allowFreeText?: boolean; expiresAt?: string };
+      allowFreeText?: boolean; expiresAt?: string }
+  | { id: string; type: 'client_tool'; toolName: string; toolCallId?: string; title?: string;
+      args?: Record<string, unknown>; argsSchema?: Record<string, unknown>;
+      timeoutSeconds?: number; requestedAt?: string; expiresAt?: string };
 ```
 
 - `title` is the tool's `approvalPrompt`; `summary` is a one-line description of what approving does (`metadata.summary` of the agent-sdk entry).
@@ -46,6 +49,7 @@ Content-Type: application/json
 |--------|-----------|
 | `tool_approval` | `{ type, decision: 'allow' \| 'deny', comment?, approvedArgs?, rememberForSession? }` |
 | `user_question` | `{ type, answers: { '<question text>': 'value' \| ['v1', 'v2'] }, cancelled? }` |
+| `client_tool` | `{ type, output }` (any JSON) or `{ type, error }` - see [Client tools](#client-tools) |
 
 - `approvedArgs` must be a JSON object; it replaces the tool arguments when allowing, and is [checked against the tool's schema](#edited-arguments-are-checked).
 - `rememberForSession` (SDK agents): later pauses on the same tool in this conversation are approved automatically - see [Remembered tools](#remembered-tools).
@@ -76,6 +80,39 @@ exactly one of the answers (the one that closes the pause) carries the turn on. 
 as the model does, so an answer does not wait for those: `409 conversation_busy`.
 
 Answering is a [run](./runs.md) like a message is: it runs detached from the request (a client that disconnects does not stop it), it can be [cancelled](./runs.md#cancel), and it leaves `action.resolved`, `session.status_running`, ... `session.status_idle` in the conversation's [event log](./runs.md#the-event-log).
+
+## Client tools
+
+A third kind of request is not for a person: it is for **the page that embeds the chat**. A host-backed agent (or a custom handler) that wants the host page to do something - read the selected rows of a table, fill a form field, open a record -
+pauses the turn with a `client_tool` request instead of calling a tool itself:
+
+```typescript
+return {
+  content: '',
+  pendingActions: [
+    { id: 'ct_1', type: 'client_tool', toolName: 'get_selected_rows', toolCallId: 'call_7',
+      args: { max: 20 }, argsSchema: { type: 'object', properties: { max: { type: 'integer' } } }, timeoutSeconds: 60 },
+  ],
+};
+```
+
+The request travels like any other (`stream.action_required`, `action.required` with `kind: "client_tool"`, `pendingActions` in `GET /conversations/:id`). A chat client **shows no card** for it: it hands `toolName` and `args` to the host page
+(the embedded chat does it with a `postMessage` bridge) and, when the page is done, answers the way it answers an approval:
+
+```http
+POST /conversations/conv_1/actions/ct_1
+{ "resolution": { "type": "client_tool", "output": { "rows": [ ... ] } } }
+```
+
+- `output` is any JSON value, at most `hitl.clientToolMaxOutputBytes` (default 65 536 bytes; more is `400 invalid_client_tool_result`). `error` (a message the model reads) says the page failed, has no such tool, or did not answer: **`{ "type": "client_tool", "error": "..." }`**. One of the two is required.
+- The turn then continues in your `resolveAction`, with the whole resolution; the model gets the output - or the error - as the result of its tool call.
+- `timeoutSeconds` is for the **client** to enforce: a page that has not answered by then is answered for with an error. The server's own deadline is the net under that for a page that went away: `expiresAt` defaults to `timeoutSeconds` + 30 s
+  after the request was recorded (`requestedAt`), or `hitl.timeoutMinutes` without a `timeoutSeconds`. A client tool that lapses is **always answered with an error the model reads** (`"The host page did not answer."`), whatever `hitl.onTimeout` says for approvals,
+  and the agent carries on; with an agent that cannot resolve actions it is dropped like any other request.
+- Approval still applies first: a host that wants the person to confirm a client tool asks for a `tool_approval` before it asks for the `client_tool`.
+- The event log records the call: `action.required` (`kind: "client_tool"`, `tool_name`, `args`, `timeout_seconds`) and `action.resolved` (`tool_name`, `ok`, `error?`, `duration_ms`, `status: "answered"` or `"failed"`). The output is **not** in the log or in the paused message:
+  the message's `metadata.pendingActions` keeps `resolution: { type: "client_tool", outputBytes }` (or the `error`), so a history never holds the page's data.
+- An agent-sdk agent has no such pause (it cannot produce one), and a resolution of another type than the request's is a `400`. Advertise the support with `capabilities.clientTools: true` on the agent.
 
 ## Requests that lapse
 
@@ -185,9 +222,9 @@ predicate is never remembered; `allowRememberApproval: false` turns it off). It 
 A pause and its resolution are in the event log, so a client that was not connected can follow them (`GET /conversations/:id/events/stream`):
 
 ```
-action.required   { action_id, kind: 'tool_approval' | 'user_question', tool_name?, summary?, args?, args_schema?, questions?, allow_free_text?, expires_at? }
+action.required   { action_id, kind: 'tool_approval' | 'user_question' | 'client_tool', tool_name?, summary?, args?, args_schema?, questions?, allow_free_text?, timeout_seconds?, requested_at?, expires_at? }
 session.status_idle { stop_reason: 'requires_action', pending_action_ids: [...] }
-action.resolved   { action_id, kind, decision?, cancelled?, expired?, remembered?, edited_args?, remember_for_session?, status: 'approved' | 'rejected' | 'answered' | 'cancelled' | 'expired', resolved_by, channel: 'api' | 'system' | 'timeout' | 'remembered' }
+action.resolved   { action_id, kind, decision?, cancelled?, expired?, remembered?, edited_args?, remember_for_session?, tool_name?, ok?, error?, duration_ms?, status: 'approved' | 'rejected' | 'answered' | 'failed' | 'cancelled' | 'expired', resolved_by, channel: 'api' | 'system' | 'timeout' | 'remembered' }
 ```
 
 `GET /conversations/:id` has `runtime.status: "requires_action"` and `runtime.pendingActionIds` while a pause is open.

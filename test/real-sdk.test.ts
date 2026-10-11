@@ -44,6 +44,44 @@ const deploy = sdk && createTool({
 const noop = sdk && createTool({ name: "noop", description: "n", schema: z.object({}), func: async () => "ok" });
 
 describe.skipIf(!sdk)("real agent-sdk", () => {
+  it("regenerates and edits: the model is only given the part of the transcript that is left", async () => {
+    const seen: string[][] = [];
+    let n = 0;
+    const model: any = {
+      modelName: "m1",
+      bindTools() { return model; },
+      async invoke(messages: any[]) {
+        seen.push(messages.filter((m) => m.role === "user" || m.role === "assistant").map((m) => `${m.role}:${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`));
+        n++;
+        return { role: "assistant", content: `reply ${n}`, usage_metadata: { input_tokens: 10, output_tokens: 5, total_tokens: 15 } };
+      },
+    };
+    const agent = createSmartAgent({ name: "t", model, tools: [noop] as any } as any);
+    const server = createAgentServer({ basePath: "/api", storage: await memoryStorage(), runs: { sweepIntervalMs: 0, recoverOnStart: false } });
+    server.registerSDKAgent("a", agent);
+    const call = (m: string, p: string, body?: unknown) => server.handleRoute(m, p, { query: {}, body });
+    const id = ((await call("POST", "/conversations", { agentId: "a" })).body as any).conversation.id;
+    const first = (await call("POST", `/conversations/${id}/messages`, { message: "one" })).body as any;
+    await call("POST", `/conversations/${id}/messages`, { message: "two" });
+    expect(seen.at(-1)).toEqual(["user:one", "assistant:reply 1", "user:two"]);
+
+    // regenerate the newest answer: the model sees the transcript up to the question it answers
+    const second = (await call("GET", `/conversations/${id}`)).body as any;
+    const newest = second.messages.at(-1);
+    const again = await call("POST", `/conversations/${id}/messages/${newest.id}/regenerate`);
+    expect(again.status).toBe(200);
+    expect(seen.at(-1)).toEqual(["user:one", "assistant:reply 1", "user:two"]);
+    expect((again.body as any).response.content).toBe("reply 3");
+    expect((again.body as any).response.metadata.previousContent).toEqual([expect.objectContaining({ content: "reply 2" })]);
+
+    // edit the first message: everything after it is gone
+    const edited = await call("POST", `/conversations/${id}/messages/${first.message.id}/edit`, { content: "uno" });
+    expect(edited.status).toBe(200);
+    expect(seen.at(-1)).toEqual(["user:uno"]);
+    const after = ((await call("GET", `/conversations/${id}`)).body as any).messages.map((m: any) => m.content);
+    expect(after).toEqual(["uno", "reply 4"]);
+  });
+
   it("pauses, validates edits, resumes with delta usage", async () => {
     const model = scriptedModel([{ tool: { name: "deploy", args: { version: "1.0" } } }, { content: "all done" }]);
     const agent = createSmartAgent({ name: "t", model, tools: [deploy] as any, costEstimator: costEstimatorFromPricing(testPricing) } as any);

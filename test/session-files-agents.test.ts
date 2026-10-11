@@ -215,7 +215,8 @@ describe("agent info", () => {
       acceptsImages: true,
       retentionDays: 7,
     });
-    expect(info.metadata).toEqual({
+    // (the server adds what a chat client shows around the agent - `experience`, see test/portal-actions.test.ts)
+    expect(info.metadata).toMatchObject({
       enableFileUpload: true,
       maxFileSize: 5_000_000,
       maxFiles: 4,

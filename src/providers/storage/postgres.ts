@@ -209,6 +209,7 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       leases: true,
       fileIndex: true,
       actionDeadlines: true,
+      pinnedFirst: true,
     };
   }
 
@@ -649,7 +650,9 @@ export class PostgresStorageProvider extends BaseStorageProvider {
     const total = parseInt(countResult.rows[0].count, 10);
 
     // Get paginated results; the insertion sequence breaks ties between rows created in one millisecond
-    const ordering = params.actionDueBefore ? "action_due_at ASC, seq ASC" : `${orderBy} ${order}, seq ${order}`;
+    // `pinnedFirst`: conversations with metadata.pinned === true lead, each group in the requested order
+    const pinned = params.pinnedFirst ? `CASE WHEN metadata @> '{"pinned": true}'::jsonb THEN 0 ELSE 1 END, ` : "";
+    const ordering = params.actionDueBefore ? "action_due_at ASC, seq ASC" : `${pinned}${orderBy} ${order}, seq ${order}`;
     const result = await this.pool.query<DbConversation>(
       `SELECT * FROM ${this.tables.conversations}
        ${whereClause}

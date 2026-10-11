@@ -93,6 +93,7 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
       leases: true,
       fileIndex: true,
       actionDeadlines: true,
+      pinnedFirst: true,
     };
   }
 
@@ -212,6 +213,11 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
     } else {
       const orderBy = params.orderBy === "updatedAt" ? "updatedAt" : "createdAt";
       this.sortByTime(conversations, (c) => c[orderBy].getTime(), params.order === "asc" ? 1 : -1);
+      if (params.pinnedFirst) {
+        // (a stable partition: each group keeps the order above)
+        const pinned = conversations.filter((c) => c.metadata?.pinned === true);
+        conversations = [...pinned, ...conversations.filter((c) => c.metadata?.pinned !== true)];
+      }
     }
 
     const total = conversations.length;

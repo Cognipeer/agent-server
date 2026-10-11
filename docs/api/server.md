@@ -30,8 +30,8 @@ interface AgentServerConfig {
   // Agents: array, or resolved per request
   agents?: AgentRegistration[] | ((ctx: RequestContext) => AgentRegistration[] | Promise<AgentRegistration[]>);
 
-  // Generate a conversation title with an OpenAI-compatible model after the first exchange
-  titleGeneration?: { baseUrl: string; apiKey: string; model: string; path?: string };
+  // Generate a conversation title after the first exchange: an OpenAI-compatible endpoint, or your own `generate` function
+  titleGeneration?: TitleGenerationConfig;
 
   // Reserved for a separate file store; files are kept by the storage provider and this is not used
   fileStorage?: FileStorageProvider;
@@ -91,6 +91,18 @@ interface AgentServerConfig {
   pricing?: (model: string) => ModelPricing | undefined;
   budget?: { maxCostUsd: number; onReach: 'pause' | 'stop' };
   authorizeBudget?: (ctx: RequestContext, change: BudgetChange) => boolean | Promise<boolean>;
+
+  // What a chat client shows around every agent: welcome, starters, message actions, history, feedback, export - see guide/chat-experience
+  experience?: AgentExperience;
+  // Ratings on answers: reason codes, comment length, a hook that hears every rating
+  feedback?: FeedbackConfig;
+  // Downloading a conversation: allowed or not, tool calls, labels, a PDF renderer
+  export?: ExportConfig;
+
+  // Asked before work that costs something; refuse with 429 rate_limited - see guide/embedding
+  rateLimit?: (ctx: RequestContext, request: RateLimitRequest) => RateLimitDecision | Promise<RateLimitDecision>;
+  // Told about exports, deletions, regenerations, edits, pins and ratings
+  audit?: (ctx: RequestContext, entry: AuditEntry) => void | Promise<void>;
 }
 ```
 
@@ -101,8 +113,14 @@ do not separate tenants: a multi-tenant host resolves a user for each request, s
 
 `maskServerErrors` keeps internal error text away from the client; use it whenever the audience is not the operator (see [Error Handling](../guide/error-handling)).
 `allowRememberApproval: false` always asks again, whatever the person ticked ("don't ask again", see [Approvals & Questions](../guide/human-in-the-loop#remembered-tools)).
-`titleGeneration` asks an OpenAI-compatible endpoint (`baseUrl` + `path`, default `/v1/chat/completions`) for a three- or four-word title after the first exchange; a failure leaves the conversation untitled.
-The turn holds its conversation while it waits, so the call is bounded: `timeoutMs` (default 10 000) cuts it short, and cancelling the turn ends it at once; a title that did not arrive in time is skipped.
+`titleGeneration` asks for a short title after the first answer: an OpenAI-compatible endpoint (`baseUrl` + `model`, `path` defaults to `/v1/chat/completions`), or - for a host that has its own model access, accounting and limits - a
+`generate(input)` function. The title has at most `maxWords` words (default 6), is written in the language of the conversation, and is made from the first message and the first answer (`includeAnswer: false` leaves the answer out). A failure leaves the conversation untitled.
+The turn holds its conversation while it waits, so the call is bounded: `timeoutMs` (default 10 000) cuts it short, and cancelling the turn ends it at once; a title that did not arrive in time is skipped. What making the title used is reported on a `session.title` event
+(`purpose: "title"`), so the host can count it to the person. An agent has its own `titleGeneration` (or `false`). See [Chat experience](../guide/chat-experience#generated-titles).
+
+`experience`, `feedback` and `export` shape the chat around the agents - see [Chat experience](../guide/chat-experience): `experience` is the welcome text, the starters and the switches of message actions, history management, feedback and export (an agent overrides fields with its own `experience`);
+`feedback` has `enabled`, `reasons`, `maxCommentLength` and the `onFeedback(ctx, event)` hook; `export` has `enabled`, `includeTools`, `maxMessages`, `labels` and `renderPdf`.
+`rateLimit` and `audit` are the host's two hooks for limits and an audit trail - see [Embedding & limits](../guide/embedding#limits).
 
 `HitlConfig` (every field optional; an agent overrides `timeoutMinutes`, `onTimeout` and `validateApprovedArgs`, see [Approvals & Questions](../guide/human-in-the-loop)):
 
@@ -113,6 +131,7 @@ The turn holds its conversation while it waits, so the call is bounded: `timeout
 | `authorizeResolve(ctx, { conversation, action })` | the conversation's owner | Decides who may answer; `false` is `403 action_forbidden` |
 | `validateApprovedArgs` | `true` | Check edited arguments against the tool's schema (`400 invalid_approved_args`) |
 | `resolveWaitMs` | 3000 | How long an answer waits for another answer to the same conversation instead of `409 conversation_busy` |
+| `clientToolMaxOutputBytes` | 65 536 | Largest `output` of a [client tool](../guide/human-in-the-loop#client-tools) answer (`400 invalid_client_tool_result`) |
 
 `FilesConfig` (every field optional; an agent overrides each but `extractCacheBytes` and `purgeIntervalMs`, see [Files](../guide/file-management#settings)):
 
@@ -183,7 +202,7 @@ agentServer.registerSDKAgent(id, agent, info?, options?);
 | id | `string` | Unique agent identifier |
 | agent | `SmartAgent` | Agent from agent-sdk |
 | info | `Partial<AgentInfo>` | Optional agent metadata |
-| options | `{ files?, hitl?, budget?, pricing? }` | Settings of this agent, overriding the server's `files`, `hitl`, `budget` (`null`: none) and `pricing` (`registerCustomAgent`, `registerChatCompletionsAgent` and `registerResponsesAgent` take the same last argument). A `budget` needs prices: this agent's or the server's |
+| options | `{ files?, hitl?, budget?, pricing?, experience?, titleGeneration? }` | Settings of this agent, overriding the server's `files`, `hitl`, `budget` (`null`: none), `pricing`, `experience` and `titleGeneration` (`false`: no generated titles for this agent) (`registerCustomAgent`, `registerChatCompletionsAgent` and `registerResponsesAgent` take the same last argument). A `budget` needs prices: this agent's or the server's |
 
 ```typescript
 import { createSmartAgent } from '@cognipeer/agent-sdk';
@@ -247,7 +266,10 @@ agentServer.registerHostAgent({
 | `invoke(input, io)` | `HostInvokeInput, HostRunIo => HostTurnResult` | Runs one user message |
 | `resolveAction(input, io)` | `HostResolveInput, HostRunIo => HostTurnResult` | Optional. Called once per answered action; without it the agent's actions answer 404 |
 | `cancel(input)` | `HostCancelInput => void` | Optional. A run was cancelled while the agent worked, or open requests were withdrawn / lapsed / deleted |
-| `files`, `hitl`, `budget`, `pricing` | | The same per-agent settings as the other `register*` methods |
+| `feedback(event)` | `FeedbackEvent => void` | Optional. A person rated (or withdrew the rating of) one of the agent's answers; the rating is already stored on the message |
+| `files`, `hitl`, `budget`, `pricing`, `experience`, `titleGeneration` | | The same per-agent settings as the other `register*` methods |
+
+`invoke` also gets `mode` (`"regenerate"` or `"edit"`) and `fromMessageId` when the turn is a [regeneration or an edit-and-resend](../guide/chat-experience#message-actions); the `history` it receives is already cut back.
 
 An agent that is resolved per request (`config.agents`) returns `hostAgentRegistration(definition)` instead - the same definition, as an `AgentRegistration`.
 A definition that cannot work (no `info.id`, no `invoke`) throws at registration.
@@ -360,7 +382,8 @@ interface AgentInfo {
   // Version string
   version?: string;
 
-  // Custom metadata
+  // Custom metadata. The server adds `welcome` (Markdown), `starters` and `experience` (the resolved switches) -
+  // see guide/chat-experience; what you put there wins over what the server derives
   metadata?: Record<string, unknown>;
 
   // What the agent can do: pause for approvals / questions, and what it takes as attachments.
@@ -368,6 +391,8 @@ interface AgentInfo {
   capabilities?: {
     toolApproval?: boolean;
     askUser?: boolean;
+    clientTools?: boolean; // pauses for a tool that runs in the page embedding the chat
+
     attachments?: { enabled?: boolean; maxFiles?: number; maxFileSize?: number; allowedMimeTypes?: string[]; acceptsImages?: boolean };
   };
 }
@@ -396,6 +421,11 @@ interface ProcessMessageParams {
 
   // What the person typed (the files are not in it)
   message: string;
+
+  // 'regenerate' (the newest answer is asked for again) or 'edit' (a message was changed and re-sent);
+  // absent for a new message. fromMessageId is the message the request named
+  mode?: 'regenerate' | 'edit';
+  fromMessageId?: string;
 
   // Attached files (stored; every entry has a real id)
   files?: FileAttachment[];
@@ -462,6 +492,7 @@ interface HostAgent {
   invoke(input: HostInvokeInput, io: HostRunIo): Promise<HostTurnResult> | HostTurnResult;
   resolveAction?(input: HostResolveInput, io: HostRunIo): Promise<HostTurnResult> | HostTurnResult;
   cancel?(input: HostCancelInput): Promise<void> | void;
+  feedback?(input: FeedbackEvent): Promise<void> | void;
 }
 
 interface HostRunIo {

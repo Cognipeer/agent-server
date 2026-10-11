@@ -28,9 +28,31 @@ export interface Message {
   metadata?: Record<string, unknown>;
   /** How the turn that produced this assistant message ended (API only; see `metadata.stopReason` for why). */
   status?: MessageStatus;
+  /**
+   * The rating the conversation's owner gave this assistant message (API only; stored in `metadata.feedback`, written by
+   * `POST /conversations/:id/messages/:messageId/feedback`). Absent when there is none.
+   */
+  feedback?: MessageFeedback;
   createdAt: Date;
   updatedAt: Date;
 }
+
+/** What a person said about an assistant message. One per message; a new rating replaces the old one. */
+export interface MessageFeedback {
+  rating: "up" | "down";
+  /** Why a `down` rating was given: codes from the server's `feedback.reasons` (default {@link DEFAULT_FEEDBACK_REASONS}). */
+  reasons?: string[];
+  /** Free text, at most `feedback.maxCommentLength` characters (default 1000). */
+  comment?: string;
+  /** Who rated (the conversation's owner). */
+  userId?: string;
+  /** ISO 8601: when the first rating was given / when it was last changed. */
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The reasons a `down` rating may carry unless `feedback.reasons` says otherwise. */
+export const DEFAULT_FEEDBACK_REASONS = ["inaccurate", "incomplete", "off_topic", "too_long", "unsafe", "other"] as const;
 
 export interface ToolCall {
   id: string;
@@ -86,6 +108,11 @@ export interface Conversation {
   spentUsd?: number;
   /** Tools the person asked not to be asked about again in this conversation (API only). */
   rememberedTools?: string[];
+  /**
+   * The person pinned the conversation (API only; stored as `metadata.pinned` by `PATCH /conversations/:id { pinned }`).
+   * `GET /conversations` lists pinned conversations first. Absent when it is not pinned.
+   */
+  pinned?: boolean;
   /**
    * Whether `POST /conversations/:id/continue` has a turn to carry on: the budget cut a turn short in the middle and its
    * state is kept (API only; present where `runtime` is). It stays `true` after the budget is raised or removed - until the
@@ -189,6 +216,11 @@ export interface AgentInfo {
   name: string;
   description?: string;
   version?: string;
+  /**
+   * Host data. The server adds the keys a chat client reads to show the agent's experience (see {@link AgentInfoMetadata}):
+   * `welcome` (Markdown), `starters` and `experience` - the switches for message actions, history management,
+   * feedback and export. What the host puts here wins over what the server derives, field by field.
+   */
   metadata?: Record<string, unknown>;
   /**
    * Human-in-the-loop features this agent can use. Set by the host; for SDK
@@ -197,11 +229,70 @@ export interface AgentInfo {
   capabilities?: AgentCapabilities;
 }
 
+/** One suggested first message on a conversation's empty state. */
+export interface ConversationStarter {
+  /** What is put in the composer (or sent, with `autoSend`) when the person picks it. At most 500 characters. */
+  text: string;
+  /** What the chip shows instead of `text`. At most 80 characters. */
+  label?: string;
+  /** Send `text` at once instead of only filling the composer (default false). */
+  autoSend?: boolean;
+}
+
+/** The most starters an agent shows. */
+export const MAX_STARTERS = 6;
+
+/**
+ * What a chat client shows around one agent: a welcome text, starters and which parts of the conversation UI are on. Set for the
+ * whole server with `AgentServerConfig.experience`, per agent with `AgentRegistration.experience` (or the `experience` option of
+ * the `register*Agent` methods); the server publishes the result in `AgentInfo.metadata` ({@link AgentInfoMetadata}).
+ * Every field is optional and every switch defaults to on, except where a field says otherwise.
+ */
+export interface AgentExperience {
+  /** Shown on the empty state. Markdown; at most 4000 characters. The server does not interpret it (variables are the host's). */
+  welcome?: string;
+  /** Up to {@link MAX_STARTERS} suggested first messages. */
+  starters?: ConversationStarter[];
+  /** What a message offers: copy its text, regenerate the newest answer, edit-and-resend one's own message. */
+  messageActions?: { copy?: boolean; regenerate?: boolean; edit?: boolean };
+  /** What the conversation list offers: rename, pin to the top, select several and delete. */
+  history?: { rename?: boolean; pin?: boolean; bulkDelete?: boolean };
+  /**
+   * Thumbs up / down on answers. `comments: false` takes the free-text box away, `reasons` replaces the reason codes of a
+   * `down` rating (an empty list: no reasons). `enabled: false` also makes the feedback route answer 403 `feedback_disabled`.
+   */
+  feedback?: { enabled?: boolean; comments?: boolean; reasons?: string[] };
+  /** Download a conversation (`GET /conversations/:id/export`). `includeTools` allows `tools=1` (default off). `enabled: false`: 403 `export_disabled`. */
+  export?: { enabled?: boolean; includeTools?: boolean };
+}
+
+/** The keys of `AgentInfo.metadata` the server fills in for chat clients (alongside whatever the host put there). */
+export interface AgentInfoMetadata {
+  /** Markdown welcome text. */
+  welcome?: string;
+  starters?: ConversationStarter[];
+  /** The resolved switches. Present on every agent the server lists. */
+  experience?: ResolvedExperience;
+  [key: string]: unknown;
+}
+
+/** {@link AgentExperience} with every switch resolved (what `AgentInfo.metadata.experience` holds). */
+export interface ResolvedExperience {
+  messageActions: { copy: boolean; regenerate: boolean; edit: boolean };
+  history: { rename: boolean; pin: boolean; bulkDelete: boolean };
+  feedback: { enabled: boolean; comments: boolean; reasons: string[]; maxCommentLength: number };
+  export: { enabled: boolean; includeTools: boolean; formats: string[] };
+  /** A title is generated after the first answer. */
+  titles: boolean;
+}
+
 export interface AgentCapabilities {
   /** The agent can pause to ask for approval before running a tool. */
   toolApproval?: boolean;
   /** The agent can pause to ask the user a question. */
   askUser?: boolean;
+  /** The agent can pause for a tool that runs in the page that embeds the chat (`client_tool` pending actions). */
+  clientTools?: boolean;
   /**
    * What the agent accepts as attachments. The server fills it from the `files` option (server and
    * agent) for `GET /agents`; whatever the host sets here wins field by field. Clients show the
@@ -279,6 +370,30 @@ export type PendingAction =
       questions: UserQuestion[];
       allowFreeText?: boolean;
       expiresAt?: string;
+    }
+  | {
+      /**
+       * A tool the page that embeds the chat runs. The turn waits for the page's result: a client shows no card for it, it hands
+       * `toolName` and `args` to the host page and answers with `{ type: "client_tool", output }` (or `error`) when the page is
+       * done. Only a host-backed agent or a custom handler produces one (an agent-sdk agent has no such pause).
+       */
+      id: string;
+      type: "client_tool";
+      toolName: string;
+      toolCallId?: string;
+      title?: string;
+      args?: Record<string, unknown>;
+      /** JSON Schema of `args`, when the host declared one. */
+      argsSchema?: Record<string, unknown>;
+      /**
+       * How long the page has to answer, in seconds. The client enforces it (and answers with an `error`); the server's own
+       * deadline - `expiresAt`, derived from this plus a grace period when the agent set none - is the net under it for a
+       * page that went away.
+       */
+      timeoutSeconds?: number;
+      /** ISO 8601: when the server recorded the request (set by the server; the event log reports the duration from it). */
+      requestedAt?: string;
+      expiresAt?: string;
     };
 
 /**
@@ -312,6 +427,17 @@ export type ActionResolution =
       type: "user_question";
       answers: Record<string, string | string[]>;
       cancelled?: boolean;
+    }
+  | {
+      /**
+       * The result of a `client_tool` request: `output` (any JSON value, at most `hitl.clientToolMaxOutputBytes`, default 65 536) or
+       * `error` (a message the model reads: the page failed, timed out or has no such tool). With neither, the answer is a 400.
+       */
+      type: "client_tool";
+      output?: unknown;
+      error?: string;
+      /** Recorded on the message that asked, in place of `output`: its size in bytes. Never sent by a client. */
+      outputBytes?: number;
     };
 
 export type MessageStatus = "completed" | "requires_action" | "incomplete" | "cancelled";
@@ -351,10 +477,21 @@ export interface AgentHandler {
   resolveAction?(params: ResolveActionParams): Promise<ProcessMessageResult>;
 }
 
+/**
+ * How a turn came about when it is not a plain new message: `regenerate` (the newest answer is asked for again; `message` is the
+ * user message it answered) or `edit` (a user message was changed and re-sent; everything after it is gone, `message` is the new text).
+ * `fromMessageId` is the message the request named: the answer being replaced / the user message being edited.
+ */
+export type TurnMode = "regenerate" | "edit";
+
 export interface ProcessMessageParams {
   conversationId: string;
   /** What the person typed. The files are not in it: see `files`, `getFileContent` and `getFileText`. */
   message: string;
+  /** Set when the turn is a regeneration or an edit-and-resend (see {@link TurnMode}); absent for a new message. */
+  mode?: TurnMode;
+  /** The message `mode` started from; present with `mode`. */
+  fromMessageId?: string;
   /** The files this message carries (uploaded earlier and attached by id, or sent inline - those are stored first, so every entry has a real id). */
   files?: FileAttachment[];
   state?: Record<string, unknown>;
@@ -446,6 +583,13 @@ export interface HostInvokeInput {
   runId: string;
   /** What the person typed. The files are not in it: see `files` and `io.files`. */
   message: string;
+  /**
+   * Set when the turn is a regeneration or an edit-and-resend; absent for a new message. A host that keeps its own transcript
+   * rewinds it to `fromMessageId` (the message the request named) and re-runs `message`; `history` is already the truncated transcript.
+   */
+  mode?: TurnMode;
+  /** The message `mode` started from; present with `mode`. */
+  fromMessageId?: string;
   /** The conversation so far, oldest first, including this message. Hosts that keep their own transcript ignore it. */
   history: Message[];
   /** The files this message carries (every entry is a stored file with a real id). */
@@ -541,10 +685,45 @@ export interface HostAgent {
    * does not answer within `runs.cancelGraceMs` is given up on.
    */
   cancel?(input: HostCancelInput): Promise<void> | void;
+  /**
+   * Called after a person rated (or withdrew the rating of) one of this agent's answers
+   * (`POST /conversations/:id/messages/:messageId/feedback`). The server has already stored the rating on the message; this
+   * is for a host that keeps its own record (analytics, an evaluation set). It runs before the server-wide `feedback.onFeedback`.
+   * A failure fails the request with its error (the call is safe to repeat: the rating is replaced, not added).
+   */
+  feedback?(input: FeedbackEvent): Promise<void> | void;
+}
+
+/** What a host hears about a rating: see `HostAgent.feedback` and `FeedbackConfig.onFeedback`. */
+export interface FeedbackEvent {
+  conversationId: string;
+  /** The assistant message that was rated. */
+  messageId: string;
+  /** Its 0-based position in the conversation's transcript (stable until a regenerate / edit removes messages before it). */
+  messageIndex: number;
+  agentId: string;
+  /** Who rated. */
+  userId?: string;
+  /** `null`: the rating was withdrawn. */
+  rating: "up" | "down" | null;
+  reasons: string[];
+  comment?: string;
+  /** The rating this one replaced, when there was one. */
+  previous?: MessageFeedback;
+  /** ISO 8601. `createdAt` is the first rating of this message by this person, `updatedAt` this change. */
+  createdAt: string;
+  updatedAt: string;
+  /** The rated answer. */
+  message: Message;
+  /** The user message it answered, when it is in the transcript. */
+  question?: Message;
+  context: RequestContext;
 }
 
 /** `registerHostAgent` takes the agent's description and behaviour, and the same per-agent settings as `AgentRegistration`. */
-export interface HostAgentDefinition extends HostAgent, Pick<AgentRegistration, "files" | "hitl" | "budget" | "pricing"> {
+export interface HostAgentDefinition
+  extends HostAgent,
+    Pick<AgentRegistration, "files" | "hitl" | "budget" | "pricing" | "experience" | "titleGeneration"> {
   info: AgentInfo;
 }
 
@@ -574,6 +753,10 @@ export interface AgentRegistration {
   budget?: SessionBudget | null;
   /** Prices the tokens this agent uses (overrides the server's `pricing`). */
   pricing?: PricingFn;
+  /** What a chat client shows around this agent; each field overrides the server's `experience` (see {@link AgentExperience}). */
+  experience?: AgentExperience;
+  /** Title generation for this agent's conversations: its own settings, or `false` for none whatever the server says. */
+  titleGeneration?: TitleGenerationConfig | false;
 }
 
 // ============================================================================
@@ -834,6 +1017,11 @@ export interface StorageCapabilities {
   leases: boolean;
   /** Per-conversation file listing and expiry purge (`listFiles` / `purgeExpiredFiles`). Absent: `false`. */
   fileIndex?: boolean;
+  /**
+   * `getConversations({ pinnedFirst: true })` lists the conversations with `metadata.pinned === true` before the others (each group
+   * in the requested order), across pages. Without it the server can only move pinned conversations to the top of the page it got.
+   */
+  pinnedFirst?: boolean;
 }
 
 export interface CreateConversationParams {
@@ -856,6 +1044,8 @@ export interface GetConversationsParams {
    * `order` are ignored). Needs `capabilities().actionDeadlines`.
    */
   actionDueBefore?: Date;
+  /** Conversations whose `metadata.pinned` is `true` first, then the rest; `orderBy` / `order` apply within each group. Needs `capabilities().pinnedFirst`. */
+  pinnedFirst?: boolean;
 }
 
 export interface UpdateConversationParams {
@@ -1017,16 +1207,20 @@ export interface FileStorageProvider {
 // ============================================================================
 
 /**
- * Configuration for LLM-based automatic conversation title generation.
- * Uses any OpenAI-compatible endpoint (e.g. OpenAI, Ollama, local models).
+ * Configuration for LLM-based automatic conversation titles: after the first answer of a conversation that has no title, a model is
+ * asked for a short one (at most `maxWords` words, in the language of the conversation). Either an OpenAI-compatible endpoint
+ * (`baseUrl` + `model`; OpenAI, Azure, Ollama, local models) or - for a host that has its own model access, accounting and
+ * limits - a `generate` function. A title that does not arrive in time is skipped; the conversation keeps working without one.
+ * Set it for the whole server with `AgentServerConfig.titleGeneration`, per agent with `AgentRegistration.titleGeneration`
+ * (`false`: this agent's conversations get no generated title).
  */
 export interface TitleGenerationConfig {
-  /** Base URL of the OpenAI-compatible API (e.g. "https://api.openai.com") */
-  baseUrl: string;
-  /** API key for authentication */
-  apiKey: string;
-  /** Model to use for title generation (e.g. "gpt-4o-mini") */
-  model: string;
+  /** Base URL of the OpenAI-compatible API (e.g. "https://api.openai.com"). Needed unless `generate` is set. */
+  baseUrl?: string;
+  /** API key for authentication. Optional (a local model needs none). */
+  apiKey?: string;
+  /** Model to use for title generation (e.g. "gpt-4o-mini"). Needed unless `generate` is set. */
+  model?: string;
   /** Custom path override (default: "/v1/chat/completions") */
   path?: string;
   /**
@@ -1034,6 +1228,40 @@ export interface TitleGenerationConfig {
    * endpoint must not hold it for long; a title that did not arrive in time is skipped. Cancelling the turn also stops the wait.
    */
   timeoutMs?: number;
+  /** The title has at most this many words (default 6; a longer one is cut). */
+  maxWords?: number;
+  /** Whether the model also reads the first answer (default true; the user's message alone is enough for most chats). */
+  includeAnswer?: boolean;
+  /** Extra instructions appended to the built-in prompt (the HTTP form only). */
+  instructions?: string;
+  /**
+   * Makes the title yourself instead of calling `baseUrl`. Return the title, `{ title, usage, model }` (the usage is reported on the
+   * `session.title` event, tagged `purpose: "title"`, so the host can count it to the person), or nothing for no title. It must
+   * stop when `signal` aborts.
+   */
+  generate?: (input: TitleInput) => Promise<string | TitleResult | null | undefined> | string | TitleResult | null | undefined;
+}
+
+/** What a custom title generator is given. */
+export interface TitleInput {
+  conversation: Conversation;
+  /** The agent the conversation is with. */
+  agent: AgentInfo;
+  /** The first user message. */
+  user: string;
+  /** The first answer (when `includeAnswer` is not false). */
+  assistant?: string;
+  /** The title is cut to this many words whatever is returned. */
+  maxWords: number;
+  context: RequestContext;
+  signal: AbortSignal;
+}
+
+/** A generated title and what making it used. */
+export interface TitleResult {
+  title: string;
+  usage?: UsageInfo;
+  model?: string;
 }
 
 export interface AgentServerConfig {
@@ -1167,6 +1395,136 @@ export interface AgentServerConfig {
    * separate tenants, so a multi-tenant host resolves a user (`resolveContext`) for every request.
    */
   allowAnonymousList?: boolean;
+
+  /**
+   * What a chat client shows around every agent: welcome text, starters and the switches for message actions, history management,
+   * feedback and export. Each agent can override fields (`AgentRegistration.experience`). The server publishes the result in
+   * `AgentInfo.metadata` (`welcome`, `starters`, `experience`). Every switch defaults to on (export's `includeTools` to off).
+   */
+  experience?: AgentExperience;
+
+  /**
+   * Ratings on answers (`POST /conversations/:id/messages/:messageId/feedback`): the reason codes, the comment length, and a hook that
+   * hears every rating (`onFeedback`). The rating itself is always stored on the message.
+   */
+  feedback?: FeedbackConfig;
+
+  /**
+   * Downloading a conversation (`GET /conversations/:id/export`): whether it is allowed, whether it may include tool calls, the labels of
+   * the files, and - when the host has a renderer - PDF. Without a PDF renderer a client offers the print-friendly HTML (`format=html`).
+   */
+  export?: ExportConfig;
+
+  /**
+   * Asked before the server does work that costs something (a message, a regeneration, an upload, an export ...). Answer `false` (or
+   * `{ allowed: false, retryAfterSeconds }`) to refuse with 429 `rate_limited` and a `Retry-After` header; return `{ release }` to hear
+   * when a turn is over, which makes "at most N streams at once" a few lines. The server implements no limit of its own.
+   */
+  rateLimit?: (ctx: RequestContext, request: RateLimitRequest) => RateLimitDecision | Promise<RateLimitDecision>;
+
+  /**
+   * Told about the things an operator audits: who exported, deleted, regenerated, edited, pinned or rated which conversation.
+   * Called after the action succeeded; a failure of the hook is logged and never fails the request.
+   */
+  audit?: (ctx: RequestContext, entry: AuditEntry) => void | Promise<void>;
+}
+
+/** Settings of the feedback route. An agent's `experience.feedback` narrows them for that agent. */
+export interface FeedbackConfig {
+  /** Accept ratings (default true). `false`: the route answers 403 `feedback_disabled`. */
+  enabled?: boolean;
+  /** The reason codes a `down` rating may carry (default {@link DEFAULT_FEEDBACK_REASONS}). `[]`: no reasons. */
+  reasons?: string[];
+  /** Longest comment, in characters (default 1000). `0`: no comments are accepted. */
+  maxCommentLength?: number;
+  /**
+   * Hears every rating and every withdrawal, after the server stored it on the message. Awaited; its failure fails the request
+   * (repeating the request is safe). `HostAgent.feedback` of the agent runs first.
+   */
+  onFeedback?: (ctx: RequestContext, event: FeedbackEvent) => void | Promise<void>;
+}
+
+/** Settings of the export route. */
+export interface ExportConfig {
+  /** Allow downloads (default true). `false`: 403 `export_disabled`. */
+  enabled?: boolean;
+  /** Allow `tools=1` (tool calls in the file; default false: asking for them is 403 `export_disabled`). */
+  includeTools?: boolean;
+  /** Most messages one export holds (default 5000); a longer conversation is cut at the newest and says so. */
+  maxMessages?: number;
+  /** Words of the generated files by locale (`en` and `tr` are built in; add a language or change a word). `?locale=` picks one. */
+  labels?: Record<string, Partial<ExportLabels>>;
+  /**
+   * Turns the print-friendly HTML into a PDF (puppeteer, playwright, wkhtmltopdf ...). Without it `format=pdf` answers 501
+   * `export_format_unsupported` and a client opens the HTML (`format=html&print=1`) to "Save as PDF".
+   */
+  renderPdf?: (input: { html: string; conversation: Conversation; context: RequestContext }) => Promise<Buffer | Uint8Array> | Buffer | Uint8Array;
+}
+
+/** The words of an exported conversation. */
+export interface ExportLabels {
+  user: string;
+  assistant: string;
+  exportedAt: string;
+  agent: string;
+  untitled: string;
+  tools: string;
+  attachments: string;
+  truncated: string;
+}
+
+/** What the `rateLimit` hook is asked about. */
+export type RateLimitOperation =
+  | "conversation.create"
+  | "message.send"
+  | "message.regenerate"
+  | "message.edit"
+  | "action.resolve"
+  | "turn.continue"
+  | "file.upload"
+  | "conversation.export"
+  | "message.feedback"
+  | "conversation.bulk_delete";
+
+export interface RateLimitRequest {
+  operation: RateLimitOperation;
+  conversationId?: string;
+  agentId?: string;
+  /** The caller, as the server resolved them. */
+  userId?: string;
+  /** The turn answers as a stream. */
+  streaming?: boolean;
+}
+
+/**
+ * The answer of the `rateLimit` hook: nothing / `true`: go ahead; `false`: refuse; an object: `allowed` (default true),
+ * `retryAfterSeconds` and `message` for a refusal, and `release` - called once when the operation is over (for a turn: when the run
+ * has finished, not when the HTTP connection closes), also when it failed or was refused further on.
+ */
+export type RateLimitDecision =
+  | void
+  | boolean
+  | { allowed?: boolean; retryAfterSeconds?: number; message?: string; release?: () => void };
+
+/** What the `audit` hook is told. */
+export interface AuditEntry {
+  action:
+    | "conversation.export"
+    | "conversation.delete"
+    | "conversation.bulk_delete"
+    | "conversation.pin"
+    | "conversation.unpin"
+    | "message.regenerate"
+    | "message.edit"
+    | "message.feedback";
+  conversationId?: string;
+  agentId?: string;
+  /** Who did it. */
+  userId?: string;
+  messageId?: string;
+  /** What else is worth keeping: the export's format, the number of conversations a bulk delete removed ... */
+  details?: Record<string, unknown>;
+  at: Date;
 }
 
 /** Approval and question settings. */
@@ -1202,6 +1560,8 @@ export interface HitlConfig {
    * actions of one pause can therefore be sent at the same time.
    */
   resolveWaitMs?: number;
+  /** Largest `output` of a `client_tool` answer, in bytes of JSON (default 65 536). A bigger one is a 400. */
+  clientToolMaxOutputBytes?: number;
 }
 
 /** The per-agent form of {@link HitlConfig}: the settings that make sense for one agent. */
@@ -1509,6 +1869,9 @@ export interface RequestLimits {
    * conversation for the agent.
    */
   maxPageSize?: number;
+
+  /** Most conversations one `POST /conversations/bulk-delete` removes (default 100). */
+  maxBulkDelete?: number;
 }
 
 // ============================================================================
@@ -1701,6 +2064,8 @@ export interface StreamActionResolvedEvent extends StreamEventBase {
     type: ActionResolution["type"];
     decision?: "allow" | "deny";
     cancelled?: boolean;
+    /** A `client_tool` answer: `false` when the page reported an error (or never answered). */
+    ok?: boolean;
     /** The request lapsed and `hitl.onTimeout` answered it. */
     expired?: boolean;
   };
@@ -1818,7 +2183,10 @@ export interface CreateConversationRequest {
 
 /** `PATCH /conversations/:id`. */
 export interface UpdateConversationRequest {
+  /** Renames the conversation (at most 200 characters; an empty string clears the title). */
   title?: string;
+  /** Pins (`true`) or unpins (`false`) the conversation; `GET /conversations` lists pinned ones first. */
+  pinned?: boolean;
   metadata?: Record<string, unknown>;
   /**
    * Sets the conversation's spend limit; `null` removes it. Lowering it is the owner's to do; raising or removing
@@ -1826,6 +2194,58 @@ export interface UpdateConversationRequest {
    * the conversation has spent (400 `invalid_budget`).
    */
   budget?: { maxCostUsd: number; onReach?: "pause" | "stop" } | null;
+}
+
+/** `POST /conversations/:id/messages/:messageId/regenerate`: asks for the newest answer again. */
+export interface RegenerateMessageRequest {
+  /** Stream the new answer as SSE, like `POST .../messages` with `stream: true`. */
+  stream?: boolean;
+  /** Passed to the agent as the turn's `metadata`. */
+  metadata?: Record<string, unknown>;
+}
+
+/** `POST /conversations/:id/messages/:messageId/edit`: replaces a user message and re-runs the conversation from it. */
+export interface EditMessageRequest {
+  /** The new text of the message (the same as `message`; one of the two is required). */
+  content?: string;
+  message?: string;
+  /**
+   * Files the new message carries, by id (uploaded with `POST /files`). Without `fileIds` and `files` the message keeps the
+   * files it had; `fileIds: []` drops them (a file that no remaining message carries is deleted).
+   */
+  fileIds?: string[];
+  /** Files sent inline, base64 (stored first, like `POST .../messages`). */
+  files?: SendMessageRequest["files"];
+  metadata?: Record<string, unknown>;
+  stream?: boolean;
+}
+
+/** `POST /conversations/:id/messages/:messageId/feedback`. */
+export interface FeedbackRequest {
+  /** `null` withdraws the rating. */
+  rating: "up" | "down" | null;
+  /** Only with `down`: codes from the server's `feedback.reasons`. */
+  reasons?: string[];
+  /** At most `feedback.maxCommentLength` characters. */
+  comment?: string;
+}
+
+export interface FeedbackResponse {
+  /** The rating now on the message; `null` after a withdrawal. */
+  feedback: MessageFeedback | null;
+  messageId: string;
+}
+
+/** `POST /conversations/bulk-delete`. */
+export interface BulkDeleteRequest {
+  /** Between 1 and `limits.maxBulkDelete` (default 100) conversation ids. */
+  ids: string[];
+}
+
+export interface BulkDeleteResponse {
+  /** One entry per id, in the order sent. A conversation that is not the caller's is `not_found`, like one that does not exist. */
+  results: Array<{ id: string; status: "deleted" | "not_found" | "busy" | "error"; message?: string }>;
+  deleted: number;
 }
 
 /** `POST /conversations/:id/continue`. */

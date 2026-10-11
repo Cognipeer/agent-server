@@ -58,6 +58,7 @@ interface Collection<T = Document> {
   findOne(filter: object, options?: object): Promise<T | null>;
   findOneAndUpdate(filter: object, update: object, options?: object): Promise<T | null>;
   find(filter: object, options?: object): FindCursor<T>;
+  aggregate(pipeline: object[]): { toArray(): Promise<T[]> };
   updateOne(
     filter: object,
     update: object,
@@ -158,6 +159,7 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       leases: true,
       fileIndex: true,
       actionDeadlines: true,
+      pinnedFirst: true,
     };
   }
 
@@ -395,12 +397,25 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
     const total = await collection.countDocuments(filter);
 
     // Get paginated results
-    const docs = await collection
-      .find(filter)
-      .sort(params.actionDueBefore ? { actionDueAt: 1, seq: 1 } : { [orderBy]: order, seq: order })
-      .skip(normalized.offset)
-      .limit(normalized.limit)
-      .toArray();
+    const docs =
+      params.pinnedFirst && !params.actionDueBefore
+        ? // conversations with metadata.pinned === true lead, each group in the requested order
+          await collection
+            .aggregate([
+              { $match: filter },
+              { $addFields: { __pinned: { $cond: [{ $eq: ["$metadata.pinned", true] }, 1, 0] } } },
+              { $sort: { __pinned: -1, [orderBy]: order, seq: order } },
+              { $skip: normalized.offset },
+              { $limit: normalized.limit },
+              { $project: { __pinned: 0 } },
+            ])
+            .toArray()
+        : await collection
+            .find(filter)
+            .sort(params.actionDueBefore ? { actionDueAt: 1, seq: 1 } : { [orderBy]: order, seq: order })
+            .skip(normalized.offset)
+            .limit(normalized.limit)
+            .toArray();
 
     return pageResult(
       docs.map((doc) => this.mapConversation(doc)),

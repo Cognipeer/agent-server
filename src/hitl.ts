@@ -192,9 +192,13 @@ export function detectPendingActions(result: { state?: any } | undefined): Pendi
 // Deadlines
 // ----------------------------------------------------------------------------
 
+/** Seconds the server waits beyond a client tool's own timeout before it counts the page as gone (the client answers at the timeout itself). */
+export const CLIENT_TOOL_GRACE_SECONDS = 30;
+
 /**
  * Gives every action that has no deadline of its own `now + timeoutMinutes`. `timeoutMinutes` 0 (or less) means
- * they never lapse. Returns new objects.
+ * they never lapse. A client tool without one lapses `timeoutSeconds` plus a grace period after it was asked (the page is to answer
+ * at `timeoutSeconds` itself) and is stamped with `requestedAt`. Returns new objects.
  */
 export function stampDeadlines(actions: PendingAction[], timeoutMinutes: number, now: Date = new Date()): PendingAction[] {
   const fallback = timeoutMinutes > 0 ? new Date(now.getTime() + timeoutMinutes * 60_000).toISOString() : undefined;
@@ -202,14 +206,24 @@ export function stampDeadlines(actions: PendingAction[], timeoutMinutes: number,
   const out = actions.map((action) => {
     // A deadline the agent gave is kept (as an ISO time); one that is no time at all counts as none
     const own = isoOf(action.expiresAt);
-    const expiresAt = own ?? fallback;
-    if (expiresAt === action.expiresAt) return action;
+    let next: PendingAction = action;
+    let expiresAt = own ?? fallback;
+    if (action.type === "client_tool") {
+      if (!action.requestedAt) next = { ...action, requestedAt: now.toISOString() };
+      if (!own && action.timeoutSeconds) {
+        expiresAt = new Date(now.getTime() + (action.timeoutSeconds + CLIENT_TOOL_GRACE_SECONDS) * 1000).toISOString();
+      }
+    }
+    if (expiresAt === next.expiresAt) {
+      if (next !== action) changed = true;
+      return next;
+    }
     changed = true;
     if (expiresAt === undefined) {
-      const { expiresAt: _unusable, ...rest } = action;
+      const { expiresAt: _unusable, ...rest } = next;
       return rest as PendingAction;
     }
-    return { ...action, expiresAt };
+    return { ...next, expiresAt };
   });
   return changed ? out : actions;
 }
@@ -234,6 +248,23 @@ export function earliestDeadline(actions: PendingAction[]): Date | undefined {
 /** The actions of a pause as the paused assistant message carries them (`metadata.pendingActions`), all still open. */
 export function openSnapshot(actions: PendingAction[]): ActionSnapshot[] {
   return actions.map((action) => ({ ...action, status: "pending" as const }));
+}
+
+/** The largest `output` of a `client_tool` answer unless `hitl.clientToolMaxOutputBytes` says otherwise, in bytes of JSON. */
+export const CLIENT_TOOL_MAX_OUTPUT_BYTES = 65_536;
+
+/** What the model is told when the host page never answered a client tool (it timed out or went away). */
+export const CLIENT_TOOL_UNANSWERED = "The host page did not answer.";
+
+/**
+ * A resolution as the paused message records it (`metadata.pendingActions`, which a history returns): a client tool's output stays
+ * out of the stored history - it may be large and is the page's data - and only its size is kept.
+ */
+export function recordableResolution(resolution: ActionResolution): ActionResolution {
+  if (resolution.type !== "client_tool") return resolution;
+  if (resolution.error) return { type: "client_tool", error: resolution.error };
+  const bytes = resolution.output === undefined ? 0 : Buffer.byteLength(JSON.stringify(resolution.output) ?? "");
+  return { type: "client_tool", outputBytes: bytes };
 }
 
 export interface SettledAction {

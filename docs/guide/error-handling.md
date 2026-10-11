@@ -45,6 +45,8 @@ Every `error.code` the server answers with. Besides `400` / `401` / `404`, the o
 | 400 | `invalid_budget` | Not a budget, or one at or below what the conversation has already spent |
 | 400 | `budget_unavailable` | The agent has no pricing, so a budget cannot be counted against |
 | 400 | `invalid_approved_args` | The edited arguments are not accepted by the tool's schema |
+| 400 | `invalid_client_tool_result` | The result of a client tool is larger than hitl.clientToolMaxOutputBytes (details.maxBytes) |
+| 400 | `invalid_feedback` | The rating, the reasons or the comment of a piece of feedback are not acceptable |
 | 401 | `AUTHENTICATION_ERROR` | Missing or invalid credentials |
 | 401 | `identity_required` | Listing needs to know who is asking (see allowAnonymousList) |
 | 402 | `budget_reached` | The conversation's budget is used up; raise it to carry on |
@@ -53,10 +55,14 @@ Every `error.code` the server answers with. Besides `400` / `401` / `404`, the o
 | 403 | `action_forbidden` | hitl.authorizeResolve says you may not answer this request |
 | 403 | `budget_forbidden` | Raising or removing a budget needs the authorizeBudget option |
 | 403 | `attachments_disabled` | The agent does not take attachments |
+| 403 | `action_disabled` | The agent's experience switches this action off (regenerate, edit, rename, pin ...); details.setting says which |
+| 403 | `feedback_disabled` | The agent does not take feedback on its answers |
+| 403 | `export_disabled` | Downloading conversations (or including tool calls in the download) is switched off for the agent |
 | 404 | `NOT_FOUND` | The agent, conversation, message, task, file or tool does not exist (or is not yours) |
 | 409 | `action_pending` | A message or continue while a request is open (details.pendingActionIds) |
 | 409 | `action_not_pending` | The action is unknown, already answered, or cannot be resumed |
 | 409 | `conversation_busy` | A turn is already running in the conversation (details.activeRunId) |
+| 409 | `invalid_message_target` | The message is not one the action applies to: only the newest message can be regenerated, only a person's own message edited, only an answer rated (details.reason) |
 | 409 | `conversation_conflict` | The conversation kept changing under the request; try again |
 | 409 | `lease_lost` | Another node took the conversation over while the turn ran |
 | 409 | `nothing_to_continue` | No turn was stopped by the budget |
@@ -68,9 +74,11 @@ Every `error.code` the server answers with. Besides `400` / `401` / `404`, the o
 | 413 | `STORAGE_LIMIT_EXCEEDED` | The storage provider cannot hold this much |
 | 415 | `unsupported_file_type` | The file's type is not one the agent accepts |
 | 415 | `unsupported_media_type` | An upload sent as multipart/form-data or a form (send the raw bytes with ?name=, or the JSON form) |
+| 429 | `rate_limited` | The rateLimit hook refused the request; Retry-After and details.retryAfterSeconds say when to try again |
 | 500 | `INTERNAL_ERROR` | Anything unexpected (the text is generic with maskServerErrors) |
 | 500 | `budget_misconfigured` | The agent has a budget but no pricing |
 | 500 | `invalid_host_result` | A host agent returned something the server cannot use |
+| 501 | `export_format_unsupported` | format=pdf and the server has no export.renderPdf; use format=html&print=1 and save the page as PDF |
 
 A turn can also carry **warnings** that are not errors (`warnings` on the response, on `stream.done` and in the assistant message's `metadata`): `pause_state_too_large` (the turn finished instead of
 pausing, see [Storage](./storage.md)), `file_truncated`, `file_unreadable` and `images_not_supported` (see [Files](./file-management.md)). The event log has `run_interrupted` for a run whose server died (see [Runs](./runs.md#recovery)).

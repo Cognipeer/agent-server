@@ -57,10 +57,10 @@ Every built-in provider reports what it can hold:
 
 ```typescript
 storage.capabilities();
-// { maxFileBytes, maxStateBytes, atomicUpdate, events, leases, fileIndex, actionDeadlines }
+// { maxFileBytes, maxStateBytes, atomicUpdate, events, leases, fileIndex, actionDeadlines, pinnedFirst }
 ```
 
-`events`, `leases`, `fileIndex` (the file listing and expiry purge that [files](./file-management.md) use), `atomicUpdate` (compare-and-set conversation updates) and `actionDeadlines` (the lookup the [approval expiry sweep](./human-in-the-loop.md#requests-that-lapse) uses) are `true` for all four built-in providers. A provider that has no `events` still works - the server keeps a bounded log in
+`events`, `leases`, `fileIndex` (the file listing and expiry purge that [files](./file-management.md) use), `atomicUpdate` (compare-and-set conversation updates), `actionDeadlines` (the lookup the [approval expiry sweep](./human-in-the-loop.md#requests-that-lapse) uses) and `pinnedFirst` (`getConversations({ pinnedFirst: true })`: [pinned](./chat-experience.md#history) conversations lead, across pages) are `true` for all four built-in providers. A provider that has no `events` still works - the server keeps a bounded log in
 memory (see [Runs](./runs.md#providers-without-an-event-log)); one without `leases` serialises runs in-process only, which is right for a single server.
 
 The server uses it in three places:

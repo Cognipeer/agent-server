@@ -30,6 +30,8 @@ export const ERROR_CODES: ReadonlyArray<{ code: string; status: number; meaning:
   { code: "invalid_budget", status: 400, meaning: "Not a budget, or one at or below what the conversation has already spent" },
   { code: "budget_unavailable", status: 400, meaning: "The agent has no pricing, so a budget cannot be counted against" },
   { code: "invalid_approved_args", status: 400, meaning: "The edited arguments are not accepted by the tool's schema" },
+  { code: "invalid_client_tool_result", status: 400, meaning: "The result of a client tool is larger than hitl.clientToolMaxOutputBytes (details.maxBytes)" },
+  { code: "invalid_feedback", status: 400, meaning: "The rating, the reasons or the comment of a piece of feedback are not acceptable" },
   { code: "AUTHENTICATION_ERROR", status: 401, meaning: "Missing or invalid credentials" },
   { code: "identity_required", status: 401, meaning: "Listing needs to know who is asking (see allowAnonymousList)" },
   { code: "budget_reached", status: 402, meaning: "The conversation's budget is used up; raise it to carry on" },
@@ -38,10 +40,14 @@ export const ERROR_CODES: ReadonlyArray<{ code: string; status: number; meaning:
   { code: "action_forbidden", status: 403, meaning: "hitl.authorizeResolve says you may not answer this request" },
   { code: "budget_forbidden", status: 403, meaning: "Raising or removing a budget needs the authorizeBudget option" },
   { code: "attachments_disabled", status: 403, meaning: "The agent does not take attachments" },
+  { code: "action_disabled", status: 403, meaning: "The agent's experience switches this action off (regenerate, edit, rename, pin ...); details.setting says which" },
+  { code: "feedback_disabled", status: 403, meaning: "The agent does not take feedback on its answers" },
+  { code: "export_disabled", status: 403, meaning: "Downloading conversations (or including tool calls in the download) is switched off for the agent" },
   { code: "NOT_FOUND", status: 404, meaning: "The agent, conversation, message, task, file or tool does not exist (or is not yours)" },
   { code: "action_pending", status: 409, meaning: "A message or continue while a request is open (details.pendingActionIds)" },
   { code: "action_not_pending", status: 409, meaning: "The action is unknown, already answered, or cannot be resumed" },
   { code: "conversation_busy", status: 409, meaning: "A turn is already running in the conversation (details.activeRunId)" },
+  { code: "invalid_message_target", status: 409, meaning: "The message is not one the action applies to: only the newest message can be regenerated, only a person's own message edited, only an answer rated (details.reason)" },
   { code: "conversation_conflict", status: 409, meaning: "The conversation kept changing under the request; try again" },
   { code: "lease_lost", status: 409, meaning: "Another node took the conversation over while the turn ran" },
   { code: "nothing_to_continue", status: 409, meaning: "No turn was stopped by the budget" },
@@ -53,9 +59,11 @@ export const ERROR_CODES: ReadonlyArray<{ code: string; status: number; meaning:
   { code: "STORAGE_LIMIT_EXCEEDED", status: 413, meaning: "The storage provider cannot hold this much" },
   { code: "unsupported_file_type", status: 415, meaning: "The file's type is not one the agent accepts" },
   { code: "unsupported_media_type", status: 415, meaning: "An upload sent as multipart/form-data or a form (send the raw bytes with ?name=, or the JSON form)" },
+  { code: "rate_limited", status: 429, meaning: "The rateLimit hook refused the request; Retry-After and details.retryAfterSeconds say when to try again" },
   { code: "INTERNAL_ERROR", status: 500, meaning: "Anything unexpected (the text is generic with maskServerErrors)" },
   { code: "budget_misconfigured", status: 500, meaning: "The agent has a budget but no pricing" },
   { code: "invalid_host_result", status: 500, meaning: "A host agent returned something the server cannot use" },
+  { code: "export_format_unsupported", status: 501, meaning: "format=pdf and the server has no export.renderPdf; use format=html&print=1 and save the page as PDF" },
 ];
 
 const errorCodeList = () =>
@@ -114,7 +122,13 @@ function generateSchemas(): Record<string, unknown> {
           type: "object",
           additionalProperties: true,
           description:
-            "Host data. Also carries enableFileUpload, maxFileSize, maxFiles, allowedFileTypes and acceptsImages (the keys the first chat-ui read; capabilities.attachments is the same information).",
+            "Host data. Also carries enableFileUpload, maxFileSize, maxFiles, allowedFileTypes and acceptsImages (the keys the first chat-ui read; capabilities.attachments is the same information), " +
+            "and what a chat client shows around the agent: welcome (Markdown), starters and experience (the switches the routes enforce). What the host put in metadata wins over what the server derives.",
+          properties: {
+            welcome: { type: "string", description: "Markdown shown on the empty state." },
+            starters: { type: "array", maxItems: 6, items: { $ref: "#/components/schemas/ConversationStarter" } },
+            experience: { $ref: "#/components/schemas/ResolvedExperience" },
+          },
         },
         capabilities: {
           type: "object",
@@ -122,11 +136,142 @@ function generateSchemas(): Record<string, unknown> {
           properties: {
             toolApproval: { type: "boolean", description: "The agent can pause to ask for approval before running a tool." },
             askUser: { type: "boolean", description: "The agent can pause to ask the user a question." },
+            clientTools: { type: "boolean", description: "The agent can pause for a tool that runs in the page embedding the chat (client_tool pending actions)." },
             attachments: { $ref: "#/components/schemas/AttachmentsCapability" },
           },
         },
       },
       required: ["id", "name"],
+    },
+    ConversationStarter: {
+      type: "object",
+      description: "A suggested first message on the empty state of a conversation.",
+      properties: {
+        text: { type: "string", maxLength: 500, description: "What is put in the composer (or sent, with autoSend)." },
+        label: { type: "string", maxLength: 80, description: "What the chip shows instead of text." },
+        autoSend: { type: "boolean", default: false, description: "Send text at once instead of only filling the composer." },
+      },
+      required: ["text"],
+    },
+    ResolvedExperience: {
+      type: "object",
+      description:
+        "What the chat client offers around an agent, resolved from the server's experience option, the agent's own and the host's metadata. " +
+        "The routes enforce the same switches (403 action_disabled, feedback_disabled, export_disabled).",
+      properties: {
+        messageActions: {
+          type: "object",
+          properties: { copy: { type: "boolean" }, regenerate: { type: "boolean" }, edit: { type: "boolean" } },
+          required: ["copy", "regenerate", "edit"],
+        },
+        history: {
+          type: "object",
+          properties: { rename: { type: "boolean" }, pin: { type: "boolean" }, bulkDelete: { type: "boolean" } },
+          required: ["rename", "pin", "bulkDelete"],
+        },
+        feedback: {
+          type: "object",
+          properties: {
+            enabled: { type: "boolean" },
+            comments: { type: "boolean", description: "A free-text comment is accepted." },
+            reasons: { type: "array", items: { type: "string" }, description: "The reason codes of a down rating." },
+            maxCommentLength: { type: "integer", description: "0 when comments are not accepted." },
+          },
+          required: ["enabled", "comments", "reasons", "maxCommentLength"],
+        },
+        export: {
+          type: "object",
+          properties: {
+            enabled: { type: "boolean" },
+            includeTools: { type: "boolean", description: "tools=1 is allowed." },
+            formats: { type: "array", items: { type: "string", enum: ["md", "json", "html", "pdf"] }, description: "pdf is listed only when the server can render it." },
+          },
+          required: ["enabled", "includeTools", "formats"],
+        },
+        titles: { type: "boolean", description: "A title is generated after the first answer." },
+      },
+      required: ["messageActions", "history", "feedback", "export", "titles"],
+    },
+    MessageFeedback: {
+      type: "object",
+      description: "What a person said about an answer. One per message: a new rating replaces the old.",
+      properties: {
+        rating: { type: "string", enum: ["up", "down"] },
+        reasons: { type: "array", items: { type: "string" }, description: "Why a down rating was given: codes from experience.feedback.reasons." },
+        comment: { type: "string" },
+        userId: { type: "string" },
+        createdAt: { type: "string", format: "date-time", description: "The first rating of this message." },
+        updatedAt: { type: "string", format: "date-time" },
+      },
+      required: ["rating", "createdAt", "updatedAt"],
+    },
+    FeedbackRequest: {
+      type: "object",
+      properties: {
+        rating: { type: "string", enum: ["up", "down"], nullable: true, description: "null withdraws the rating." },
+        reasons: { type: "array", items: { type: "string" }, description: "Only with down; each one from experience.feedback.reasons." },
+        comment: { type: "string", description: "At most experience.feedback.maxCommentLength characters." },
+      },
+      required: ["rating"],
+    },
+    FeedbackResponse: {
+      type: "object",
+      properties: {
+        feedback: { oneOf: [{ $ref: "#/components/schemas/MessageFeedback" }, { type: "null" }], description: "The rating now on the message; null after a withdrawal." },
+        messageId: { type: "string" },
+      },
+      required: ["feedback", "messageId"],
+    },
+    RegenerateMessageRequest: {
+      type: "object",
+      properties: {
+        stream: { type: "boolean", default: false, description: "Stream the new answer as SSE." },
+        metadata: { type: "object", additionalProperties: true, description: "Passed to the agent as the turn's metadata." },
+      },
+    },
+    EditMessageRequest: {
+      type: "object",
+      properties: {
+        content: { type: "string", description: "The new text of the message (message is accepted as a synonym)." },
+        message: { type: "string" },
+        fileIds: { type: "array", items: { type: "string" }, description: "Files of the new message, by id. Omit both fileIds and files to keep the message's files; [] drops them (a file no remaining message carries is deleted)." },
+        files: {
+          type: "array",
+          description: "Files sent inline, base64 (stored first, like POST .../messages).",
+          items: {
+            type: "object",
+            properties: { name: { type: "string" }, content: { type: "string" }, mimeType: { type: "string" } },
+            required: ["name", "content", "mimeType"],
+          },
+        },
+        metadata: { type: "object", additionalProperties: true },
+        stream: { type: "boolean", default: false },
+      },
+    },
+    BulkDeleteRequest: {
+      type: "object",
+      properties: { ids: { type: "array", minItems: 1, maxItems: 100, items: { type: "string" }, description: "At most limits.maxBulkDelete (default 100)." } },
+      required: ["ids"],
+    },
+    BulkDeleteResponse: {
+      type: "object",
+      properties: {
+        results: {
+          type: "array",
+          description: "One per id, in the order sent. Someone else's conversation is not_found, like one that does not exist.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              status: { type: "string", enum: ["deleted", "not_found", "busy", "error"] },
+              message: { type: "string" },
+            },
+            required: ["id", "status"],
+          },
+        },
+        deleted: { type: "integer" },
+      },
+      required: ["results", "deleted"],
     },
     AttachmentsCapability: {
       type: "object",
@@ -175,6 +320,10 @@ function generateSchemas(): Record<string, unknown> {
           type: "array",
           items: { type: "string" },
           description: "Tools the person asked not to be asked about again in this conversation (GET / DELETE .../remembered-tools).",
+        },
+        pinned: {
+          type: "boolean",
+          description: "The person pinned the conversation (PATCH { pinned: true }); GET /conversations lists pinned ones first. Absent when it is not pinned.",
         },
         createdAt: { type: "string", format: "date-time" },
         updatedAt: { type: "string", format: "date-time" },
@@ -229,7 +378,8 @@ function generateSchemas(): Record<string, unknown> {
     UpdateConversationRequest: {
       type: "object",
       properties: {
-        title: { type: "string" },
+        title: { type: "string", maxLength: 200, description: "Renames the conversation (trimmed; an empty string clears the title; at most 200 characters)." },
+        pinned: { type: "boolean", description: "Pins or unpins the conversation. Pins are the server's: they cannot be set or dropped through metadata." },
         metadata: { type: "object", additionalProperties: true },
         budget: {
           oneOf: [{ $ref: "#/components/schemas/SessionBudget" }, { type: "null" }],
@@ -296,7 +446,9 @@ function generateSchemas(): Record<string, unknown> {
       description:
         "One entry of a conversation's event log, in the Console client wire: dotted event types and snake_case data. " +
         "Types: user.message, session.status_running, agent.tool_use, agent.tool_result, agent.message, action.required, " +
-        "action.resolved, session.usage, session.status_idle, session.work_done, session.error. A client ignores the types it does not know.",
+        "action.resolved, session.usage, session.status_idle, session.work_done, session.error, budget.reached, session.truncated " +
+        "(messages were removed: a regeneration dropped the answer it replaced, an edit dropped a message and everything after it; reload the history) " +
+        "and session.title (a title was generated, with what making it used, tagged purpose: title). A client ignores the types it does not know.",
       properties: {
         seq: { type: "integer", description: "1, 2, 3 ... within the conversation; unique." },
         type: { type: "string", example: "agent.tool_use" },
@@ -370,12 +522,19 @@ function generateSchemas(): Record<string, unknown> {
         metadata: {
           type: "object",
           additionalProperties: true,
-          description: "Assistant messages carry metadata.status and metadata.stopReason: how, and why, the turn ended.",
+          description:
+            "Assistant messages carry metadata.status and metadata.stopReason: how, and why, the turn ended. An answer that replaced an earlier one " +
+            "(POST .../regenerate) carries metadata.regeneratedFrom and metadata.previousContent (what the earlier answers said, newest last, at most 5); " +
+            "a user message that replaced another (POST .../edit) carries metadata.edited, metadata.editedFrom and metadata.previousContent.",
         },
         status: {
           type: "string",
           enum: ["completed", "requires_action", "incomplete", "cancelled"],
           description: "Assistant messages: how the turn that produced it ended (derived from metadata.status).",
+        },
+        feedback: {
+          $ref: "#/components/schemas/MessageFeedback",
+          description: "Assistant messages: the rating the owner gave the answer (derived from metadata.feedback). Absent when there is none.",
         },
         createdAt: { type: "string", format: "date-time" },
         updatedAt: { type: "string", format: "date-time" },
@@ -521,10 +680,17 @@ function generateSchemas(): Record<string, unknown> {
     },
     PendingAction: {
       type: "object",
-      description: "Something the agent is waiting on (tool approval or user question).",
+      description:
+        "Something the agent is waiting on: a tool approval, a user question, or a client tool - a tool that runs in the page embedding the chat " +
+        "(the client shows no card; it hands toolName and args to the host page and answers with { type: client_tool, output | error }).",
       properties: {
         id: { type: "string" },
-        type: { type: "string", enum: ["tool_approval", "user_question"] },
+        type: { type: "string", enum: ["tool_approval", "user_question", "client_tool"] },
+        timeoutSeconds: {
+          type: "number",
+          description: "client_tool: how long the page has to answer. The client enforces it (and answers with an error); expiresAt is the server's net under it.",
+        },
+        requestedAt: { type: "string", format: "date-time", description: "client_tool: when the server recorded the request." },
         toolName: { type: "string" },
         toolCallId: { type: "string" },
         title: { type: "string" },
@@ -602,6 +768,18 @@ function generateSchemas(): Record<string, unknown> {
                   },
                 },
                 cancelled: { type: "boolean" },
+              },
+              required: ["type"],
+            },
+            {
+              type: "object",
+              description:
+                "The result of a client tool: output (any JSON value, at most hitl.clientToolMaxOutputBytes - default 65536 - else 400 invalid_client_tool_result) " +
+                "or error (a message the model reads: the page failed, timed out or has no such tool). One of the two is required.",
+              properties: {
+                type: { type: "string", enum: ["client_tool"] },
+                output: {},
+                error: { type: "string" },
               },
               required: ["type"],
             },
@@ -804,9 +982,10 @@ function generateSchemas(): Record<string, unknown> {
         resolution: {
           type: "object",
           properties: {
-            type: { type: "string", enum: ["tool_approval", "user_question"] },
+            type: { type: "string", enum: ["tool_approval", "user_question", "client_tool"] },
             decision: { type: "string", enum: ["allow", "deny"] },
             cancelled: { type: "boolean" },
+            ok: { type: "boolean", description: "client_tool: false when the page reported an error (or never answered)." },
             expired: { type: "boolean", description: "The request lapsed and hitl.onTimeout answered it." },
           },
         },
@@ -997,6 +1176,8 @@ function generateSchemas(): Record<string, unknown> {
   };
 }
 
+const ERR = { "application/json": { schema: { $ref: "#/components/schemas/Error" } } };
+
 function generatePaths(
   _agents: AgentInfo[],
   _authEnabled: boolean
@@ -1101,6 +1282,14 @@ function generatePaths(
             description: "desc (default, newest first) or asc",
             schema: { type: "string", enum: ["asc", "desc"], default: "desc" },
           },
+          {
+            name: "pinned",
+            in: "query",
+            description:
+              "first (default): pinned conversations lead, each group in the requested order, across pages. none: ordered by time alone. " +
+              "A storage provider that cannot order them across pages moves them to the top of the page it returned.",
+            schema: { type: "string", enum: ["first", "none"], default: "first" },
+          },
         ],
         responses: {
           200: {
@@ -1156,6 +1345,22 @@ function generatePaths(
             description: "budget_forbidden: a budget above the default needs the authorizeBudget option",
             content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
+        },
+      },
+    },
+    "/conversations/bulk-delete": {
+      post: {
+        tags: ["Conversations"],
+        summary: "Delete several conversations at once",
+        description:
+          "Deletes the conversations in ids that belong to the caller, each judged by itself (a running turn is stopped first). Someone else's conversation is reported " +
+          "as not_found, exactly like one that does not exist; one running on another node is busy. At most limits.maxBulkDelete ids (default 100).",
+        operationId: "bulkDeleteConversations",
+        requestBody: { required: true, content: { "application/json": { schema: { $ref: "#/components/schemas/BulkDeleteRequest" } } } },
+        responses: {
+          200: { description: "One result per id", content: { "application/json": { schema: { $ref: "#/components/schemas/BulkDeleteResponse" } } } },
+          400: { description: "ids is not a list of 1 to maxBulkDelete conversation ids", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+          429: { description: "rate_limited", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
         },
       },
     },
@@ -1414,6 +1619,116 @@ function generatePaths(
               },
             },
           },
+        },
+      },
+    },
+    "/conversations/{conversationId}/messages/{messageId}/regenerate": {
+      post: {
+        tags: ["Messages"],
+        summary: "Ask for the newest answer again",
+        description:
+          "Runs the turn again from the user message the newest answer replied to (the same agent, with the transcript cut back to that message) and replaces the answers " +
+          "after it with the new one, which keeps what they said in metadata.previousContent (at most 5). A turn that failed and left no answer can be run again " +
+          "by naming the user message. Goes through the run registry like a message: one turn at a time (409 conversation_busy), the budget (402), open approvals (409 action_pending). " +
+          "The old answer is removed only once the new one is stored, so a failed turn loses nothing. Events: session.truncated, then the turn's own. " +
+          "A host agent hears mode: regenerate and fromMessageId.",
+        operationId: "regenerateMessage",
+        parameters: [
+          { name: "conversationId", in: "path", required: true, schema: { type: "string" } },
+          { name: "messageId", in: "path", required: true, schema: { type: "string" }, description: "The newest message of the conversation: its latest answer (or an unanswered user message)." },
+        ],
+        requestBody: { required: false, content: { "application/json": { schema: { $ref: "#/components/schemas/RegenerateMessageRequest" } } } },
+        responses: {
+          200: { description: "The new answer; JSON, or text/event-stream when stream is true", content: { "application/json": { schema: { $ref: "#/components/schemas/SendMessageResponse" } } } },
+          402: { description: "budget_reached", content: ERR },
+          403: { description: "Not your conversation, or action_disabled: the agent switched regenerating off", content: ERR },
+          404: { description: "Conversation or message not found", content: ERR },
+          409: { description: "invalid_message_target (not the newest message), conversation_busy or action_pending", content: ERR },
+          429: { description: "rate_limited", content: ERR },
+        },
+      },
+    },
+    "/conversations/{conversationId}/messages/{messageId}/edit": {
+      post: {
+        tags: ["Messages"],
+        summary: "Edit a message of the person and run the conversation again from it",
+        description:
+          "Stores the new text as a user message in place of the old one, removes the old message and everything after it, and runs a new turn. The new message carries " +
+          "metadata.edited, editedFrom and previousContent. Its files are the old ones unless fileIds / files say otherwise; files no remaining message carries are deleted. " +
+          "Goes through the run registry, the budget and the approvals like a message. Events: session.truncated, user.message (edited), then the turn's own. A host agent hears mode: edit and fromMessageId.",
+        operationId: "editMessage",
+        parameters: [
+          { name: "conversationId", in: "path", required: true, schema: { type: "string" } },
+          { name: "messageId", in: "path", required: true, schema: { type: "string" }, description: "A user message of the conversation." },
+        ],
+        requestBody: { required: true, content: { "application/json": { schema: { $ref: "#/components/schemas/EditMessageRequest" } } } },
+        responses: {
+          200: { description: "The new message and the answer; JSON, or text/event-stream when stream is true", content: { "application/json": { schema: { $ref: "#/components/schemas/SendMessageResponse" } } } },
+          400: { description: "content is missing, or the files are not acceptable", content: ERR },
+          402: { description: "budget_reached", content: ERR },
+          403: { description: "Not your conversation, attachments_disabled, or action_disabled: the agent switched editing off", content: ERR },
+          404: { description: "Conversation, message or file not found", content: ERR },
+          409: { description: "invalid_message_target (not a user message), conversation_busy, action_pending or too_many_files", content: ERR },
+          429: { description: "rate_limited", content: ERR },
+        },
+      },
+    },
+    "/conversations/{conversationId}/messages/{messageId}/feedback": {
+      post: {
+        tags: ["Messages"],
+        summary: "Rate an answer",
+        description:
+          "Thumbs up or down on an answer, with reasons (down only) and a comment; one rating per message, a new one replaces the old, rating null withdraws it. " +
+          "Stored on the message (metadata.feedback, shown as feedback), then the agent's feedback hook and the server's feedback.onFeedback hear it. " +
+          "Needs no turn lease: a person can rate while another turn runs.",
+        operationId: "rateMessage",
+        parameters: [
+          { name: "conversationId", in: "path", required: true, schema: { type: "string" } },
+          { name: "messageId", in: "path", required: true, schema: { type: "string" }, description: "An assistant message of the conversation." },
+        ],
+        requestBody: { required: true, content: { "application/json": { schema: { $ref: "#/components/schemas/FeedbackRequest" } } } },
+        responses: {
+          200: { description: "The rating now on the message", content: { "application/json": { schema: { $ref: "#/components/schemas/FeedbackResponse" } } } },
+          400: { description: "invalid_feedback: the rating, the reasons or the comment are not acceptable", content: ERR },
+          403: { description: "Not your conversation, or feedback_disabled", content: ERR },
+          404: { description: "Conversation or message not found", content: ERR },
+          409: { description: "invalid_message_target: only an answer can be rated", content: ERR },
+          429: { description: "rate_limited", content: ERR },
+        },
+      },
+    },
+    "/conversations/{conversationId}/export": {
+      get: {
+        tags: ["Conversations"],
+        summary: "Download the conversation",
+        description:
+          "The conversation as a file: Markdown or JSON made by the server, a print-friendly HTML page (with print=1 it opens the browser's print dialog, i.e. Save as PDF), " +
+          "or - when the server has export.renderPdf - a PDF. Tool calls (from the event log) are included only with tools=1 and only when allowed. " +
+          "Messages are escaped text in the HTML; the page is served with a Content-Security-Policy that allows no network and, with print=1, exactly one script.",
+        operationId: "exportConversation",
+        parameters: [
+          { name: "conversationId", in: "path", required: true, schema: { type: "string" } },
+          { name: "format", in: "query", schema: { type: "string", enum: ["md", "json", "html", "pdf"], default: "md" } },
+          { name: "tools", in: "query", description: "1 includes the tool calls of each answer (allowed by export.includeTools).", schema: { type: "string", enum: ["0", "1"], default: "0" } },
+          { name: "locale", in: "query", description: "Language of the words in the file (en and tr are built in; export.labels adds more).", schema: { type: "string" } },
+          { name: "print", in: "query", description: "format=html: open the print dialog when the page has loaded.", schema: { type: "string", enum: ["0", "1"], default: "0" } },
+          { name: "disposition", in: "query", schema: { type: "string", enum: ["attachment", "inline"], default: "attachment" } },
+        ],
+        responses: {
+          200: {
+            description: "The file",
+            content: {
+              "text/markdown": { schema: { type: "string" } },
+              "application/json": { schema: { type: "object", additionalProperties: true } },
+              "text/html": { schema: { type: "string" } },
+              "application/pdf": { schema: { type: "string", format: "binary" } },
+            },
+          },
+          400: { description: "Unknown format", content: ERR },
+          403: { description: "Not your conversation, or export_disabled", content: ERR },
+          404: { description: "Conversation not found", content: ERR },
+          429: { description: "rate_limited", content: ERR },
+          501: { description: "export_format_unsupported: format=pdf and no export.renderPdf", content: ERR },
         },
       },
     },

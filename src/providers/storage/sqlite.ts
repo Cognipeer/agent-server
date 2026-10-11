@@ -130,6 +130,7 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       leases: true,
       fileIndex: true,
       actionDeadlines: true,
+      pinnedFirst: true,
     };
   }
 
@@ -469,9 +470,11 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
     const total = countRow.count;
 
     // Insertion order (rowid) breaks ties between rows created in the same millisecond
+    // `pinnedFirst`: conversations with metadata.pinned === true lead, each group in the requested order
+    const pinned = params.pinnedFirst ? "CASE WHEN json_extract(metadata, '$.pinned') = 1 THEN 0 ELSE 1 END, " : "";
     const ordering = params.actionDueBefore
       ? "action_due_at ASC, rowid ASC"
-      : `${orderBy} ${order}, rowid ${order}`;
+      : `${pinned}${orderBy} ${order}, rowid ${order}`;
     const rows = this.db.prepare(
       `SELECT * FROM ${this.tables.conversations} ${whereClause}
        ORDER BY ${ordering}

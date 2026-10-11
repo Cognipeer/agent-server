@@ -36,6 +36,10 @@ export const EVENT_TYPES = {
   workDone: "session.work_done",
   error: "session.error",
   budgetReached: "budget.reached",
+  /** Messages were removed from the transcript: a regeneration dropped the answer, an edit dropped a message and everything after it. */
+  truncated: "session.truncated",
+  /** A title was generated for the conversation (with what making it used, tagged `purpose: "title"`). */
+  title: "session.title",
 } as const;
 
 export const DEFAULT_EVENT_PAGE = 100;
@@ -77,6 +81,20 @@ export function actionRequiredData(action: PendingAction): Record<string, unknow
       ...(action.args !== undefined ? { args: action.args } : {}),
       // (a JSON Schema: its keys are the schema's own, never re-cased)
       ...(action.argsSchema !== undefined ? { args_schema: action.argsSchema } : {}),
+      ...(action.expiresAt ? { expires_at: action.expiresAt } : {}),
+    };
+  }
+  if (action.type === "client_tool") {
+    return {
+      action_id: action.id,
+      kind: action.type,
+      tool_name: action.toolName,
+      ...(action.toolCallId ? { tool_call_id: action.toolCallId } : {}),
+      ...(action.title ? { title: action.title } : {}),
+      ...(action.args !== undefined ? { args: action.args } : {}),
+      ...(action.argsSchema !== undefined ? { args_schema: action.argsSchema } : {}),
+      ...(action.timeoutSeconds !== undefined ? { timeout_seconds: action.timeoutSeconds } : {}),
+      ...(action.requestedAt ? { requested_at: action.requestedAt } : {}),
       ...(action.expiresAt ? { expires_at: action.expiresAt } : {}),
     };
   }

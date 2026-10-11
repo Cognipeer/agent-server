@@ -35,6 +35,12 @@ features:
   - icon: ✅
     title: Approvals and Budgets
     details: Tool approvals and questions that lapse, who may answer, edited arguments, per-conversation spend limits.
+  - icon: 💬
+    title: Chat Experience
+    details: Regenerate, edit and resend, pin and rename, generated titles, starters, feedback with reasons and export - for every agent kind.
+  - icon: 🪟
+    title: Embeddable
+    details: Per-request bearer auth for chats in other sites, client tools that run in the host page, rate-limit and audit hooks.
   - icon: 🔐
     title: Authentication
     details: Token providers, or your own identity per request; conversations belong to their user.

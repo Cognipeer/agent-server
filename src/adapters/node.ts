@@ -165,7 +165,9 @@ export function createNodeHandler(server: AgentServer, options: NodeHandlerOptio
       return;
     }
     res.setHeader("Access-Control-Allow-Methods", (cors.methods ?? ["GET", "POST", "PATCH", "DELETE", "OPTIONS"]).join(", "));
-    res.setHeader("Access-Control-Allow-Headers", (cors.headers ?? ["Content-Type", "Authorization"]).join(", "));
+    res.setHeader("Access-Control-Allow-Headers", (cors.headers ?? ["Content-Type", "Authorization", "Last-Event-ID"]).join(", "));
+    // What a page on another origin may read from an answer: when to retry (429) and the name of a downloaded file
+    res.setHeader("Access-Control-Expose-Headers", "Retry-After, Content-Disposition, Content-Length");
     res.setHeader("Access-Control-Max-Age", "86400");
   };
 

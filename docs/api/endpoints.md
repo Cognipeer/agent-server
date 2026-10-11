@@ -77,6 +77,7 @@ GET /conversations
 | offset | number | Pagination offset (default: 0) |
 | orderBy | string | `createdAt` (default) or `updatedAt` (last activity) |
 | order | string | `desc` (default, newest first) or `asc` |
+| pinned | string | `first` (default): [pinned](#update-conversation) conversations lead, each group in the requested order, across pages. `none`: by time alone |
 
 **Response:**
 
@@ -205,12 +206,15 @@ PATCH /conversations/:id
 ```json
 {
   "title": "Updated Title",
+  "pinned": true,
   "metadata": { "favorite": true },
   "budget": { "maxCostUsd": 20, "onReach": "pause" }
 }
 ```
 
-Every field is optional. `budget` sets the conversation's spend limit (`null` removes it); lowering it is the owner's to do, raising or removing it goes through the
+Every field is optional. `title` renames the conversation (trimmed, at most 200 characters, `""` clears it; `400 VALIDATION_ERROR` otherwise) and `pinned` pins or unpins it - `GET /conversations` lists pinned conversations first,
+and the conversation shows `pinned: true`. Pins (and the mark of a [generated title](../guide/chat-experience#generated-titles)) are the server's: a client cannot set or drop them through `metadata`, and replacing `metadata` keeps them. An agent can switch renaming and pinning off
+(`403 action_disabled`, see [Chat experience](../guide/chat-experience#switches)). `budget` sets the conversation's spend limit (`null` removes it); lowering it is the owner's to do, raising or removing it goes through the
 `authorizeBudget` option (`403 budget_forbidden` without it), and it has to be above what the conversation has spent (`400 invalid_budget`). See [Usage & Budgets](../guide/budgets).
 
 **Response:** the conversation, with its `runtime` and `continuable` when `budget` was changed. A turn the budget cut short in the middle stays `budget_paused` after a raise and `continuable` is `true`: `POST /conversations/:id/continue` carries it on. A turn that finished its answer before the limit has nothing to carry on: the raise only reopens the conversation (`runtime.status` becomes `idle`, `continuable` is `false`).
@@ -235,6 +239,54 @@ DELETE /conversations/:id
 Deletes the conversation, its messages, files and event log. A turn that is running is cancelled first (`409 conversation_busy` if it runs on another node).
 
 **Response:** `204`, no body.
+
+### Delete Several Conversations
+
+```
+POST /conversations/bulk-delete
+```
+
+**Request Body:** `{ "ids": ["conv_1", "conv_2"] }` - 1 to `limits.maxBulkDelete` (default 100) ids; duplicates count once.
+
+Deletes the caller's conversations in the list, each judged by itself, as `DELETE /conversations/:id` would (a turn that is running is stopped first).
+
+```json
+{
+  "results": [
+    { "id": "conv_1", "status": "deleted" },
+    { "id": "conv_2", "status": "not_found" }
+  ],
+  "deleted": 1
+}
+```
+
+`status` is `deleted`, `not_found` (it does not exist **or is somebody else's** - the two look the same), `busy` (it runs on another node) or `error` (with a `message`; also what an agent that switched bulk deletion off answers). `400 VALIDATION_ERROR` for a list that is not 1 to `maxBulkDelete` ids.
+
+### Export a Conversation
+
+```
+GET /conversations/:id/export?format=md|json|html|pdf&tools=0|1&locale=&print=0|1&disposition=attachment|inline
+```
+
+The conversation as a file - see [Chat experience](../guide/chat-experience#export).
+
+| Parameter | Description |
+|-----------|-------------|
+| format | `md` (default), `json`, `html` (a print-friendly page) or `pdf` (only when the server has `export.renderPdf`) |
+| tools | `1` includes the tool calls of each answer, from the event log - when the agent allows it (`export.includeTools`) |
+| locale | Language of the words in the file (`en` and `tr` are built in; `export.labels` adds more) |
+| print | `format=html`: open the browser's print dialog once the page has loaded ("Save as PDF") |
+| disposition | `attachment` (default) or `inline` (`print=1` is inline) |
+
+**Response:** the file, with `Content-Type`, a `Content-Disposition` carrying a file name made from the title, `X-Content-Type-Options: nosniff` and `Cache-Control: private, no-store`. The HTML page is served with a `Content-Security-Policy` that allows no network and, with `print=1`, exactly one script.
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `VALIDATION_ERROR` | Unknown `format` |
+| 403 | `FORBIDDEN` / `export_disabled` | Not your conversation / the agent switched downloads off, or `tools=1` where tool calls are not allowed |
+| 404 | `NOT_FOUND` | Unknown conversation |
+| 429 | `rate_limited` | The `rateLimit` hook refused |
+| 501 | `export_format_unsupported` | `format=pdf` and no PDF renderer: use `format=html&print=1` |
 
 ## Messages
 
@@ -343,6 +395,81 @@ The turn runs detached from the connection: closing it does not stop it.
 | 409 | `action_pending` | The conversation waits on a pending action (`error.details.pendingActionIds`) |
 | 409 | `conversation_busy` | A turn is already running in the conversation (`error.details.activeRunId`) |
 
+### Regenerate an Answer
+
+```
+POST /conversations/:id/messages/:messageId/regenerate
+```
+
+**Request Body (optional):** `{ "stream": false, "metadata": {} }`
+
+Asks for the **newest** answer again: the turn runs from the user message that answer replied to (the same agent, the transcript cut back to that message), and the new answer replaces the answers after it. It keeps what they said in `metadata.previousContent` (newest last, at most 5) and the id of the answer it replaced in `metadata.regeneratedFrom`. The old answer is removed only once the new one is stored - a failed turn loses nothing. After a turn that failed and left no answer, name the user message to run it again.
+
+**Response:** the same as a message - `{ message, response, ... }` with `message` the user message that was answered again - or the usual SSE sequence with `"stream": true`. It goes through the run registry like a message: one turn at a time, the budget and open approvals apply. The log gets `session.status_running` with `mode: "regenerate"` and, once the old answer is gone, `session.truncated` (just before the new `agent.message`); a host agent hears `mode: "regenerate"`.
+
+| Status | Code | When |
+|--------|------|------|
+| 402 | `budget_reached` | The conversation's budget is used up |
+| 403 | `FORBIDDEN` / `action_disabled` | Not your conversation / the agent switched regenerating off |
+| 404 | `NOT_FOUND` | Unknown conversation or message |
+| 409 | `invalid_message_target` | The message is not the newest one (`error.details.reason`) |
+| 409 | `conversation_busy` / `action_pending` | A turn is running / a request is open |
+| 429 | `rate_limited` | The `rateLimit` hook refused |
+
+### Edit a Message
+
+```
+POST /conversations/:id/messages/:messageId/edit
+```
+
+**Request Body:**
+
+```json
+{
+  "content": "What is the weather in Izmir?",
+  "fileIds": ["file_abc"],
+  "stream": false
+}
+```
+
+Replaces a **user** message: the new text is stored as a new user message (with `metadata.edited`, `editedFrom` and `previousContent`), the old message and everything after it are removed, and a new turn runs from it. `message` is accepted for `content`; `files` sends inline base64 files like `POST .../messages`. Without `fileIds` and `files` the message keeps its files; `fileIds: []` drops them (a file no remaining message carries is deleted).
+
+**Response:** the same as a message. The log gets `session.truncated`, `user.message` (`edited: true`) and the turn's own events; a host agent hears `mode: "edit"`.
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `VALIDATION_ERROR` | No `content`, or files the agent does not accept |
+| 402 | `budget_reached` | The conversation's budget is used up |
+| 403 | `FORBIDDEN` / `action_disabled` / `attachments_disabled` | Not your conversation / the agent switched editing off / files are off |
+| 404 | `NOT_FOUND` | Unknown conversation, message or file |
+| 409 | `invalid_message_target` | The message is not a user message |
+| 409 | `conversation_busy` / `action_pending` / `too_many_files` | A turn is running / a request is open / the files do not fit |
+| 429 | `rate_limited` | The `rateLimit` hook refused |
+
+### Rate an Answer
+
+```
+POST /conversations/:id/messages/:messageId/feedback
+```
+
+**Request Body:**
+
+```json
+{ "rating": "down", "reasons": ["inaccurate", "too_long"], "comment": "The date was wrong" }
+```
+
+`rating` is `"up"`, `"down"` or `null` (withdraws the rating). `reasons` go with `down` only, each one a code from the agent's `experience.feedback.reasons` (default `inaccurate`, `incomplete`, `off_topic`, `too_long`, `unsafe`, `other`); `comment` is at most `feedback.maxCommentLength` characters (default 1000). One rating per message: a new one replaces the old.
+
+**Response:** `{ "feedback": { "rating": "down", "reasons": [...], "comment": "...", "userId": "...", "createdAt": "...", "updatedAt": "..." }, "messageId": "msg_..." }` (`feedback: null` after a withdrawal). The rating is stored on the message (`metadata.feedback`) and the API shows it as the message's `feedback`; the agent's `feedback` hook and the server's `feedback.onFeedback` hear it. It needs no turn lease: a person can rate while another turn runs.
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `invalid_feedback` | The rating, the reasons or the comment are not acceptable |
+| 403 | `FORBIDDEN` / `feedback_disabled` | Not your conversation / the agent takes no feedback |
+| 404 | `NOT_FOUND` | Unknown conversation or message |
+| 409 | `invalid_message_target` | The message is not an answer |
+| 429 | `rate_limited` | The `rateLimit` hook refused |
+
 ### Resolve a Pending Action
 
 ```
@@ -360,7 +487,7 @@ Answers a tool approval or a question the agent paused on (see [Approvals & Ques
 }
 ```
 
-or `{ "resolution": { "type": "user_question", "answers": { "Which env?": "Production" } } }`.
+or `{ "resolution": { "type": "user_question", "answers": { "Which env?": "Production" } } }`, or - for a `client_tool` request, a tool that runs in the page embedding the chat - `{ "resolution": { "type": "client_tool", "output": { "title": "Report" } } }` (any JSON; or `"error": "..."` when the page failed, which the model reads). See [Client tools](../guide/human-in-the-loop#client-tools).
 
 **Response:** same shape as a message response, without the user `message` (`{ response, usage?, status?, pendingActions? }`). With `"stream": true` the response is the usual SSE sequence, starting with `stream.start` and `stream.action_resolved`.
 
@@ -368,6 +495,7 @@ or `{ "resolution": { "type": "user_question", "answers": { "Which env?": "Produ
 |--------|------|------|
 | 400 | `VALIDATION_ERROR` | Malformed resolution, wrong type for the action, invalid answers |
 | 400 | `invalid_approved_args` | `approvedArgs` that the tool's schema does not accept |
+| 400 | `invalid_client_tool_result` | A client tool's `output` larger than `hitl.clientToolMaxOutputBytes` (default 65 536 bytes) |
 | 402 | `budget_reached` | The answer would let the agent run again and the conversation's budget is used up; nothing was recorded |
 | 403 | `FORBIDDEN` / `action_forbidden` | Not your conversation / `hitl.authorizeResolve` says no |
 | 404 | `NOT_FOUND` | Unknown conversation, or the agent cannot resolve actions |
@@ -677,4 +805,5 @@ Every error has one shape, and a `code` to switch on (the full list is in [Error
 | 403 | `FORBIDDEN` | The conversation, task or file is somebody else's |
 | 404 | `NOT_FOUND` | It does not exist (or is not yours) |
 | 409 | `conversation_busy`, `action_pending`, ... | The state does not allow it right now |
+| 429 | `rate_limited` | The host's `rateLimit` hook refused (`Retry-After`) |
 | 500 | `INTERNAL_ERROR` | Anything unexpected |

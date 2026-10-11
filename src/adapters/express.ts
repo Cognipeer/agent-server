@@ -264,7 +264,8 @@ export function createCorsMiddleware(origins: string[] = ["*"]): RequestHandler 
       res.set({
         "Access-Control-Allow-Origin": allowedOrigin,
         "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, Last-Event-ID",
+        "Access-Control-Expose-Headers": "Retry-After, Content-Disposition, Content-Length",
         "Access-Control-Max-Age": "86400",
       });
     }
