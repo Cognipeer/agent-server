@@ -39,6 +39,7 @@ export type {
 
   // Agent types
   AgentInfo,
+  AgentModelOption,
   AgentInfoMetadata,
   AgentExperience,
   ResolvedExperience,

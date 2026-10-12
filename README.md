@@ -357,6 +357,27 @@ agentServer.registerHostAgent({
 
 See [docs/guide/host-agents.md](docs/guide/host-agents.md).
 
+## Choosing a model per message
+
+An agent can let the person pick the model that answers. List the choices in `AgentInfo.models` (two or more; exactly one `default`):
+
+```ts
+server.registerSDKAgent("support", agent, {
+  models: [
+    { key: "gpt-5", label: "GPT-5", description: "Best quality", default: true },
+    { key: "gpt-5-mini", label: "GPT-5 mini", description: "Faster, cheaper", default: false },
+  ],
+}, {
+  // local runner: switch before the turn (the instance is shared, so serialise turns if you mutate it)
+  selectModel: async ({ model, conversationId, context }) => agent.setModel(model),
+});
+```
+
+- `GET /agents` and `GET /agents/:id` return `models`. A host agent (for example one backed by the Console) reports the list the caller may use.
+- `POST .../messages`, `.../regenerate` and `.../edit` accept `model`. A key that is not in the agent's list answers 400 `model_not_allowed`.
+- Host agents get it as `HostInvokeInput.model`, custom handlers as `ProcessMessageParams.model`, Chat Completions / Responses agents use it as the request's model, and SDK agents get the `selectModel` hook. A request without `model` leaves all of these unset (the agent's own model runs).
+- The answer's `metadata.model` holds the key it came from (the requested one, else the advertised default), for "answered with" footers.
+
 ## Request Context & Dynamic Agents
 
 Resolve who is calling (and anything else your host knows, e.g. tenant) once per

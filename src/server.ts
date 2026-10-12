@@ -142,7 +142,7 @@ import {
   snapshotLedger,
 } from "./usage.js";
 import { findToolSchema, toJsonSchema, validateAgainstSchema } from "./schema.js";
-import { hostAgentRegistration, readHostEvent, readHostResult, type HostCollected } from "./host.js";
+import { readModels, hostAgentRegistration, readHostEvent, readHostResult, type HostCollected } from "./host.js";
 import { generateOpenAPISpec, generateSwaggerHTML } from "./swagger.js";
 import {
   invokeChatCompletions,
@@ -589,6 +589,8 @@ export interface AgentRegistrationOptions {
   experience?: AgentExperience;
   /** Generated titles for this agent's conversations: its own settings, or `false` for none. Overrides the server's `titleGeneration`. */
   titleGeneration?: TitleGenerationConfig | false;
+  /** Switches a local agent-sdk agent to the model a request chose (see `AgentRegistration.selectModel`). */
+  selectModel?: AgentRegistration["selectModel"];
 }
 
 /** The fields of {@link AgentRegistrationOptions} as an {@link AgentRegistration} holds them. */
@@ -600,6 +602,7 @@ function registrationExtras(options?: AgentRegistrationOptions): Partial<AgentRe
     ...(options?.pricing && { pricing: options.pricing }),
     ...(options?.experience && { experience: options.experience }),
     ...(options?.titleGeneration !== undefined && { titleGeneration: options.titleGeneration }),
+    ...(options?.selectModel && { selectModel: options.selectModel }),
   };
 }
 
@@ -814,6 +817,9 @@ export class AgentServer {
   private addAgent(id: string, registration: AgentRegistration): void {
     this.assertBudgetUsable(registration);
     assertTitleGeneration(registration.titleGeneration, `Agent "${registration.info.id}" titleGeneration`);
+    if (registration.info.models) {
+      registration = { ...registration, info: { ...registration.info, models: readModels(registration.info.models, id) } };
+    }
     this.agents.set(id, registration);
   }
 
@@ -1305,6 +1311,7 @@ export class AgentServer {
         version,
         description: info?.description,
         metadata: info?.metadata,
+        ...(info?.models && { models: info.models }),
         ...(capabilities && { capabilities }),
       },
       sdkAgent: agent,
@@ -3145,6 +3152,26 @@ export class AgentServer {
 
   // ---- messages -------------------------------------------------------------
 
+  /**
+   * The model a request names, checked against what the agent advertises (`AgentInfo.models`; for a host agent that is the list
+   * its host resolved for this caller). `undefined` when the request names none. 400 `model_not_allowed` for any other key.
+   */
+  private requestedModel(agent: AgentRegistration, raw: unknown): string | undefined {
+    if (raw === undefined || raw === null || raw === "") return undefined;
+    if (typeof raw !== "string") {
+      throw { statusCode: 400, code: "VALIDATION_ERROR", message: "model has to be a string" } as ValidationError;
+    }
+    if (!agent.info.models?.some((m) => m.key === raw)) {
+      throw {
+        statusCode: 400,
+        code: "model_not_allowed",
+        message: `Model "${raw}" is not available for agent "${agent.info.id}"`,
+        details: { model: raw, allowed: (agent.info.models ?? []).map((m) => m.key) },
+      };
+    }
+    return raw;
+  }
+
   private async handleSendMessage(
     ctx: RouteContext
   ): Promise<RouteResult<SendMessageResponse>> {
@@ -3184,6 +3211,7 @@ export class AgentServer {
     }
     const { agent } = loaded;
     let { conversation } = loaded;
+    const model = this.requestedModel(agent, body.model);
 
     // Work that costs something is the host's to limit (429 rate_limited)
     const release = await this.admit(ctx, { operation: "message.send", conversationId, agentId: conversation.agentId, streaming });
@@ -3217,7 +3245,7 @@ export class AgentServer {
     }
 
     const stream = streaming ? this.attachStream(run) : undefined;
-    this.launch(run, ctx, () => this.executeMessage(run, { ctx, conversation, agent, body, attachments, budget }));
+    this.launch(run, ctx, () => this.executeMessage(run, { ctx, conversation, agent, body: { ...body, model }, attachments, budget }));
     void run.done.then(release, release);
     if (stream) return { status: 200, headers: SSE_HEADERS, stream: stream.generator, close: stream.close };
 
@@ -3376,6 +3404,7 @@ export class AgentServer {
     const body = (ctx.body ?? {}) as RegenerateMessageRequest;
     const loaded = await this.loadForTurn(conversationId, ctx);
     this.assertExperience(loaded.agent, "messageActions", "regenerate", "Regenerating an answer");
+    const model = this.requestedModel(loaded.agent, body.model);
     return this.runMessageVariant(ctx, {
       operation: "message.regenerate",
       loaded,
@@ -3385,7 +3414,7 @@ export class AgentServer {
         const variant = await this.regenerationVariant(conversationId, messageId, ctx);
         return {
           variant,
-          body: { message: messageText(variant.user), metadata: body.metadata, stream: !!body.stream },
+          body: { message: messageText(variant.user), metadata: body.metadata, stream: !!body.stream, model },
         };
       },
     });
@@ -3401,6 +3430,7 @@ export class AgentServer {
     }
     const loaded = await this.loadForTurn(conversationId, ctx);
     this.assertExperience(loaded.agent, "messageActions", "edit", "Editing a message");
+    const model = this.requestedModel(loaded.agent, body.model);
 
     // The message has to be the person's own, and be there before the files of the edit are looked at
     const target = await this.messageOf(conversationId, messageId, ctx);
@@ -3423,7 +3453,7 @@ export class AgentServer {
         const after = await this.messagesAfter(conversationId, current.id, ctx);
         return {
           variant: { mode: "edit", fromMessageId: current.id, remove: [current, ...after], previousUser: current },
-          body: { message: text, metadata: body.metadata, stream: !!body.stream },
+          body: { message: text, metadata: body.metadata, stream: !!body.stream, model },
           attachments,
         };
       },
@@ -3597,6 +3627,7 @@ export class AgentServer {
       // (a task's conversation gets no generated title: it is not a chat)
       firstExchange: history.length === 1 && !run.taskId ? body.message : undefined,
       budget,
+      model: body.model ?? agent.info.models?.find((m) => m.default)?.key,
       // A regeneration replaces the answers it re-ran, once the new one is stored
       replace: variant?.mode === "regenerate" && variant.remove.length > 0 ? { messages: variant.remove, fromMessageId: variant.fromMessageId } : undefined,
     });
@@ -3705,6 +3736,9 @@ export class AgentServer {
       const withWarnings = (step: AgentStep): AgentStep => (warnings.length > 0 ? { ...step, warnings } : step);
 
       if (agent.sdkAgent) {
+        if (body.model && agent.selectModel) {
+          await agent.selectModel({ model: body.model, conversationId, context: ctx.context! });
+        }
         // Map messages with tool_calls and tool_call_id preserved
         return withWarnings(
           await this.runSdk(
@@ -3736,14 +3770,15 @@ export class AgentServer {
         }));
         const messages = (await this.resolveImages(raw, turn, "data-url")) as typeof raw;
 
-        const priced = (raw: unknown) => normalizeUsage(raw, { pricing, model: agent.chatCompletions!.model });
+        const chatCfg = body.model ? { ...agent.chatCompletions, model: body.model } : agent.chatCompletions;
+        const priced = (raw: unknown) => normalizeUsage(raw, { pricing, model: chatCfg.model });
         if (!run.streaming) {
-          const result = await invokeChatCompletions(agent.chatCompletions, messages, { signal: run.signal });
+          const result = await invokeChatCompletions(chatCfg, messages, { signal: run.signal });
           return withWarnings({ content: result.content, usage: priced(result.usage), pending: [], cancelled: run.cancelled });
         }
         let content = "";
         let usage: UsageInfo | undefined;
-        for await (const event of streamChatCompletions(agent.chatCompletions, messages, { signal: run.signal })) {
+        for await (const event of streamChatCompletions(chatCfg, messages, { signal: run.signal })) {
           if (event.type === "text") {
             partial.text += event.text;
             run.emit({ delta: event.text, frame: textFrame(event.text, false) });
@@ -3772,14 +3807,15 @@ export class AgentServer {
         let content = "";
         let usage: UsageInfo | undefined;
         let responseId: string | undefined;
-        const priced = (raw: unknown) => normalizeUsage(raw, { pricing, model: agent.responsesApi!.model });
+        const respCfg = body.model ? { ...agent.responsesApi, model: body.model } : agent.responsesApi;
+        const priced = (raw: unknown) => normalizeUsage(raw, { pricing, model: respCfg.model });
         if (!run.streaming) {
-          const result = await invokeResponsesApi(agent.responsesApi, messages, undefined, { signal: run.signal });
+          const result = await invokeResponsesApi(respCfg, messages, undefined, { signal: run.signal });
           content = result.content;
           usage = priced(result.usage);
           responseId = result.responseId;
         } else {
-          for await (const event of streamResponsesApi(agent.responsesApi, messages, undefined, { signal: run.signal })) {
+          for await (const event of streamResponsesApi(respCfg, messages, undefined, { signal: run.signal })) {
             if (event.type === "text") {
               partial.text += event.text;
               run.emit({ delta: event.text, frame: textFrame(event.text, false) });
@@ -3815,6 +3851,7 @@ export class AgentServer {
                 runId: run.id,
                 message: body.message,
                 ...turnMode,
+                ...(body.model && { model: body.model }),
                 history,
                 files: files ?? [],
                 metadata: x.handlerMetadata ?? body.metadata,
@@ -3841,6 +3878,7 @@ export class AgentServer {
           conversationId,
           message: body.message,
           ...turnMode,
+          ...(body.model && { model: body.model }),
           files,
           state: conversation.state,
           metadata: x.handlerMetadata ?? body.metadata,
@@ -4183,6 +4221,8 @@ export class AgentServer {
       /** The first message of the conversation: a title is generated from it. */
       firstExchange?: string;
       budget: TurnBudget;
+      /** The model key the answer came from (the request's, else the advertised default): stored as `metadata.model`. */
+      model?: string;
       /** Tools this turn's answer asked to remember for the session. */
       rememberAdd?: string[];
       /** How this turn's answer ended the actions of the paused message it continues. */
@@ -4231,7 +4271,14 @@ export class AgentServer {
       onTimeout: hitl.onTimeout,
       spend: tb.pricing ? { turnCostUsd, budget: tb.budget } : undefined,
       settled: x.settled,
-      ...(x.replace ? { extraMetadata: this.regenerationMetadata(x.replace.messages, x.replace.fromMessageId) } : {}),
+      ...(x.replace || x.model
+        ? {
+            extraMetadata: {
+              ...(x.model ? { model: x.model } : {}),
+              ...(x.replace ? this.regenerationMetadata(x.replace.messages, x.replace.fromMessageId) : {}),
+            },
+          }
+        : {}),
     });
     const assistant = saved.message;
     const stopReason = saved.stopReason;

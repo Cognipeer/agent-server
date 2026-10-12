@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-12
+
+### Added
+
+- **Per-message model choice.** `AgentInfo.models` (`AgentModelOption`: `key`, `label`, `description?`, `default`) is published by `GET /agents` and `GET /agents/:id`. `POST .../messages`, `.../regenerate` and `.../edit` accept `model`; a key that is not advertised answers 400 `model_not_allowed`. Forwarded as `HostInvokeInput.model` / `ProcessMessageParams.model`, used as the model of Chat Completions / Responses agents, and handed to the new `selectModel` hook (`AgentRegistration` / `AgentRegistrationOptions`) of SDK agents. The stored answer carries `metadata.model`.
+
 ### Fixed
 
 - **Export with `tools=1` includes the tool calls of a host whose events carry no run id.** The calls were matched to an answer only through the `run_id` of the events, so a conversation of a host that keeps its own log (a portal) exported without any. They are now matched by the id of the answer, the position it reports (`message_index`), what it says (`content`) or, failing that, the order the events were written in (the calls between a question and the answer after it); `tool_call_id` / `toolCallId` and `duration_ms` / `durationMs` are both read. An answer that matches no stored message shows no calls. New internal `toolCallsByAnswer()`.
