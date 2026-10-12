@@ -1,6 +1,6 @@
 {
   "name": "@cognipeer/agent-server",
-  "version": "0.1.6",
+  "version": "0.3.0",
   "description": "REST API server infrastructure for AI agents - supports agent-sdk and custom implementations",
   "type": "module",
   "main": "./dist/index.js",
@@ -8,28 +8,44 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "default": "./dist/index.js"
     },
     "./express": {
+      "types": "./dist/adapters/express.d.ts",
       "import": "./dist/adapters/express.js",
-      "types": "./dist/adapters/express.d.ts"
+      "default": "./dist/adapters/express.js"
     },
     "./next": {
+      "types": "./dist/adapters/next.d.ts",
       "import": "./dist/adapters/next.js",
-      "types": "./dist/adapters/next.d.ts"
+      "default": "./dist/adapters/next.js"
+    },
+    "./node": {
+      "types": "./dist/adapters/node.d.ts",
+      "import": "./dist/adapters/node.js",
+      "default": "./dist/adapters/node.js"
+    },
+    "./fastify": {
+      "types": "./dist/adapters/fastify.d.ts",
+      "import": "./dist/adapters/fastify.js",
+      "default": "./dist/adapters/fastify.js"
     },
     "./postgres": {
+      "types": "./dist/providers/storage/postgres.d.ts",
       "import": "./dist/providers/storage/postgres.js",
-      "types": "./dist/providers/storage/postgres.d.ts"
+      "default": "./dist/providers/storage/postgres.js"
     },
     "./mongodb": {
+      "types": "./dist/providers/storage/mongodb.d.ts",
       "import": "./dist/providers/storage/mongodb.js",
-      "types": "./dist/providers/storage/mongodb.d.ts"
+      "default": "./dist/providers/storage/mongodb.js"
     },
     "./sqlite": {
+      "types": "./dist/providers/storage/sqlite.d.ts",
       "import": "./dist/providers/storage/sqlite.js",
-      "types": "./dist/providers/storage/sqlite.d.ts"
+      "default": "./dist/providers/storage/sqlite.js"
     }
   },
   "files": [
@@ -68,24 +84,38 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^20.14.0",
+    "@types/pg": "^8.23.1",
+    "better-sqlite3": "^13.0.3",
     "eslint": "^9.5.0",
+    "express-rate-limit": "^7.5.0",
+    "fastify": "^5.12.5",
+    "mongodb": "^7.7.0",
+    "mongodb-memory-server": "^11.3.0",
+    "pg": "^8.23.1",
     "tsup": "^8.1.0",
     "typescript": "^5.4.5",
+    "typescript-eslint": "^8.71.1",
     "vitepress": "^1.0.0",
     "vitest": "^1.6.0"
   },
   "peerDependencies": {
     "@cognipeer/agent-sdk": ">=0.1.0",
+    "@cognipeer/to-markdown": ">=3.0.0",
     "better-sqlite3": ">=11.0.0",
     "express": ">=4.0.0",
     "mongodb": ">=6.0.0",
     "next": ">=13.0.0",
     "pg": ">=8.0.0",
-    "swagger-ui-express": ">=5.0.0"
+    "swagger-ui-express": ">=5.0.0",
+    "fastify": ">=4.0.0"
   },
   "peerDependenciesMeta": {
     "@cognipeer/agent-sdk": {
+      "optional": true
+    },
+    "@cognipeer/to-markdown": {
       "optional": true
     },
     "express": {
@@ -104,6 +134,9 @@
       "optional": true
     },
     "swagger-ui-express": {
+      "optional": true
+    },
+    "fastify": {
       "optional": true
     }
   },

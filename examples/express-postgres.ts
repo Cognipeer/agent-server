@@ -12,6 +12,7 @@
  */
 
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import {
   createAgentServer,
   createPostgresProvider,
@@ -131,7 +132,8 @@ async function main() {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
   });
 
-  // Agent server middleware'i ekle
+  // Agent server middleware'i ekle (istek sınırı ile)
+  app.use(rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false }));
   app.use(createExpressMiddleware(agentServer));
 
   // 6. Storage'a bağlan ve server'ı başlat
@@ -152,7 +154,7 @@ async function main() {
    - greeter   : Greets you and remembers your name
    - calculator: Does simple math
 
-${AUTH_ENABLED ? `🔐 Authentication ENABLED (use header: Authorization: Bearer ${API_KEY})` : '🔓 Authentication DISABLED'}
+${AUTH_ENABLED ? `🔐 Authentication ENABLED (use header: Authorization: Bearer <your API key>)` : '🔓 Authentication DISABLED'}
 
 Try it:
    curl http://localhost:${PORT}/api/agents/agents

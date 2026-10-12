@@ -41,7 +41,8 @@ export interface ChatCompletionsConfig {
 
 interface ChatCompletionsMessage {
   role: string;
-  content: string;
+  /** Text, or parts (`text`, `image_url`) for a message that carries pictures. */
+  content: string | unknown[];
   tool_calls?: Array<{
     id: string;
     type: string;
@@ -153,7 +154,8 @@ function buildMessages(
  */
 export async function invokeChatCompletions(
   config: ChatCompletionsConfig,
-  messages: ChatCompletionsMessage[]
+  messages: ChatCompletionsMessage[],
+  options: { signal?: AbortSignal } = {}
 ): Promise<ChatCompletionsResult> {
   const url = buildUrl(config);
   const allMessages = buildMessages(config, messages);
@@ -170,6 +172,7 @@ export async function invokeChatCompletions(
     method: "POST",
     headers: buildHeaders(config),
     body: JSON.stringify(requestBody),
+    signal: options.signal,
   });
 
   if (!response.ok) {
@@ -199,7 +202,8 @@ export async function invokeChatCompletions(
  */
 export async function* streamChatCompletions(
   config: ChatCompletionsConfig,
-  messages: ChatCompletionsMessage[]
+  messages: ChatCompletionsMessage[],
+  options: { signal?: AbortSignal } = {}
 ): AsyncGenerator<ChatCompletionsStreamEvent, void, unknown> {
   const url = buildUrl(config);
   const allMessages = buildMessages(config, messages);
@@ -217,6 +221,7 @@ export async function* streamChatCompletions(
     method: "POST",
     headers: buildHeaders(config),
     body: JSON.stringify(requestBody),
+    signal: options.signal,
   });
 
   if (!response.ok) {

@@ -154,51 +154,46 @@ return new Response(
 Create your own adapter for other frameworks:
 
 ```typescript
-import { AgentServer, RouteContext, RouteResult } from '@cognipeer/agent-server';
+import type { AgentServer } from '@cognipeer/agent-server';
 
 function createCustomAdapter(agentServer: AgentServer) {
   return async function handleRequest(req: CustomRequest, res: CustomResponse) {
     // 1. Extract request info
     const method = req.method;
-    const path = req.path.replace(agentServer.config.basePath, '');
-    
-    // 2. Build route context
-    const context: RouteContext = {
-      params: {},
-      query: req.query,
-      body: req.body,
-    };
-    
-    // 3. Handle authentication
-    if (agentServer.config.auth?.enabled) {
-      const token = extractToken(req.headers);
-      if (token) {
-        const result = await agentServer.config.auth.provider.validate(token);
-        if (result.valid) {
-          context.user = { id: result.userId! };
-        } else {
-          return res.status(401).json({ error: 'Unauthorized' });
-        }
-      }
+    const path = req.path;                 // handleRequest strips the base path itself
+
+    // 2. Authenticate (a no-op returning null when token auth is off)
+    let user;
+    try {
+      user = (await agentServer.authenticate(extractToken(req.headers))) ?? undefined;
+    } catch (error) {
+      const { statusCode = 401, code = 'AUTHENTICATION_ERROR', message } = error as { statusCode?: number; code?: string; message?: string };
+      return res.status(statusCode).json({ error: { code, message } });
     }
-    
-    // 4. Handle request
-    const result = await agentServer.handleRequest(method, path, context);
-    
-    // 5. Send response
+
+    // 3. Handle the request
+    const result = await agentServer.handleRequest(method, path, {
+      query: req.query,
+      body: req.body,       // a file uploaded as itself: pass its bytes as a Buffer
+      headers: req.headers,
+      user,
+    });
+
+    // 4. Send the response
     if (result.stream) {
-      // Handle streaming
+      // Server-Sent Events: stop reading when the client goes away (the run it was watching goes on)
       res.setHeader('Content-Type', 'text/event-stream');
+      res.on('close', () => result.close?.());
       for await (const chunk of result.stream) {
         res.write(chunk);
       }
       res.end();
     } else if (result.raw) {
-      // Handle binary response
+      // Binary response
       res.setHeader('Content-Type', result.headers?.['Content-Type'] || 'application/octet-stream');
       res.send(result.raw);
     } else {
-      // Handle JSON response
+      // JSON response
       res.status(result.status).json(result.body);
     }
   };
@@ -213,44 +208,29 @@ function extractToken(headers: Record<string, string>): string | undefined {
 }
 ```
 
-## Fastify Example
+**File uploads.** `POST /files` takes the file either as JSON (a parsed object body) or as itself: its bytes as the body, its own `Content-Type` and
+`?name=&conversationId=` in the query. For the second form pass the bytes - a `Buffer` - as `body`; `isRawUploadRequest(method, routePath, contentType)`
+(exported) tells which form a request is (`true`: a `POST` to `/files` whose `Content-Type` is not JSON). Limit the body yourself:
+`server.maxUploadBytes()` is the largest file any agent accepts. See [Files](../guide/file-management.md#uploading).
+
+## Node HTTP Adapter
 
 ```typescript
-import Fastify from 'fastify';
-import { createAgentServer } from '@cognipeer/agent-server';
+import { createNodeHandler } from '@cognipeer/agent-server'; // or '@cognipeer/agent-server/node'
 
-const fastify = Fastify();
-const agentServer = createAgentServer({ basePath: '/api', storage });
+const handle = createNodeHandler(server, { basePath: '/api', maxBodyBytes: 15_000_000 });
+// (req: IncomingMessage, res: ServerResponse, overrides?: { path, body, mountParams, raw, error }) => Promise<boolean>
+```
 
-// Custom Fastify handler
-fastify.all('/api/*', async (request, reply) => {
-  const path = request.url.replace('/api', '');
-  
-  const context = {
-    params: {},
-    query: request.query as Record<string, string>,
-    body: request.body,
-  };
-  
-  const result = await agentServer.handleRequest(
-    request.method,
-    path,
-    context
-  );
-  
-  if (result.stream) {
-    reply.header('Content-Type', 'text/event-stream');
-    for await (const chunk of result.stream) {
-      reply.raw.write(chunk);
-    }
-    reply.raw.end();
-  } else {
-    reply.status(result.status).send(result.body);
-  }
-});
+See the [Fastify & Node HTTP guide](../guide/fastify.md).
 
-await storage.connect();
-await fastify.listen({ port: 3000 });
+## Fastify Adapter
+
+```typescript
+import { mountOnFastify, createFastifyPlugin } from '@cognipeer/agent-server/fastify';
+
+mountOnFastify(app, server, { prefix: '/api/portal/:portalKey', bodyLimit });
+app.register(createFastifyPlugin(server, { maxBodyBytes }), { prefix: '/api' });
 ```
 
 ## Hono Example

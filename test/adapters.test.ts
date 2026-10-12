@@ -1,0 +1,475 @@
+import http from "node:http";
+import Fastify from "fastify";
+import { afterEach, describe, expect, it } from "vitest";
+import { createAgentServer, createNodeHandler, type AgentRegistration, type ContextRequest } from "../src/index.js";
+import { createNextHandler } from "../src/adapters/next.js";
+import { createExpressMiddleware } from "../src/adapters/express.js";
+import { createFastifyPlugin, mountOnFastify } from "../src/adapters/fastify.js";
+import { eventually, fakeSdkAgent, listen, memoryStorage, parseSse } from "./helpers.js";
+
+const closers: Array<() => Promise<void>> = [];
+afterEach(async () => {
+  while (closers.length) await closers.pop()!();
+});
+
+const sdkAgent = (reply = "pong"): AgentRegistration => ({
+  info: { id: "bot", name: "Bot" },
+  sdkAgent: fakeSdkAgent(async () => ({ content: reply })),
+});
+
+async function json(res: Response) {
+  return (await res.json()) as any;
+}
+
+async function converse(base: string, headers: Record<string, string> = {}, message = "ping") {
+  const created = await fetch(`${base}/conversations`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify({ agentId: "bot" }),
+  });
+  const { conversation } = await json(created);
+  const res = await fetch(`${base}/conversations/${conversation.id}/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify({ message, stream: true }),
+  });
+  return { conversation, res, events: parseSse(await res.text()) };
+}
+
+describe("createNodeHandler", () => {
+  async function boot(config: Partial<Parameters<typeof createAgentServer>[0]> = {}, options = {}) {
+    const server = createAgentServer({ basePath: "/api/agents", storage: await memoryStorage(), agents: [sdkAgent()], ...config });
+    const handle = createNodeHandler(server, options);
+    const http_ = http.createServer(async (req, res) => {
+      if (!(await handle(req, res))) {
+        res.statusCode = 418;
+        res.end("outside");
+      }
+    });
+    const { url, close } = await listen(http_);
+    closers.push(close);
+    return { url, server };
+  }
+
+  it("serves JSON routes under the server base path", async () => {
+    const { url } = await boot();
+    const res = await fetch(`${url}/api/agents/agents`);
+    expect(res.status).toBe(200);
+    expect((await json(res)).agents.map((a: any) => a.id)).toEqual(["bot"]);
+  });
+
+  it("returns false (and writes nothing) for paths outside the base path", async () => {
+    const { url } = await boot();
+    const res = await fetch(`${url}/other`);
+    expect(res.status).toBe(418);
+    expect(await res.text()).toBe("outside");
+  });
+
+  it("honours a custom basePath option", async () => {
+    const { url } = await boot({}, { basePath: "/x" });
+    expect((await fetch(`${url}/x/agents`)).status).toBe(200);
+    expect((await fetch(`${url}/api/agents/agents`)).status).toBe(418);
+  });
+
+  it("streams SSE, including a final answer from a non-streaming agent", async () => {
+    const { url } = await boot();
+    const { res, events } = await converse(`${url}/api/agents`);
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+    expect(events.map((e) => e.type)).toEqual(["stream.start", "stream.text", "stream.done"]);
+    expect(events[1]).toMatchObject({ text: "pong" });
+  });
+
+  it("answers errors with proper statuses", async () => {
+    const { url } = await boot();
+    expect((await fetch(`${url}/api/agents/conversations/nope`)).status).toBe(404);
+    const bad = await fetch(`${url}/api/agents/conversations`, { method: "POST", headers: { "content-type": "application/json" }, body: "{not json" });
+    expect(bad.status).toBe(400);
+  });
+
+  it("rejects bodies over the limit with 413", async () => {
+    const { url } = await boot({}, { maxBodyBytes: 50 });
+    const res = await fetch(`${url}/api/agents/conversations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId: "bot", title: "x".repeat(200) }),
+    });
+    expect(res.status).toBe(413);
+  });
+
+  it("runs resolveContext with cookies and 401s without a session", async () => {
+    let seen: ContextRequest | undefined;
+    const { url } = await boot({
+      resolveContext: (req) => {
+        seen = req;
+        return req.cookies.sid === "good" ? { user: { id: "u1" }, data: {} } : null;
+      },
+    });
+    expect((await fetch(`${url}/api/agents/agents`)).status).toBe(401);
+    const ok = await fetch(`${url}/api/agents/agents?x=1`, { headers: { cookie: "sid=good" } });
+    expect(ok.status).toBe(200);
+    expect(seen?.query).toEqual({ x: "1" });
+    expect(seen?.path).toBe("/agents");
+  });
+
+  it("answers CORS preflight when enabled", async () => {
+    const { url } = await boot({ cors: { enabled: true, origins: ["https://a.example"] } });
+    const res = await fetch(`${url}/api/agents/agents`, { method: "OPTIONS", headers: { origin: "https://a.example" } });
+    expect(res.status).toBe(204);
+    expect(res.headers.get("access-control-allow-origin")).toBe("https://a.example");
+    const other = await fetch(`${url}/api/agents/agents`, { method: "OPTIONS", headers: { origin: "https://evil.example" } });
+    expect(other.headers.get("access-control-allow-origin")).toBeNull();
+  });
+
+  it("applies token auth", async () => {
+    const { url } = await boot({
+      auth: { enabled: true, provider: { validateToken: async (t) => (t === "tok" ? { valid: true, userId: "u" } : { valid: false }) } },
+    });
+    expect((await fetch(`${url}/api/agents/agents`)).status).toBe(401);
+    expect((await fetch(`${url}/api/agents/agents`, { headers: { authorization: "Bearer tok" } })).status).toBe(200);
+  });
+
+  it("lets the turn finish and stores it when the client disconnects mid-stream", async () => {
+    const slow: AgentRegistration = {
+      info: { id: "bot", name: "Bot" },
+      sdkAgent: fakeSdkAgent(async (_p, config) => {
+        for (let i = 0; i < 10; i++) {
+          config?.onStream?.({ text: `t${i} ` });
+          await new Promise((r) => setTimeout(r, 15));
+        }
+        return { content: "t0 t1 t2 t3 t4 t5 t6 t7 t8 t9 " };
+      }),
+    };
+    const { url } = await boot({ agents: [slow] });
+    const created = await json(await fetch(`${url}/api/agents/conversations`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ agentId: "bot" }) }));
+    const id = created.conversation.id;
+    const ctrl = new AbortController();
+    const res = await fetch(`${url}/api/agents/conversations/${id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "x", stream: true }),
+      signal: ctrl.signal,
+    });
+    const reader = res.body!.getReader();
+    await reader.read();
+    ctrl.abort();
+
+    // the server is healthy, and the turn the client walked away from finishes and is stored
+    expect((await fetch(`${url}/api/agents/agents`)).status).toBe(200);
+    const stored = await eventually(async () => {
+      const conv = await json(await fetch(`${url}/api/agents/conversations/${id}`));
+      return conv.conversation.runtime.status === "idle" && conv.messages.length === 2 ? conv : undefined;
+    }, 4000, "the turn to finish");
+    expect(stored.messages[1]).toMatchObject({ role: "assistant", content: "t0 t1 t2 t3 t4 t5 t6 t7 t8 t9 ", status: "completed" });
+  });
+
+  it("serves the event stream: ids, Last-Event-ID, and it ends when the client goes away", async () => {
+    const { url, server } = await boot({ runs: { pingIntervalMs: 40 } });
+    const { conversation } = await converse(`${url}/api/agents`);
+    const stream = `${url}/api/agents/conversations/${conversation.id}/events/stream`;
+
+    const ctrl = new AbortController();
+    const res = await fetch(stream, { headers: { "last-event-id": "2" }, signal: ctrl.signal });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    const until = async (check: (t: string) => boolean) => {
+      const deadline = Date.now() + 3000;
+      while (!check(text) && Date.now() < deadline) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+      }
+    };
+    await until((t) => t.includes("event: session.work_done") && t.includes(": ping"));
+    const ids = [...text.matchAll(/^id: (\d+)$/gm)].map((m) => Number(m[1]));
+    expect(ids).toEqual([3, 4, 5]);
+    expect(text).toContain(": ping");
+    expect(text).toMatch(/^event: agent\.message\ndata: \{"seq":3,"type":"agent\.message"/m);
+
+    expect((server as any).bus.hasListeners(conversation.id)).toBe(true);
+    ctrl.abort();
+    await eventually(() => !(server as any).bus.hasListeners(conversation.id), 3000, "the follower to be released");
+  });
+});
+
+describe("Fastify adapter", () => {
+  async function boot(config: Partial<Parameters<typeof createAgentServer>[0]> = {}, prefix = "/api/portal/:portalKey") {
+    const server = createAgentServer({ basePath: "/ignored", storage: await memoryStorage(), agents: [sdkAgent()], ...config });
+    const app = Fastify();
+    mountOnFastify(app, server, { prefix });
+    app.get("/health", async () => ({ ok: true }));
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    closers.push(() => app.close());
+    const { port } = app.server.address() as { port: number };
+    return { app, url: `http://127.0.0.1:${port}`, server };
+  }
+
+  it("serves under a parameterised prefix and passes the params to resolveContext", async () => {
+    const seen: ContextRequest[] = [];
+    const { url } = await boot({
+      resolveContext: (req) => {
+        seen.push(req);
+        return { user: { id: "u1" }, data: { portalKey: req.mountParams.portalKey } };
+      },
+    });
+    const res = await fetch(`${url}/api/portal/abc123/agents`);
+    expect(res.status).toBe(200);
+    expect(seen[0].mountParams).toEqual({ portalKey: "abc123" });
+    expect(seen[0].path).toBe("/agents");
+    // the bare prefix maps to "/" (unknown route -> our 404, not Fastify's)
+    const root = await fetch(`${url}/api/portal/abc123`);
+    expect(root.status).toBe(404);
+    expect((await json(root)).error.code).toBe("NOT_FOUND");
+  });
+
+  it("uses Fastify's parsed JSON body and streams SSE", async () => {
+    const { url } = await boot();
+    const { res, events, conversation } = await converse(`${url}/api/portal/k1`);
+    expect(conversation.agentId).toBe("bot");
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+    expect(events.map((e) => e.type)).toEqual(["stream.start", "stream.text", "stream.done"]);
+  });
+
+  it("reads a body the app's own JSON parser left as a raw string or Buffer", async () => {
+    for (const parseAs of ["string", "buffer"] as const) {
+      const server = createAgentServer({ basePath: "/x", storage: await memoryStorage(), agents: [sdkAgent()] });
+      const app = Fastify();
+      // e.g. an app that keeps bodies raw for a framework that re-parses them
+      app.addContentTypeParser("application/json", { parseAs }, (_req, body, done) => done(null, body));
+      mountOnFastify(app, server, { prefix: "/p/:k" });
+      await app.listen({ port: 0, host: "127.0.0.1" });
+      closers.push(() => app.close());
+      const { port } = app.server.address() as { port: number };
+      const url = `http://127.0.0.1:${port}/p/k1`;
+
+      const created = await fetch(`${url}/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ agentId: "bot" }),
+      });
+      expect(created.status, parseAs).toBe(201);
+      const bad = await fetch(`${url}/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{not json",
+      });
+      expect(bad.status, parseAs).toBe(400);
+    }
+  });
+
+  it("returns 401 for unauthenticated requests and leaves other routes alone", async () => {
+    const { url } = await boot({ resolveContext: () => null });
+    expect((await fetch(`${url}/api/portal/k/agents`)).status).toBe(401);
+    expect((await fetch(`${url}/health`)).status).toBe(200);
+  });
+
+  it("scopes dynamic agents per mount param", async () => {
+    const { url } = await boot({
+      resolveContext: (req) => ({ user: { id: "u" }, data: { key: req.mountParams.portalKey } }),
+      agents: (ctx) => (ctx.data.key === "one" ? [sdkAgent()] : []),
+    });
+    expect((await json(await fetch(`${url}/api/portal/one/agents`))).agents).toHaveLength(1);
+    expect((await json(await fetch(`${url}/api/portal/two/agents`))).agents).toHaveLength(0);
+    const create = await fetch(`${url}/api/portal/two/conversations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId: "bot" }),
+    });
+    expect(create.status).toBe(404);
+  });
+
+  it("carries headers set by earlier hooks over to the hijacked response", async () => {
+    const server = createAgentServer({ basePath: "/x", storage: await memoryStorage(), agents: [sdkAgent()] });
+    const app = Fastify();
+    app.addHook("onRequest", async (_req, reply) => {
+      reply.header("x-request-id", "rid-1");
+    });
+    app.register(createFastifyPlugin(server), { prefix: "/p/:k" });
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    closers.push(() => app.close());
+    const { port } = app.server.address() as { port: number };
+    const res = await fetch(`http://127.0.0.1:${port}/p/z/agents`);
+    expect(res.headers.get("x-request-id")).toBe("rid-1");
+  });
+
+  it("follows a conversation through Fastify and lets go when the client does", async () => {
+    const { url, server } = await boot({ runs: { pingIntervalMs: 30 } });
+    const { conversation } = await converse(`${url}/api/portal/k1`);
+    const ctrl = new AbortController();
+    const res = await fetch(`${url}/api/portal/k1/conversations/${conversation.id}/events/stream?after=3`, { signal: ctrl.signal });
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    while (!text.includes("session.work_done") || !text.includes(": ping")) text += decoder.decode((await reader.read()).value, { stream: true });
+    expect(text).toContain("id: 4");
+    expect((server as any).bus.hasListeners(conversation.id)).toBe(true);
+    ctrl.abort();
+    await eventually(() => !(server as any).bus.hasListeners(conversation.id), 3000, "the follower to be released");
+  });
+
+  it("tolerates DELETE and bodyless POST", async () => {
+    const { url } = await boot();
+    const { conversation } = await converse(`${url}/api/portal/k1`);
+    const del = await fetch(`${url}/api/portal/k1/conversations/${conversation.id}`, { method: "DELETE" });
+    expect(del.status).toBe(204);
+  });
+
+  describe("body over Fastify's limit", () => {
+    async function bootLimited(
+      config: Partial<Parameters<typeof createAgentServer>[0]> = {},
+      adapter: { bodyLimit?: number; uploadBodyLimit?: number } = {},
+      fastifyBodyLimit?: number
+    ) {
+      const server = createAgentServer({ basePath: "/x", storage: await memoryStorage(), agents: [sdkAgent()], ...config });
+      const app = Fastify(fastifyBodyLimit ? { bodyLimit: fastifyBodyLimit } : {});
+      mountOnFastify(app, server, { prefix: "/p/:k", ...adapter });
+      return { app, server };
+    }
+    async function listenOn(app: ReturnType<typeof Fastify>) {
+      await app.listen({ port: 0, host: "127.0.0.1" });
+      closers.push(() => app.close());
+      const { port } = app.server.address() as { port: number };
+      return `http://127.0.0.1:${port}/p/k1`;
+    }
+    const post = (url: string, body: unknown, headers: Record<string, string> = {}) =>
+      fetch(url, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+
+    it("answers in the error envelope (413 PAYLOAD_TOO_LARGE), not Fastify's own shape", async () => {
+      const { app } = await bootLimited({}, { bodyLimit: 2_000, uploadBodyLimit: 200_000 });
+      const url = await listenOn(app);
+
+      const res = await post(`${url}/conversations`, { agentId: "bot", pad: "x".repeat(5_000) });
+      expect(res.status).toBe(413);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await json(res)).toEqual({ error: { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds 2000 bytes" } });
+
+      // the upload route reports its own, bigger ceiling
+      const upload = await post(`${url}/files`, { file: { name: "a.txt", content: "y".repeat(210_000), mimeType: "text/plain" } });
+      expect(upload.status).toBe(413);
+      expect(await json(upload)).toEqual({ error: { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds 200000 bytes" } });
+    });
+
+    it("names the app's own limit when the adapter sets none, and keeps CORS and earlier hook headers", async () => {
+      const { app } = await bootLimited({ cors: { enabled: true, origins: ["*"] } }, {}, 1_000);
+      app.addHook("onRequest", async (_req, reply) => {
+        reply.header("x-request-id", "rid-2");
+      });
+      const url = await listenOn(app);
+
+      const res = await post(`${url}/conversations`, { agentId: "bot", pad: "x".repeat(3_000) });
+      expect(res.status).toBe(413);
+      expect((await json(res)).error).toEqual({ code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds 1000 bytes" });
+      expect(res.headers.get("access-control-allow-origin")).toBe("*");
+      expect(res.headers.get("x-request-id")).toBe("rid-2");
+    });
+
+    it("leaves every other Fastify error to the app's own error handler", async () => {
+      const { app } = await bootLimited();
+      app.setErrorHandler((error, _req, reply) => {
+        reply.code((error as { statusCode?: number }).statusCode ?? 500).send({ app: "handled", code: (error as { code?: string }).code });
+      });
+      const url = await listenOn(app);
+
+      const bad = await fetch(`${url}/conversations`, { method: "POST", headers: { "content-type": "application/json" }, body: "{not json" });
+      expect(bad.status).toBe(400);
+      expect((await json(bad)).app).toBe("handled");
+    });
+  });
+});
+
+describe("Express and Next adapters feed resolveContext", () => {
+  it("Next: forwards headers, cookies and the native request", async () => {
+    let seen: ContextRequest | undefined;
+    const server = createAgentServer({
+      basePath: "/api/agents",
+      storage: await memoryStorage(),
+      agents: [sdkAgent()],
+      resolveContext: (req) => {
+        seen = req;
+        return req.cookies.sid ? { user: { id: "u" }, data: {} } : null;
+      },
+    });
+    const handler = createNextHandler(server);
+    const anon = await handler(new Request("http://x/api/agents/agents") as never);
+    expect(anon.status).toBe(401);
+    const ok = await handler(new Request("http://x/api/agents/agents", { headers: { cookie: "sid=1" } }) as never);
+    expect(ok.status).toBe(200);
+    expect(seen?.headers.cookie).toBe("sid=1");
+    expect(seen?.raw).toBeInstanceOf(Request);
+  });
+
+  it("Next: lets a client leave an event stream, which releases the follower", async () => {
+    const server = createAgentServer({ basePath: "/api/agents", storage: await memoryStorage(), agents: [sdkAgent()] });
+    const handler = createNextHandler(server);
+    const created = (await (await handler(new Request("http://x/api/agents/conversations", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ agentId: "bot" }) }) as never)).json()) as any;
+    const id = created.conversation.id;
+    await handler(new Request(`http://x/api/agents/conversations/${id}/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: "hi" }) }) as never);
+
+    const res = await handler(new Request(`http://x/api/agents/conversations/${id}/events/stream?after=3`) as never);
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+    const reader = res.body!.getReader();
+    let text = "";
+    const decoder = new TextDecoder();
+    while (!text.includes("session.work_done")) text += decoder.decode((await reader.read()).value, { stream: true });
+    expect(text).toContain("id: 4");
+    expect((server as any).bus.hasListeners(id)).toBe(true);
+    await reader.cancel();
+    await eventually(() => !(server as any).bus.hasListeners(id), 3000, "the follower to be released");
+  });
+
+  it("Express: releases an event stream when the response closes", async () => {
+    const server = createAgentServer({ basePath: "/api/agents", storage: await memoryStorage(), agents: [sdkAgent()] });
+    const mw = createExpressMiddleware(server);
+    const mount = async (method: string, path: string, body?: unknown, onClose?: { fn?: () => void }) => {
+      const written: string[] = [];
+      let status = 0;
+      let payload: any;
+      const res: any = {
+        status(c: number) { status = c; return res; },
+        json(b: unknown) { payload = b; return res; }, send() { return res; }, set() { return res; },
+        write(c: string) { written.push(c); return true; }, end() {},
+        once(_event: string, fn: () => void) { if (onClose) onClose.fn = fn; },
+      };
+      const done = mw({ method, path, originalUrl: path, headers: {}, query: {}, body } as any, res, () => {});
+      return { res, written, done, status: () => status, payload: () => payload };
+    };
+    const created = await mount("POST", "/api/agents/conversations", { agentId: "bot" });
+    await created.done;
+    const id = created.payload().conversation.id;
+    await (await mount("POST", `/api/agents/conversations/${id}/messages`, { message: "hi" })).done;
+
+    const close: { fn?: () => void } = {};
+    const stream = await mount("GET", `/api/agents/conversations/${id}/events/stream`, undefined, close);
+    await eventually(() => stream.written.join("").includes("session.work_done"), 3000, "the replay");
+    expect((server as any).bus.hasListeners(id)).toBe(true);
+    close.fn!(); // the client closes the connection
+    await stream.done; // the middleware returns once the stream ended
+    expect((server as any).bus.hasListeners(id)).toBe(false);
+  });
+
+  it("Express: forwards headers and mount params", async () => {
+    let seen: ContextRequest | undefined;
+    const server = createAgentServer({
+      basePath: "/api/agents",
+      storage: await memoryStorage(),
+      agents: [sdkAgent()],
+      resolveContext: (req) => {
+        seen = req;
+        return { user: { id: "u" }, data: {} };
+      },
+    });
+    const mw = createExpressMiddleware(server);
+    let status = 0;
+    const res: any = {
+      status(c: number) { status = c; return res; },
+      json() { return res; }, send() { return res; }, set() { return res; }, write() { return true; }, end() {},
+    };
+    await mw({ method: "GET", path: "/api/agents/agents", originalUrl: "/api/agents/agents", headers: { cookie: "a=b" }, query: {}, params: { portalKey: "k" } } as any, res, () => {});
+    expect(status).toBe(200);
+    expect(seen?.cookies).toEqual({ a: "b" });
+    expect(seen?.mountParams).toEqual({ portalKey: "k" });
+  });
+});

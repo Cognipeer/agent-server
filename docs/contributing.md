@@ -29,6 +29,17 @@ npm run dev
 npm test
 ```
 
+The storage tests (`test/storage/`, and the human-in-the-loop tests) run against **all four storage providers** with real
+databases: memory, SQLite (`better-sqlite3`), MongoDB and PostgreSQL. Nothing needs to be set up by hand:
+
+- MongoDB: `mongodb-memory-server` starts a `mongod` (`MONGOMS_VERSION`, default 7.0.14). Set `MONGODB_URL` to use a server you run instead.
+- PostgreSQL: set `PG_URL` to use a server you run; otherwise the tests start one throwaway `postgres:16-alpine` docker container on a random
+  port and remove it afterwards. `AGENT_SERVER_TEST_PG=off` skips it.
+- A provider that cannot run on your machine is reported as a **skipped** suite with the reason. CI sets `REQUIRE_ALL_PROVIDERS=1`, which turns every skip into a failure.
+
+`runStorageContract` (`test/storage/contract.ts`) is the provider contract; a new provider (or a change to an existing one) must pass it. See
+[Custom Storage](/guide/custom-storage).
+
 ## Building
 
 ```bash

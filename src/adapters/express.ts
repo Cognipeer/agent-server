@@ -6,6 +6,7 @@
 
 import type { AgentServer } from "../server.js";
 import type { AuthUser } from "../types.js";
+import { isRawUploadRequest, isUnsupportedUploadRequest } from "../files/config.js";
 
 // Express types - minimal to avoid requiring express as a dependency
 interface Request {
@@ -16,6 +17,11 @@ interface Request {
   query: Record<string, string | string[] | undefined>;
   body?: unknown;
   user?: AuthUser;
+  params?: Record<string, string>;
+  /** The request stream (an `IncomingMessage`); read for an upload of raw bytes the app has not parsed. */
+  [Symbol.asyncIterator]?: () => AsyncIterator<Buffer | string>;
+  readableEnded?: boolean;
+  complete?: boolean;
 }
 
 interface Response {
@@ -25,6 +31,9 @@ interface Response {
   set(headers: Record<string, string>): Response;
   write(chunk: string | Buffer): boolean;
   end(): void;
+  /** Node's `ServerResponse` events (`close` when the client goes away). */
+  once(event: "close", listener: () => void): unknown;
+  destroyed?: boolean;
 }
 
 type NextFunction = (error?: unknown) => void;
@@ -52,6 +61,26 @@ export interface ExpressAdapterOptions {
    * Set to false if you're using express.json() middleware
    */
   parseBody?: boolean;
+}
+
+/** The bytes of an upload: a Buffer a body parser already made (`express.raw()`), else read from the request. */
+async function rawBodyOf(req: Request, limit: number): Promise<unknown> {
+  if (Buffer.isBuffer(req.body)) return req.body;
+  if (typeof req.body === "string") return Buffer.from(req.body);
+  const iterate = req[Symbol.asyncIterator];
+  // Nothing parsed it, and there is still a stream to read
+  if (typeof iterate !== "function" || req.readableEnded) return req.body;
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req as unknown as AsyncIterable<Buffer | string>) {
+    const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    size += buf.length;
+    if (size > limit) {
+      throw { statusCode: 413, code: "PAYLOAD_TOO_LARGE", message: `Request body exceeds ${limit} bytes` };
+    }
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks);
 }
 
 /**
@@ -96,11 +125,28 @@ export function createExpressMiddleware(
         }
       }
 
+      // A file uploaded as itself (`POST /files?name=...` with its own Content-Type) is a body of bytes: take
+      // what `express.raw()` left, or read it from the request when no body parser touched it
+      let body = req.body;
+      const fullPath = req.originalUrl.split("?")[0]!;
+      const routePath = fullPath.startsWith(basePath) ? fullPath.slice(basePath.length) || "/" : req.path;
+      if (isUnsupportedUploadRequest(req.method, routePath, req.headers["content-type"])) {
+        // (a form or multipart upload is turned away by the server with a 415; its body is not read)
+        body = undefined;
+      } else if (isRawUploadRequest(req.method, routePath, req.headers["content-type"])) {
+        body = await rawBodyOf(req, config.limits?.maxBodySize ?? Math.ceil(server.maxUploadBytes() * 1.4) + 64 * 1024);
+      }
+
       // Handle request
       const result = await server.handleRequest(req.method, req.path || req.originalUrl, {
         user,
         query: req.query as Record<string, string | string[] | undefined>,
-        body: req.body,
+        body,
+        headers: req.headers,
+        url: req.originalUrl,
+        // Params of a parameterised mount path, e.g. app.use("/p/:key/agents", ...)
+        mountParams: req.params,
+        raw: req,
       });
 
       // Set headers
@@ -121,9 +167,21 @@ export function createExpressMiddleware(
           "X-Accel-Buffering": "no",
         });
 
+        // The client going away ends the stream at once; a run it was watching goes on without it
+        let closed = false;
+        res.once("close", () => {
+          closed = true;
+          result.close?.();
+        });
+        if (res.destroyed) {
+          closed = true;
+          result.close?.();
+        }
+
         // Stream the data
         try {
           for await (const chunk of result.stream) {
+            if (closed) break;
             res.write(chunk);
             // Flush if possible (for nginx buffering)
             if (typeof (res as unknown as { flush?: () => void }).flush === "function") {
@@ -182,7 +240,6 @@ export function createExpressRouter(
  * Mount AgentServer on an Express app
  */
 export function mountOnExpress(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   app: { use: (path: string, handler: RequestHandler) => void } | any,
   server: AgentServer,
   options: ExpressAdapterOptions = {}
@@ -207,7 +264,8 @@ export function createCorsMiddleware(origins: string[] = ["*"]): RequestHandler 
       res.set({
         "Access-Control-Allow-Origin": allowedOrigin,
         "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, Last-Event-ID",
+        "Access-Control-Expose-Headers": "Retry-After, Content-Disposition, Content-Length",
         "Access-Control-Max-Age": "86400",
       });
     }

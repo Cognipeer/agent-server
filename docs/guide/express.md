@@ -28,6 +28,7 @@ async function main() {
   const agentServer = createAgentServer({
     basePath: '/api/agents',
     storage,
+    allowAnonymousList: true, // a quick start with no sign-in: see "Who may list" in Request Context
     swagger: {
       enabled: true,
       path: '/docs',
@@ -109,6 +110,7 @@ async function main() {
   const agentServer = createAgentServer({
     basePath: '/api/agents',
     storage,
+    allowAnonymousList: true, // a quick start with no sign-in: see "Who may list" in Request Context
     swagger: { enabled: true },
   });
 
@@ -231,6 +233,17 @@ app.use('/v1', createExpressMiddleware(agentServer));
 // GET /v1/api/agents/agents
 // POST /v1/api/agents/conversations
 // etc.
+```
+
+## Uploading Files
+
+A file can be uploaded as itself (`POST /files?name=...` with the file's own `Content-Type`, see [Files](./file-management.md#uploading)). The middleware takes `req.body` when
+it is a Buffer - mount `express.raw({ type: '*/*', limit: '25mb' })` on that route if you want a body parser to do the reading - and otherwise reads the request itself
+(up to `limits.maxBodySize`, by default ~1.4 x the largest file an agent accepts). `express.json()` leaves such a request alone.
+
+```typescript
+app.use(express.json());
+app.use(createExpressMiddleware(agentServer));   // no express.raw() needed
 ```
 
 ## Error Handling

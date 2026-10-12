@@ -31,9 +31,15 @@ npm install pg
 # MongoDB
 npm install mongodb
 
+# SQLite (one process, one file)
+npm install better-sqlite3
+
 # Express
 npm install express
 ```
+
+A complete, runnable server (SQLite or MongoDB, an agent-sdk agent, approvals, files, a host-backed agent) is in
+[`examples/standalone`](https://github.com/Cognipeer/agent-server/tree/main/examples/standalone).
 
 ## Quick Start with Express
 
@@ -43,18 +49,21 @@ Here's a minimal example to get you started:
 import express from 'express';
 import {
   createAgentServer,
-  createMemoryProvider,
+  createInMemoryProvider,
   createExpressMiddleware,
 } from '@cognipeer/agent-server';
 
 // Create an in-memory storage (for development)
-const storage = createMemoryProvider();
+const storage = createInMemoryProvider();
 
 // Create the agent server
 const agentServer = createAgentServer({
   basePath: '/api/agents',
   storage,
   swagger: { enabled: true },
+  // Listing conversations needs to know who is asking. This quick start has no sign-in, so everybody is
+  // the same person; with real users, use `resolveContext` or `auth` instead and drop this line.
+  allowAnonymousList: true,
 });
 
 // Register a simple echo agent
@@ -89,16 +98,17 @@ For Next.js App Router:
 // app/api/agents/[...path]/route.ts
 import {
   createAgentServer,
-  createMemoryProvider,
+  createInMemoryProvider,
   createNextRouteHandlers,
 } from '@cognipeer/agent-server';
 
-const storage = createMemoryProvider();
+const storage = createInMemoryProvider();
 
 const agentServer = createAgentServer({
   basePath: '/api/agents',
   storage,
   swagger: { enabled: true },
+  allowAnonymousList: true, // no sign-in in this quick start; see "Who may list" in Request Context
 });
 
 // Register your agents
@@ -134,6 +144,11 @@ agentServer.registerSDKAgent('assistant', myAgent, {
 });
 ```
 
+## Your own backend as an agent
+
+If the agent's work happens somewhere else - a product runtime behind an API, a workflow engine - register it as a host-backed agent: it streams with `emit`, pauses by returning
+`pendingActions`, and the server keeps the messages, the events and the pause. See [Host-backed agents](/guide/host-agents).
+
 ## Project Structure
 
 Here's a recommended project structure:
@@ -159,7 +174,7 @@ We recommend using environment variables for configuration:
 # Database
 DATABASE_URL=postgresql://user:pass@localhost:5432/mydb
 
-# Authentication
+# Authentication (the secret your JWTs are signed with; the server verifies their signature with it)
 JWT_SECRET=your-secret-key
 
 # Server
@@ -170,7 +185,7 @@ NODE_ENV=development
 ## Next Steps
 
 - [Core Concepts](/guide/core-concepts) - Understand the architecture
-- [Storage Providers](/guide/storage) - Set up PostgreSQL or MongoDB
+- [Storage Providers](/guide/storage) - Set up PostgreSQL, MongoDB or SQLite
 - [Authentication](/guide/authentication) - Secure your API
 - [Express Integration](/guide/express) - Detailed Express setup
 - [Next.js Integration](/guide/nextjs) - Detailed Next.js setup

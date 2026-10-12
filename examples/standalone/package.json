@@ -1,0 +1,26 @@
+{
+  "name": "agent-server-example-standalone",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A standalone @cognipeer/agent-server with an agent-sdk agent and a host-backed agent, on SQLite or MongoDB",
+  "scripts": {
+    "start": "tsx server.ts",
+    "start:sqlite": "STORAGE=sqlite tsx server.ts",
+    "start:mongodb": "STORAGE=mongodb tsx server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cognipeer/agent-sdk": "file:../../../.local-packages/cognipeer-agent-sdk-0.10.6.tgz",
+    "@cognipeer/agent-server": "file:../..",
+    "better-sqlite3": "^13.0.3",
+    "mongodb": "^7.7.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "mongodb-memory-server": "^11.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.4.5"
+  }
+}

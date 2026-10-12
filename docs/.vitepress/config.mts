@@ -12,7 +12,7 @@ export default defineConfig({
       { text: 'API Reference', link: '/api/server' },
       { text: 'Examples', link: '/examples/' },
       {
-        text: 'v0.1.0',
+        text: 'v0.3.0',
         items: [
           { text: 'Changelog', link: '/changelog' },
           { text: 'Contributing', link: '/contributing' },
@@ -34,6 +34,7 @@ export default defineConfig({
           items: [
             { text: 'Express.js', link: '/guide/express' },
             { text: 'Next.js', link: '/guide/nextjs' },
+            { text: 'Fastify & Node HTTP', link: '/guide/fastify' },
           ],
         },
         {
@@ -43,13 +44,21 @@ export default defineConfig({
             { text: 'Authentication', link: '/guide/authentication' },
             { text: 'File Management', link: '/guide/file-management' },
             { text: 'Streaming', link: '/guide/streaming' },
+            { text: 'Runs, Cancel & Reattach', link: '/guide/runs' },
+            { text: 'Approvals & Questions', link: '/guide/human-in-the-loop' },
+            { text: 'Chat Experience', link: '/guide/chat-experience' },
+            { text: 'Embedding & Limits', link: '/guide/embedding' },
+            { text: 'Host-backed Agents', link: '/guide/host-agents' },
+            { text: 'Usage & Budgets', link: '/guide/budgets' },
             { text: 'Swagger UI', link: '/guide/swagger' },
           ],
         },
         {
           text: 'Advanced',
           items: [
+            { text: 'Request Context & Dynamic Agents', link: '/guide/request-context' },
             { text: 'Custom Agents', link: '/guide/custom-agents' },
+            { text: 'Tasks', link: '/tasks' },
             { text: 'Custom Storage', link: '/guide/custom-storage' },
             { text: 'Error Handling', link: '/guide/error-handling' },
           ],
@@ -73,11 +82,6 @@ export default defineConfig({
           text: 'Examples',
           items: [
             { text: 'Overview', link: '/examples/' },
-            { text: 'Express Basic', link: '/examples/express-basic' },
-            { text: 'Express with PostgreSQL', link: '/examples/express-postgres' },
-            { text: 'Next.js App Router', link: '/examples/nextjs-app' },
-            { text: 'Custom Agent', link: '/examples/custom-agent' },
-            { text: 'JWT Authentication', link: '/examples/jwt-auth' },
           ],
         },
       ],

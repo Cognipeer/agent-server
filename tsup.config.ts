@@ -5,6 +5,8 @@ export default defineConfig({
     index: "src/index.ts",
     "adapters/express": "src/adapters/express.ts",
     "adapters/next": "src/adapters/next.ts",
+    "adapters/node": "src/adapters/node.ts",
+    "adapters/fastify": "src/adapters/fastify.ts",
     "providers/storage/postgres": "src/providers/storage/postgres.ts",
     "providers/storage/mongodb": "src/providers/storage/mongodb.ts",
     "providers/storage/sqlite": "src/providers/storage/sqlite.ts",
@@ -19,6 +21,7 @@ export default defineConfig({
   outDir: "dist",
   external: [
     "express",
+    "fastify",
     "next",
     "pg",
     "mongodb",

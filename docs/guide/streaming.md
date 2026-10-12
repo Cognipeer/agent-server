@@ -1,370 +1,233 @@
 # Streaming
 
-Real-time response streaming with Server-Sent Events (SSE).
+Real-time responses with Server-Sent Events (SSE).
 
-## Overview
+A streamed request is a *subscriber* of the run that executes the turn, not the run itself: if the client disconnects the turn
+**keeps running** and is stored when it finishes. Reconnect with the event cursor to pick it up - see [Runs, Cancel & Reattach](./runs.md).
 
-The agent server supports streaming responses, allowing clients to receive partial responses as they're generated. This is especially useful for:
+## Enabling streaming
 
-- **Better UX** - Users see responses as they're generated
-- **Long responses** - Don't wait for the entire response
-- **Tool calls** - See tool execution in real-time
-
-## Enabling Streaming
-
-### Client Request
-
-Enable streaming in your message request:
+Send `stream: true` with the message (or with the answer to an [approval](./human-in-the-loop.md)):
 
 ```typescript
-const response = await fetch('/api/agents/conversations/conv-123/messages', {
+const response = await fetch('/api/agents/conversations/conv_123/messages', {
   method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-    'Authorization': 'Bearer your-token',
-  },
-  body: JSON.stringify({
-    message: 'Hello!',
-    streaming: true,  // Enable streaming
-  }),
+  headers: { 'Content-Type': 'application/json', Authorization: 'Bearer your-token' },
+  body: JSON.stringify({ message: 'Hello!', stream: true }),
 });
 ```
 
-### Response Format
-
-Streaming responses use Server-Sent Events (SSE):
+The response is `text/event-stream`. Every event is a single `data:` line holding JSON with a `type`, followed by a blank line:
 
 ```
-event: stream.start
-data: {"conversationId":"conv-123","messageId":"msg-456","timestamp":1234567890}
+data: {"type":"stream.start","conversationId":"conv_123","messageId":"msg_1","timestamp":1234567890,"seq":2}
 
-event: stream.text
-data: {"text":"Hello","timestamp":1234567891}
+data: {"type":"stream.text","text":"Hello","isFinal":false,"timestamp":1234567891,"seq":2}
 
-event: stream.text
-data: {"text":" there!","timestamp":1234567892}
+data: {"type":"stream.text","text":" there!","isFinal":false,"timestamp":1234567892,"seq":2}
 
-event: stream.text
-data: {"text":" How can I help?","isFinal":true,"timestamp":1234567893}
-
-event: stream.done
-data: {"message":{"id":"msg-456","role":"assistant","content":"Hello there! How can I help?"},"timestamp":1234567894}
+data: {"type":"stream.done","conversationId":"conv_123","messageId":"msg_2","content":"Hello there!","stopReason":"end_turn","runId":"run_x1","timestamp":1234567894,"seq":5}
 ```
 
-## Event Types
+`POST /conversations/:id/messages/:messageId/regenerate` and `.../edit` answer with `stream: true` in the same way (`stream.start` carries the id of the user message that is answered, or of the new user message of an edit).
+A request that cannot start is an HTTP status, not a stream: `404` for an unknown `fileIds`, `409 action_pending` while an
+action is pending, `409 conversation_busy` while the conversation is running another turn. (A streamed request for a
+conversation or agent that does not exist, or is not yours, answers `200` with a stream that carries one `stream.error`.)
+
+## The cursor: `seq`
+
+Every `stream.*` frame carries `seq`: the position in the conversation's [event log](./runs.md#the-event-log) at that frame - the `seq` of the stored
+event the frame reports, or of the newest one before it for frames that are not stored (text chunks). Remember the last one. If the connection drops:
+
+```http
+GET /api/agents/conversations/conv_123/events/stream?after=<last seq>
+```
+
+replays what you missed from the log and follows the turn from there. (`GET .../events?after=` is the same without the live part.)
+You lose at most the text chunks in between - the finished `agent.message` event has the whole text.
+
+## Event types
 
 ### stream.start
-
-Sent when streaming begins:
 
 ```typescript
 interface StreamStartEvent {
   type: 'stream.start';
   conversationId: string;
-  messageId: string;
+  messageId: string;      // the user message (for a resolved action: the paused assistant message)
   timestamp: number;
+  seq?: number;
 }
 ```
 
 ### stream.text
 
-Sent for each text chunk:
+A chunk of the answer. The last one of an agent that did not stream is the whole answer with `isFinal: true`.
 
 ```typescript
 interface StreamTextEvent {
   type: 'stream.text';
   text: string;
-  isFinal?: boolean;  // True for the last text chunk
+  isFinal?: boolean;
   timestamp: number;
+  seq?: number;
 }
 ```
 
-### stream.tool_call
-
-Sent when a tool is called:
+### stream.tool_call / stream.tool_result
 
 ```typescript
 interface StreamToolCallEvent {
   type: 'stream.tool_call';
-  id: string;
-  name: string;
-  arguments: string;  // JSON string
-  timestamp: number;
+  toolName: string;
+  toolCallId: string;
+  args: Record<string, unknown>;
 }
-```
 
-### stream.tool_result
-
-Sent when a tool returns:
-
-```typescript
 interface StreamToolResultEvent {
   type: 'stream.tool_result';
-  id: string;
-  name: string;
-  result: unknown;
-  timestamp: number;
+  toolName: string;
+  toolCallId: string;
+  result: unknown;        // { error: string } when the tool failed
 }
 ```
 
 ### stream.progress
 
-Optional progress updates:
-
-```typescript
-interface StreamProgressEvent {
-  type: 'stream.progress';
-  stage: string;
-  message?: string;
-  percent?: number;
-  timestamp: number;
-}
-```
+Sent by custom handlers (`stage: "processing"`) before they answer; they do not stream text.
 
 ### stream.error
-
-Sent on errors:
 
 ```typescript
 interface StreamErrorEvent {
   type: 'stream.error';
   error: string;
-  code?: string;
-  timestamp: number;
+  code?: string;          // the error's own code for errors the host raised (e.g. NOT_FOUND), else INTERNAL_ERROR
 }
 ```
 
-### stream.done
+With `maskServerErrors: true` only errors the host marked for the client keep their message.
 
-Sent when streaming completes:
+### stream.action_required / stream.action_resolved
+
+When the agent pauses for a tool approval, a question or a [client tool](./human-in-the-loop.md#client-tools) (`type: "client_tool"`: a client shows no card, it hands the call to the host page), `stream.action_required` (with the `actions`) precedes the final `stream.done`,
+which carries `status: "requires_action"`. `stream.action_resolved` is the first event after `stream.start` of the stream returned
+by `POST /conversations/:id/actions/:actionId` (with `resolution.expired: true` when it is the sweep answering a lapsed request, which has no stream to speak of). The stream of `POST /conversations/:id/continue` starts with
+`stream.start` and ends with `stream.done` the same way. See [Approvals & Questions](./human-in-the-loop.md) and [Usage & Budgets](./budgets.md).
+
+### stream.done
 
 ```typescript
 interface StreamDoneEvent {
   type: 'stream.done';
-  message: Message;  // Final message object
-  timestamp: number;
+  conversationId: string;
+  messageId: string;                 // the assistant message
+  content: string;
+  title?: string;                    // generated on the first exchange
+  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cachedInputTokens?: number; costUsd?: number };   // this turn only
+  budget?: { maxCostUsd: number; onReach: 'pause' | 'stop' };   // when the conversation has a budget ...
+  spentUsd?: number;                                            // ... and what it has spent, this turn included
+  status?: 'requires_action' | 'incomplete' | 'cancelled';   // only when the turn did not simply complete
+  pendingActions?: PendingAction[];
+  warnings?: TurnWarning[];
+  stopReason?: 'end_turn' | 'requires_action' | 'cancelled' | 'max_turns' | 'limit' | 'budget_reached' | 'error';
+  runId?: string;
+  seq?: number;
 }
 ```
 
-## Client Implementation
+A turn that is [cancelled](./runs.md#cancel) ends with `stream.done` and `status: "cancelled"`, carrying the text streamed so far. A turn that fails ends with `stream.error`
+(nothing is stored for the assistant). Clients ignore event types they do not know.
+
+## Client implementation
 
 ### Using fetch
 
 ```typescript
-async function streamMessage(conversationId: string, message: string) {
+async function streamMessage(conversationId: string, message: string, onEvent: (e: any) => void) {
   const response = await fetch(`/api/agents/conversations/${conversationId}/messages`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': 'Bearer your-token',
-    },
-    body: JSON.stringify({
-      message,
-      streaming: true,
-    }),
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer your-token' },
+    body: JSON.stringify({ message, stream: true }),
   });
+  if (!response.ok) throw await response.json();      // 409 conversation_busy, 404, ...
 
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-
-  while (true) {
+  let lastSeq = 0;
+  for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
-
     buffer += decoder.decode(value, { stream: true });
-    
-    // Parse SSE events
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || ''; // Keep incomplete line in buffer
-
-    let eventType = '';
-    for (const line of lines) {
-      if (line.startsWith('event: ')) {
-        eventType = line.slice(7);
-      } else if (line.startsWith('data: ')) {
-        const data = JSON.parse(line.slice(6));
-        handleEvent(eventType, data);
-      }
+    const frames = buffer.split('\n\n');
+    buffer = frames.pop() ?? '';
+    for (const frame of frames) {
+      if (!frame.startsWith('data: ')) continue;
+      const event = JSON.parse(frame.slice(6));
+      if (event.seq) lastSeq = event.seq;
+      onEvent(event);
     }
   }
-}
-
-function handleEvent(type: string, data: unknown) {
-  switch (type) {
-    case 'stream.start':
-      console.log('Started:', data);
-      break;
-    case 'stream.text':
-      console.log('Text:', (data as any).text);
-      break;
-    case 'stream.tool_call':
-      console.log('Tool called:', (data as any).name);
-      break;
-    case 'stream.done':
-      console.log('Done:', (data as any).message);
-      break;
-    case 'stream.error':
-      console.error('Error:', (data as any).error);
-      break;
-  }
+  return lastSeq;
 }
 ```
 
-### Using EventSource
+### Following with EventSource
 
-For browsers that support it:
+The *event stream* is a `GET`, so a browser's `EventSource` can follow it and reconnects by itself with `Last-Event-ID`:
 
 ```typescript
-// Note: EventSource only supports GET, so we need a wrapper
-// or use POST with fetch as shown above
+const source = new EventSource(`/api/agents/conversations/${id}/events/stream?after=${lastSeq}`);
+source.addEventListener('agent.message', (e) => console.log(JSON.parse((e as MessageEvent).data).data.content));
+source.addEventListener('agent.message.delta', (e) => append(JSON.parse((e as MessageEvent).data).text));
+source.addEventListener('session.status_idle', () => reloadConversation());
 ```
 
-### Using @cognipeer/chat-ui
+(`EventSource` cannot send an `Authorization` header; use a cookie session through `resolveContext`, or follow with `fetch`.)
 
-The chat-ui library handles streaming automatically:
+### Using @cognipeer/chat-ui
 
 ```tsx
 import { Chat } from '@cognipeer/chat-ui';
 
-<Chat
-  baseUrl="/api/agents"
-  agentId="assistant"
-  streaming={true}  // Default is true
-  onStreamText={(chunk, fullText) => {
-    console.log('Chunk:', chunk);
-    console.log('Full text so far:', fullText);
-  }}
-  onToolCall={(name, args) => {
-    console.log('Tool called:', name, args);
-  }}
-  onToolResult={(name, result) => {
-    console.log('Tool result:', name, result);
-  }}
-/>
+<Chat baseUrl="/api/agents" agentId="assistant" />
 ```
 
-## Server Implementation
+## Server implementation
 
-### SDK Agents
+### SDK agents
 
-SDK agents stream automatically when registered:
+SDK agents stream when registered; tool calls and results are reported even for a non-streamed request (they go to the event log).
 
 ```typescript
-const assistant = createSmartAgent({
-  name: 'Assistant',
-  model: fromLangchainModel(new ChatOpenAI({ streaming: true })),
-  tools: [...],
-});
-
+const assistant = createSmartAgent({ name: 'Assistant', model, tools: [/* ... */] });
 agentServer.registerSDKAgent('assistant', assistant);
 ```
 
-### Custom Agents
+### Custom handlers
 
-Custom agents can implement streaming:
+A custom handler answers in one piece: the stream carries `stream.progress`, then the whole answer as one `stream.text` with `isFinal: true`.
+Honour `signal` so that [cancel](./runs.md#cancel) can stop it.
 
-```typescript
-agentServer.registerCustomAgent('streaming-agent', {
-  processMessage: async function* (params) {
-    // Yield text chunks
-    yield { type: 'text', text: 'Hello' };
-    yield { type: 'text', text: ' there!' };
-    
-    // Yield tool calls
-    yield {
-      type: 'tool_call',
-      id: 'tool-1',
-      name: 'get_weather',
-      arguments: JSON.stringify({ location: 'NYC' }),
-    };
-    
-    // Yield tool results
-    yield {
-      type: 'tool_result',
-      id: 'tool-1',
-      name: 'get_weather',
-      result: { temp: 72, conditions: 'Sunny' },
-    };
-    
-    // Final text
-    yield { type: 'text', text: ' The weather is nice!' };
-  },
-});
-```
+## Disconnecting and stopping
 
-## Abort/Cancel
-
-### Client-side Abort
+Closing the connection (`AbortController.abort()`, closing the tab) **does not stop the turn**; the answer and any pending approval are
+stored and the conversation is busy until the turn is done (`409 conversation_busy`). To stop it:
 
 ```typescript
-const controller = new AbortController();
-
-const response = await fetch('/api/agents/conversations/conv-123/messages', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ message: 'Hello', streaming: true }),
-  signal: controller.signal,
-});
-
-// Cancel the stream
-controller.abort();
+await fetch(`/api/agents/conversations/${id}/cancel`, { method: 'POST' });
 ```
 
-### Using chat-ui
+The stream that was following the turn then ends with `stream.done` (`status: "cancelled"`). A "Stop" button should call this and abort its own fetch.
 
-```tsx
-const { stop } = useChat({
-  baseUrl: '/api/agents',
-  agentId: 'assistant',
-});
+## Keep-alive
 
-// Stop button
-<button onClick={stop}>Stop</button>
-```
-
-## Error Handling
-
-```typescript
-try {
-  const response = await fetch(/* ... */);
-  
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
-  
-  const reader = response.body!.getReader();
-  // ...
-} catch (error) {
-  if (error.name === 'AbortError') {
-    console.log('Stream was cancelled');
-  } else {
-    console.error('Stream error:', error);
-  }
-}
-```
-
-## Connection Keep-Alive
-
-For long streams, ensure proper keep-alive:
-
-```typescript
-// Server-side: Send heartbeat events
-async *streamResponse() {
-  const heartbeatInterval = setInterval(() => {
-    yield { type: 'heartbeat' };
-  }, 15000);
-  
-  try {
-    // ... stream logic
-  } finally {
-    clearInterval(heartbeatInterval);
-  }
-}
-```
+`GET .../events/stream` sends a `: ping` comment every 15 seconds (`runs.pingIntervalMs`). A message stream is as long as its turn;
+if a proxy in front of you times out long silences, follow the turn through the event stream, which pings.
 
 ## Next Steps
 
-- [Swagger UI](/guide/swagger)
-- [Custom Agents](/guide/custom-agents)
-- [Error Handling](/guide/error-handling)
+- [Runs, Cancel & Reattach](./runs.md)
+- [Approvals & Questions](./human-in-the-loop.md)
+- [Error Handling](./error-handling.md)

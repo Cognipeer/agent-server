@@ -215,6 +215,11 @@ auth: {
 }
 ```
 
+## What the spec covers
+
+The spec lists **every route** of the server (a test holds `server.getRoutes()` and the document to each other), the request and response schemas, and the machine-readable `error.code`s in the
+description of the `Error` schema. It is generated from the configuration: `auth.enabled` adds the bearer scheme, and the agents you pass appear in the spec.
+
 ## Customizing the UI
 
 The generated Swagger UI uses the default SwaggerUI theme. For custom styling, you can:
@@ -231,8 +236,8 @@ app.get('/docs', (req, res) => {
 });
 
 // Serve OpenAPI spec
-app.get('/docs/openapi.json', (req, res) => {
-  res.json(agentServer.getOpenAPISpec());
+app.get('/docs/openapi.json', async (req, res) => {
+  res.json(generateOpenAPISpec(agentServer.getConfig(), await agentServer.getAgentsFor()));
 });
 ```
 
@@ -240,7 +245,8 @@ app.get('/docs/openapi.json', (req, res) => {
 
 ```typescript
 // Generate OpenAPI spec
-const spec = agentServer.getOpenAPISpec();
+import { generateOpenAPISpec } from '@cognipeer/agent-server';
+const spec = generateOpenAPISpec(agentServer.getConfig(), await agentServer.getAgentsFor());
 
 // Use with Redoc, Rapidoc, etc.
 ```
@@ -251,7 +257,8 @@ Access the OpenAPI spec programmatically:
 
 ```typescript
 // Get the OpenAPI specification
-const spec = agentServer.getOpenAPISpec();
+import { generateOpenAPISpec } from '@cognipeer/agent-server';
+const spec = generateOpenAPISpec(agentServer.getConfig(), await agentServer.getAgentsFor());
 
 // Save to file
 fs.writeFileSync('openapi.json', JSON.stringify(spec, null, 2));

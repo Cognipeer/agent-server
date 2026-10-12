@@ -11,14 +11,22 @@ While `@cognipeer/agent-sdk` provides a powerful agent framework, you can also i
 ```typescript
 interface AgentHandler {
   processMessage(params: ProcessMessageParams): Promise<ProcessMessageResult>;
+  // Optional: continue a turn that paused for an approval / question
+  resolveAction?(params: ResolveActionParams): Promise<ProcessMessageResult>;
 }
 
 interface ProcessMessageParams {
   conversationId: string;
-  message: string;
-  files?: FileAttachment[];
+  message: string;                       // what the person typed
+  mode?: 'regenerate' | 'edit';          // set for a regeneration / an edit-and-resend (see "Chat experience"); absent for a new message
+  fromMessageId?: string;                // the message `mode` started from
+  files?: FileAttachment[];              // the files the message carries (real ids)
   state?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+  context?: RequestContext;
+  signal?: AbortSignal;                  // aborted when the run is cancelled
+  getFileContent?: (fileId: string) => Promise<Buffer | null>;   // see "With File Processing"
+  getFileText?: (fileId: string) => Promise<string | null>;
 }
 
 interface ProcessMessageResult {
@@ -30,9 +38,15 @@ interface ProcessMessageResult {
     inputTokens?: number;
     outputTokens?: number;
     totalTokens?: number;
+    costUsd?: number;   // what the turn cost: counts toward the conversation's budget (see "Usage & Budgets")
+    model?: string;     // or name the model and let the server's `pricing` price the tokens
   };
+  status?: 'completed' | 'requires_action' | 'incomplete' | 'cancelled';
+  pendingActions?: PendingAction[];  // see "Approvals & Questions"; give one an `expiresAt` of its own, or the server stamps hitl.timeoutMinutes
 }
 ```
+
+`state` is yours: it replaces the visible state of the conversation, and the server's own bookkeeping (pause state, remembered tools, spend) is kept next to it whatever you return.
 
 ## Basic Example
 
@@ -135,35 +149,42 @@ agentServer.registerCustomAgent('claude-assistant', {
 
 ## With File Processing
 
+A message's files are in `files` (every entry has a real id, also for files sent inline), and two readers are scoped to the
+conversation: `getFileContent(id)` gives the bytes, `getFileText(id)` the text the way an agent-sdk agent would be given it
+(see [Files](./file-management.md)). Both answer `null` for an id that is not a file of this conversation or that expired.
+
 ```typescript
 agentServer.registerCustomAgent('document-analyzer', {
-  processMessage: async ({ message, files }) => {
+  processMessage: async ({ message, files, getFileContent, getFileText }) => {
     if (!files || files.length === 0) {
       return { content: 'Please upload a document to analyze.' };
     }
-    
+
     const results = [];
-    
+
     for (const file of files) {
-      // Get file content from storage
-      const content = await storage.getFileContent(file.id);
-      
-      if (file.mimeType === 'application/pdf') {
-        const text = await extractPDFText(content);
-        results.push(`PDF "${file.name}": ${text.slice(0, 500)}...`);
-      } else if (file.mimeType.startsWith('image/')) {
+      if (file.mimeType.startsWith('image/')) {
         // Use vision API
-        const description = await analyzeImage(content);
+        const bytes = await getFileContent!(file.id);
+        const description = await analyzeImage(bytes!);
         results.push(`Image "${file.name}": ${description}`);
+      } else {
+        // PDF, Word, text ... converted when @cognipeer/to-markdown is installed (or by files.extractText)
+        const text = await getFileText!(file.id);
+        results.push(`"${file.name}": ${text ? text.slice(0, 500) + '...' : '(no text)'}`);
       }
     }
-    
+
     return {
       content: `Analysis complete:\n\n${results.join('\n\n')}`,
     };
   },
+}, { name: 'Document analyzer' }, {
+  files: { allowedMimeTypes: ['application/pdf', 'image/*', 'text/*'], maxFileSize: 25 * 1024 * 1024 },
 });
 ```
+
+`message` is what the person typed; the server does not put the files' text into it for a custom handler.
 
 ## With State Management
 
@@ -200,23 +221,47 @@ agentServer.registerCustomAgent('stateful-assistant', {
 });
 ```
 
-## Streaming Custom Agents
+## Streaming
 
-For streaming responses, use an async generator:
+A handler answers once: a streamed request (`stream: true`) gets a progress frame and then the whole answer as one `stream.text`. An agent that streams its answer, reports its tool calls and
+is cancelled through a signal is a **host-backed agent**: `registerHostAgent({ info, invoke })`, where `invoke` calls `emit({ type: 'text', text })` as it goes. See [Host-backed agents](./host-agents.md).
 
 ```typescript
-agentServer.registerCustomAgent('streaming-agent', {
-  processMessage: async function* ({ message }) {
-    // Stream text chunks
-    const chunks = ['Hello', ' there!', ' How', ' can', ' I', ' help?'];
-    
-    for (const chunk of chunks) {
-      yield { type: 'text', text: chunk };
+agentServer.registerHostAgent({
+  info: { id: 'streaming-agent', name: 'Streaming agent' },
+  async invoke({ message }, { emit, signal }) {
+    for (const chunk of ['Hello', ' there!', ' How', ' can', ' I', ' help?']) {
+      if (signal.aborted) break;
+      emit({ type: 'text', text: chunk });
       await delay(100); // Simulate processing
     }
+    return {}; // the streamed text is the answer
   },
 });
 ```
+
+## OpenAI-compatible endpoints
+
+An endpoint that speaks the Chat Completions or Responses API needs no handler:
+
+```typescript
+agentServer.registerChatCompletionsAgent('gpt', {
+  baseUrl: 'https://api.openai.com',
+  apiKey: process.env.OPENAI_API_KEY!,
+  model: 'gpt-4o',
+  systemPrompt: 'You are a helpful assistant.',
+}, { name: 'GPT-4o' });
+
+agentServer.registerResponsesAgent('resp', {
+  baseUrl: 'https://api.openai.com',
+  apiKey: process.env.OPENAI_API_KEY!,
+  model: 'gpt-4o',
+  instructions: 'You are a helpful assistant.',
+  tools: [{ type: 'web_search_preview' }],
+}, { name: 'GPT-4o Responses' });
+```
+
+They stream, accept attachments (text inline, pictures as `image_url` / `input_image` parts), are cancelled by aborting the upstream request, and count their usage; they never pause for an approval.
 
 ## With External APIs
 

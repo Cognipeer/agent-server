@@ -16,17 +16,18 @@ Create a catch-all route handler:
 // app/api/agents/[...path]/route.ts
 import {
   createAgentServer,
-  createMemoryProvider,
+  createInMemoryProvider,
   createNextRouteHandlers,
 } from '@cognipeer/agent-server';
 
 // Create storage (use PostgreSQL or MongoDB in production)
-const storage = createMemoryProvider();
+const storage = createInMemoryProvider();
 
 // Create agent server
 const agentServer = createAgentServer({
   basePath: '/api/agents',
   storage,
+  allowAnonymousList: true, // a quick start with no sign-in: see "Who may list" in Request Context
   swagger: { enabled: true },
 });
 
@@ -59,7 +60,7 @@ import { createSmartAgent, fromLangchainModel } from '@cognipeer/agent-sdk';
 import { ChatOpenAI } from '@langchain/openai';
 
 // Create storage provider
-const storage = createPostgresProvider({
+export const storage = createPostgresProvider({
   connectionString: process.env.DATABASE_URL!,
 });
 
@@ -79,6 +80,7 @@ const assistant = createSmartAgent({
 export const agentServer = createAgentServer({
   basePath: '/api/agents',
   storage,
+  allowAnonymousList: true, // a quick start with no sign-in: see "Who may list" in Request Context
   swagger: { enabled: true },
 });
 
@@ -120,6 +122,8 @@ const storage = createPostgresProvider({
   connectionString: process.env.DATABASE_URL!,
 });
 
+// Verifies each token's signature with this secret (HS256 by default). For an identity provider with
+// rotating keys (JWKS), write an AuthProvider on a JWT library instead - see Authentication.
 const authProvider = createJWTAuthProvider({
   secret: process.env.JWT_SECRET!,
   extractUserId: (payload) => payload.sub as string,
@@ -184,13 +188,13 @@ module.exports = nextConfig;
 // app/actions.ts
 'use server';
 
-import { agentServer, initializeServer } from '@/lib/agent-server';
+import { storage, initializeServer } from '@/lib/agent-server';   // export the storage next to the server
 
 export async function sendMessage(conversationId: string, message: string) {
   await initializeServer();
   
   // Use storage directly for server actions
-  const result = await agentServer.storage.createMessage({
+  const result = await storage.createMessage({
     conversationId,
     role: 'user',
     content: message,
@@ -250,7 +254,7 @@ const response = await fetch('/api/agents/conversations/123/messages', {
   },
   body: JSON.stringify({
     message: 'Hello!',
-    streaming: true,
+    stream: true,
   }),
 });
 
@@ -266,6 +270,13 @@ while (true) {
   // Parse SSE events
 }
 ```
+
+## Uploading Files
+
+The adapter authenticates a request before it reads its body, and then reads the body in pieces, refusing it with `413` as soon as it is over `limits.maxBodySize` (by default about 1.4 times the largest
+`files.maxFileSize`, plus 64 KiB; set the option when your agents are built per request, see [Files](./file-management.md#adapters)). A file uploaded as itself (`POST /files?name=...` with the file's
+own `Content-Type`, see [Files](./file-management.md#uploading)) arrives as bytes; JSON requests are parsed as before. Next.js and your host may have their own, smaller request size limits - make sure they
+allow your largest file.
 
 ## Error Handling
 
@@ -286,7 +297,7 @@ export async function GET(request: Request, context: any) {
   } catch (error) {
     console.error('API Error:', error);
     return NextResponse.json(
-      { error: 'Internal Server Error' },
+      { error: { code: 'INTERNAL_ERROR', message: 'Internal Server Error' } },
       { status: 500 }
     );
   }
