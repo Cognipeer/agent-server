@@ -243,17 +243,24 @@ export function isFormContentType(contentType: string | string[] | undefined): b
   return base.startsWith("multipart/") || base === "application/x-www-form-urlencoded";
 }
 
+/** `value` without its trailing slashes (a loop: a `/\/+$/` regex backtracks quadratically on a long run of slashes). */
+export function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end--;
+  return value.slice(0, end);
+}
+
 /** Whether `POST /files` is called with a form encoding: answered 415 by the server, so an adapter need not read the body. */
 export function isUnsupportedUploadRequest(method: string, routePath: string, contentType: string | string[] | undefined): boolean {
   if (method.toUpperCase() !== "POST") return false;
-  const path = routePath.split("?")[0]!.replace(/\/+$/, "");
+  const path = trimTrailingSlashes(routePath.split("?")[0]!);
   return path === "/files" && isFormContentType(contentType);
 }
 
 /** Whether an upload request carries the file as its raw body instead of JSON. */
 export function isRawUploadRequest(method: string, routePath: string, contentType: string | string[] | undefined): boolean {
   if (method.toUpperCase() !== "POST") return false;
-  const path = routePath.split("?")[0]!.replace(/\/+$/, "");
+  const path = trimTrailingSlashes(routePath.split("?")[0]!);
   if (path !== "/files") return false;
   const raw = Array.isArray(contentType) ? contentType[0] : contentType;
   if (!raw) return false; // no declared type: the JSON body it always was

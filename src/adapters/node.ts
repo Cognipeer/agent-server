@@ -9,7 +9,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AgentServer, RouteResult } from "../server.js";
 import type { AuthUser } from "../types.js";
-import { isRawUploadRequest, isUnsupportedUploadRequest } from "../files/config.js";
+import { isRawUploadRequest, isUnsupportedUploadRequest, trimTrailingSlashes } from "../files/config.js";
 
 export interface NodeHandlerOptions {
   /**
@@ -145,7 +145,7 @@ async function readJsonBody(req: IncomingMessage, limit: number): Promise<unknow
  */
 export function createNodeHandler(server: AgentServer, options: NodeHandlerOptions = {}): NodeHandler {
   const config = server.getConfig();
-  const base = (options.basePath ?? server.getBasePath()).replace(/\/+$/, "");
+  const base = trimTrailingSlashes(options.basePath ?? server.getBasePath());
   const maxBody =
     options.maxBodyBytes ??
     config.limits?.maxBodySize ??
