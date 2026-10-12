@@ -6,6 +6,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { EVENT_TYPES } from "./events.js";
 import type { Conversation, ContentPart, ExportConfig, ExportLabels, Message, MessageFeedback } from "./types.js";
 
 export const EXPORT_FORMATS = ["md", "json", "html", "pdf"] as const;
@@ -53,6 +54,151 @@ export interface ExportTool {
   ok?: boolean;
   error?: string;
   durationMs?: number;
+}
+
+/** The part of a stored event the tool-call correlation reads (a {@link ConversationEvent} fits). */
+export interface ToolLogEvent {
+  seq: number;
+  type: string;
+  data: Record<string, unknown>;
+  runId?: string;
+}
+
+/** The event types {@link toolCallsByAnswer} reads. */
+export const TOOL_LOG_TYPES: string[] = [EVENT_TYPES.userMessage, EVENT_TYPES.toolUse, EVENT_TYPES.toolResult, EVENT_TYPES.message];
+
+const camel = (key: string): string => key.replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase());
+
+/** A field of an event's `data`, whichever way its writer cased it: `tool_call_id` from this server, `toolCallId` from a host's own log. */
+const eventField = (data: Record<string, unknown>, snake: string): unknown => data[snake] ?? data[camel(snake)];
+
+const textOf = (value: unknown): string | undefined => (typeof value === "string" && value !== "" ? value : undefined);
+
+type LoggedCall = ExportTool & { id: string };
+
+/**
+ * The tool calls of each assistant message, from the event log.
+ *
+ * A turn of this server writes its events with the run that made them, so the calls of a run belong to the answer that names the
+ * run. A host that keeps its own log (a portal) writes events with no run id, and may name neither the answer (`message_id`) nor
+ * anything else about it. Those are told apart by the order they were written in: the calls between a question (`user.message`)
+ * and the answer that follows it are that answer's. Which stored message the answer is: the one it names (`message_id`), else the one
+ * at the position it reports (`message_index`, an index into the whole transcript), else the one that says the same thing
+ * (`content`), else - for an answer that says nothing about itself - the answers are lined up with the stored ones from the newest
+ * back, since the log may have lost its oldest events but not its newest. An answer that reports something that matches no stored
+ * message (one that was regenerated away) shows nothing, and neither does a log with more answers than there are stored ones to
+ * put them to and nothing to tell them apart: a wrong list of tool calls is worse than none.
+ *
+ * `history` is the whole stored transcript, oldest first. Events are read in the order given (ascending `seq`).
+ */
+export function toolCallsByAnswer(events: Iterable<ToolLogEvent>, history: Message[]): Map<string, ExportTool[]> {
+  const byRun = new Map<string, Map<string, LoggedCall>>();
+  const runOfAnswer = new Map<string, string>();
+  /** Answers that carry no run (or no message id), in the order they were written, with the calls written since the question. */
+  const loose: Array<{ answerId?: string; index?: number; content?: string; truncated?: boolean; runId?: string; calls: LoggedCall[] }> = [];
+  let open = new Map<string, LoggedCall>();
+
+  for (const event of events) {
+    const data = event.data ?? {};
+    if (event.type === EVENT_TYPES.userMessage) {
+      // a new question: calls the previous turn left without an answer (a stopped one) are not this turn's
+      open = new Map();
+    } else if (event.type === EVENT_TYPES.message) {
+      const answerId = textOf(eventField(data, "message_id"));
+      if (event.runId && answerId) {
+        runOfAnswer.set(answerId, event.runId);
+      } else {
+        const index = eventField(data, "message_index");
+        const content = textOf(data.content);
+        loose.push({
+          ...(answerId ? { answerId } : {}),
+          ...(typeof index === "number" && Number.isInteger(index) ? { index } : {}),
+          ...(content ? { content, truncated: data._truncated === true } : {}),
+          ...(event.runId ? { runId: event.runId } : {}),
+          calls: [...open.values()],
+        });
+      }
+      open = new Map();
+    } else if (event.type === EVENT_TYPES.toolUse || event.type === EVENT_TYPES.toolResult) {
+      let bucket = open;
+      if (event.runId) {
+        bucket = byRun.get(event.runId) ?? new Map<string, LoggedCall>();
+        byRun.set(event.runId, bucket);
+      }
+      const id = textOf(eventField(data, "tool_call_id")) ?? `${event.seq}`;
+      const call = bucket.get(id) ?? { id, name: textOf(data.name) ?? "tool" };
+      if (event.type === EVENT_TYPES.toolUse) {
+        if (data.args && typeof data.args === "object") call.args = data.args as Record<string, unknown>;
+      } else {
+        call.ok = data.ok !== false;
+        const error = textOf(data.error);
+        if (error) call.error = error;
+        const took = eventField(data, "duration_ms");
+        if (typeof took === "number") call.durationMs = took;
+      }
+      bucket.set(id, call);
+    }
+  }
+
+  const out = new Map<string, ExportTool[]>();
+  const give = (answerId: string, calls: Iterable<LoggedCall>) => {
+    const list = [...calls].map(({ id: _id, ...call }) => call);
+    if (list.length > 0) out.set(answerId, list);
+  };
+  const assigned = new Set<string>();
+
+  for (const [answerId, runId] of runOfAnswer) {
+    assigned.add(answerId);
+    give(answerId, byRun.get(runId)?.values() ?? []);
+  }
+
+  // The answers an id-less log can be about: the ones with text (an event is written for an answer that said something)
+  const answers = history.filter((message) => message.role === "assistant" && messageText(message) !== "");
+  const stored = new Set(answers.map((message) => message.id));
+  const unnamed: typeof loose = [];
+  for (const entry of loose) {
+    const calls = [...(entry.runId ? (byRun.get(entry.runId)?.values() ?? []) : []), ...entry.calls];
+    if (entry.answerId) {
+      // it names its message; one that is gone from the transcript has nothing to show
+      if (stored.has(entry.answerId) && !assigned.has(entry.answerId)) {
+        assigned.add(entry.answerId);
+        give(entry.answerId, calls);
+      }
+    } else {
+      unnamed.push({ ...entry, calls });
+    }
+  }
+
+  // The newest event first: an answer that was written again (regenerated) claims its message before the stale one can
+  const isFree = (message: Message | undefined): message is Message => !!message && stored.has(message.id) && !assigned.has(message.id) && message.role === "assistant";
+  const same = (entry: (typeof loose)[number], message: Message): boolean => {
+    if (!entry.content) return false;
+    const text = messageText(message);
+    // (an event cut to its size limit ends in "...")
+    return entry.truncated ? text.startsWith(entry.content.replace(/\.{3}$/, "")) : text === entry.content;
+  };
+  const unsaid: typeof loose = [];
+  for (const entry of [...unnamed].reverse()) {
+    // by position in the transcript - unless another message says exactly this and the one at that position does not (the
+    // transcript was cut back since) - else by what it says
+    const byIndex = entry.index !== undefined ? history[entry.index] : undefined;
+    const bySaying = entry.content ? [...answers].reverse().find((message) => isFree(message) && same(entry, message)) : undefined;
+    const target = isFree(byIndex) && !(bySaying && !same(entry, byIndex)) ? byIndex : bySaying;
+    if (target) {
+      assigned.add(target.id);
+      give(target.id, entry.calls);
+    } else if (!entry.content && entry.index === undefined) {
+      unsaid.unshift(entry);
+    }
+  }
+
+  // By order, from the newest back: answers that said nothing about themselves. A log with more of them than there are stored
+  // answers to put them to has events of answers that are gone (regenerated, edited away) and no way to tell which: none is guessed.
+  const free = answers.filter((message) => !assigned.has(message.id));
+  if (unsaid.length <= free.length) {
+    for (let i = 1; i <= unsaid.length; i++) give(free[free.length - i]!.id, unsaid[unsaid.length - i]!.calls);
+  }
+  return out;
 }
 
 export interface Transcript {

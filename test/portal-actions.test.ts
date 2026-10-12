@@ -8,6 +8,8 @@ import { createAgentServer, hostAgentRegistration } from "../src/index.js";
 import type {
   AgentServerConfig,
   AuditEntry,
+  ConversationEvent,
+  EventStore,
   FeedbackEvent,
   HostAgent,
   HostAgentDefinition,
@@ -33,6 +35,85 @@ const freshUser = () => `user-${Date.now().toString(36)}-${++nextUser}`;
 
 type Behaviour = Partial<HostAgent> & { invoke?: HostAgent["invoke"] };
 
+/** A storage provider with some of its members replaced (a getter such as `events` included); everything else is the real one. */
+function overriding(storage: StorageProvider, replace: Record<string, unknown>): StorageProvider {
+  return new Proxy(storage, {
+    get(target, prop) {
+      if (typeof prop === "string" && prop in replace) return replace[prop];
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+/**
+ * How a host that keeps its own log (a portal) writes it, whatever this server wrote: no run on any event, and
+ * - `ids`: otherwise as this server writes it (snake_case, the answer's `message_id`)
+ * - `console`: camelCase, the answer's position in the transcript (`messageIndex`) and its text, but no message id
+ * - `content`: camelCase and the answer's text only
+ * - `order`: camelCase and nothing that names an answer
+ */
+type HostLog = "ids" | "console" | "content" | "order";
+function hostShaped(storage: StorageProvider, shape: HostLog): StorageProvider {
+  const events = storage.events!;
+  const camelKeys = (data: Record<string, unknown>) =>
+    Object.fromEntries(Object.entries(data).map(([key, value]) => [key.replace(/_([a-z])/g, (_m, c: string) => c.toUpperCase()), value]));
+  const wrapped: EventStore = {
+    append: (conversationId, batch, ctx) => events.append(conversationId, batch, ctx),
+    summary: events.summary?.bind(events),
+    prune: events.prune?.bind(events),
+    list: async (conversationId, params, ctx) => {
+      const page = await events.list(conversationId, params, ctx);
+      const stored = (await storage.getMessages(conversationId, { order: "asc", limit: 1000 }, ctx)).data;
+      return {
+        ...page,
+        events: page.events.map(({ runId: _run, ...event }): ConversationEvent => {
+          if (shape === "ids") return event as ConversationEvent;
+          const data = camelKeys(event.data);
+          if (event.type === "agent.message" || event.type === "user.message") {
+            const answerId = data.messageId as string | undefined;
+            delete data.messageId;
+            if (event.type === "agent.message") {
+              if (shape === "console") data.messageIndex = stored.findIndex((m) => m.id === answerId);
+              if (shape !== "console" && shape !== "content") delete data.content;
+            }
+          }
+          return { ...event, data } as ConversationEvent;
+        }),
+      };
+    },
+  };
+  return overriding(storage, { events: wrapped });
+}
+
+/**
+ * A host's storage that answers an update with a record of its own making: `remembers` still carries what the update took away
+ * (the pin of an unpin) and adds a key of its own; `forgets` leaves out what the update put there.
+ */
+function answeringStale(storage: StorageProvider, mode: "remembers" | "forgets"): StorageProvider {
+  const SERVER_KEYS = ["pinned", "pinnedAt", "titleGenerated"];
+  const staleOf = (before: { metadata?: Record<string, unknown> } | null, after: any) => {
+    if (!after) return after;
+    const metadata = { ...(after.metadata ?? {}) };
+    if (mode === "forgets") for (const key of SERVER_KEYS) delete metadata[key];
+    else {
+      for (const key of SERVER_KEYS) if (before?.metadata?.[key] !== undefined) metadata[key] = before.metadata[key];
+      metadata.hostKey = "kept";
+    }
+    return { ...after, metadata };
+  };
+  return overriding(storage, {
+    updateConversation: async (id: string, params: any, ctx: any) => {
+      const before = await storage.getConversation(id, ctx);
+      return staleOf(before, await storage.updateConversation(id, params, ctx));
+    },
+    updateConversationIf: async (id: string, version: number, params: any, ctx: any) => {
+      const before = await storage.getConversation(id, ctx);
+      return staleOf(before, await storage.updateConversationIf!(id, version, params, ctx));
+    },
+  });
+}
+
 /** A host agent that numbers its answers and records what it is given. */
 function numbering(behaviour: Behaviour = {}) {
   const invokes: HostInvokeInput[] = [];
@@ -57,9 +138,11 @@ async function boot(
     config?: Partial<AgentServerConfig>;
     settings?: Partial<HostAgentDefinition>;
     user?: string;
+    /** Puts something between the server and the provider (see {@link hostShaped}, {@link answeringStale}). */
+    through?: (storage: StorageProvider) => StorageProvider;
   } = {}
 ) {
-  const storage = currentStorage();
+  const storage = options.through ? options.through(currentStorage()) : currentStorage();
   const host = numbering(options.behaviour);
   const user = options.user ?? freshUser();
   const server = createAgentServer({
@@ -426,6 +509,47 @@ function suite() {
       expect((created.body as any).conversation.pinned).toBeUndefined();
       const patched = await t.call("PATCH", `/conversations/${t.id}`, { body: { metadata: { pinned: true } } });
       expect((patched.body as any).pinned).toBeUndefined();
+    });
+
+    it("answers the metadata the update left when the host's store answers with a stale record", async () => {
+      const t = await boot({ through: (storage) => answeringStale(storage, "remembers") });
+      const patch = async (body: Record<string, unknown>) => (await t.call("PATCH", `/conversations/${t.id}`, { body })).body as any;
+
+      const pinned = await patch({ pinned: true });
+      expect(pinned).toMatchObject({ pinned: true, metadata: { pinned: true, hostKey: "kept" } });
+      expect(typeof pinned.metadata.pinnedAt).toBe("string");
+
+      // the store still says it is pinned; the answer is what the update left
+      const unpinned = await patch({ pinned: false });
+      expect(unpinned.pinned).toBeUndefined();
+      expect(unpinned.metadata.pinned).toBeUndefined();
+      expect(unpinned.metadata.pinnedAt).toBeUndefined();
+      // (the store's own keys are not replaced away)
+      expect(unpinned.metadata.hostKey).toBe("kept");
+      // ... and it is what was stored
+      const shown = (await t.get()).conversation;
+      expect(shown.metadata?.pinned).toBeUndefined();
+      expect(shown.pinned).toBeUndefined();
+
+      // a title a person wrote ends the mark of a generated one, also in the answer
+      await t.storage.updateConversation(t.id, { metadata: { titleGenerated: true, keep: 1 } }, undefined);
+      const renamed = await patch({ title: "Mine" });
+      expect(renamed.title).toBe("Mine");
+      expect(renamed.metadata.titleGenerated).toBeUndefined();
+      expect(renamed.metadata.keep).toBe(1);
+    });
+
+    it("answers the pin and the metadata it wrote when the host's store leaves them out", async () => {
+      const t = await boot({ through: (storage) => answeringStale(storage, "forgets") });
+      const patch = async (body: Record<string, unknown>) => (await t.call("PATCH", `/conversations/${t.id}`, { body })).body as any;
+
+      const pinned = await patch({ pinned: true });
+      expect(pinned).toMatchObject({ pinned: true, metadata: { pinned: true } });
+      expect(typeof pinned.metadata.pinnedAt).toBe("string");
+
+      // a metadata update keeps the pin (it is the server's) and adds to what the store returned
+      const meta = await patch({ metadata: { topic: "x" } });
+      expect(meta).toMatchObject({ pinned: true, metadata: { topic: "x", pinned: true, pinnedAt: pinned.metadata.pinnedAt } });
     });
 
     it("renames, with the title checked", async () => {
@@ -843,6 +967,81 @@ function suite() {
       // without tools=1 the file has none
       expect(text(await exp(allowed))).not.toContain("search");
       expect(((await allowed.call("GET", "/agents/h")).body as any).metadata.experience.export.includeTools).toBe(true);
+    });
+
+    describe("tool calls when the log has no run ids", () => {
+      /** A turn that searches, a turn that does not, a turn that writes with one tool failing. */
+      const toolful: Behaviour = {
+        invoke: (input, { emit }) => {
+          if (input.message === "find") {
+            emit({ type: "tool_use", id: "c1", name: "search", args: { q: "lisbon" } });
+            emit({ type: "tool_result", id: "c1", result: { hits: 3 } });
+            return { content: "found it" };
+          }
+          if (input.message === "save") {
+            emit({ type: "tool_use", id: "c2", name: "fetch", args: { url: "u" } });
+            emit({ type: "tool_use", id: "c3", name: "write", args: { path: "p" } });
+            emit({ type: "tool_result", id: "c2", error: "timeout" });
+            emit({ type: "tool_result", id: "c3", result: "ok" });
+            return { content: "saved it" };
+          }
+          return { content: "plain answer" };
+        },
+      };
+
+      for (const shape of ["ids", "console", "content", "order"] as const) {
+        it(`includes them for a host whose log is ${shape === "ids" ? "this server's, minus the runs" : `camelCase and says ${shape === "console" ? "the position and the text" : shape === "content" ? "the text" : "nothing about the answer"}`}`, async () => {
+          const t = await boot({ behaviour: toolful, config: { export: { includeTools: true } }, through: (storage) => hostShaped(storage, shape) });
+          for (const message of ["find", "chat", "save"]) await t.send(message);
+
+          // (the log really has no run to go by)
+          const log = ((await t.call("GET", `/conversations/${t.id}/events`)).body as any).events as any[];
+          expect(log.some((e) => e.type === "agent.tool_use")).toBe(true);
+          expect(log.every((e) => e.run_id === undefined)).toBe(true);
+
+          const json = JSON.parse(text(await exp(t, { tools: "1", format: "json" })));
+          expect(json.messages.map((m: any) => [m.content, (m.toolCalls ?? []).map((c: any) => [c.name, c.ok, c.error])])).toEqual([
+            ["find", []],
+            ["found it", [["search", true, undefined]]],
+            ["chat", []],
+            ["plain answer", []],
+            ["save", []],
+            ["saved it", [["fetch", false, "timeout"], ["write", true, undefined]]],
+          ]);
+          expect(json.messages[1].toolCalls[0].args).toEqual({ q: "lisbon" });
+          const md = text(await exp(t, { tools: "1" }));
+          expect(md).toContain('`search` {"q":"lisbon"} - ok');
+          expect(md).toContain("`fetch` {\"url\":\"u\"} - failed: timeout");
+          expect(md).toContain('`write` {"path":"p"} - ok');
+          expect(text(await exp(t, { tools: "1", format: "html" }))).toContain("<code>search</code>");
+          // without tools=1 there are none
+          expect(text(await exp(t))).not.toContain("search");
+        });
+      }
+
+      it("does not give a regenerated answer the calls of the one it replaced, nor hand them to another answer", async () => {
+        let finds = 0;
+        const behaviour: Behaviour = {
+          invoke: (input, { emit }) => {
+            if (input.message !== "find") return { content: "plain answer" };
+            const tool = ++finds === 1 ? "search" : "search_again";
+            emit({ type: "tool_use", id: `c${finds}`, name: tool, args: {} });
+            emit({ type: "tool_result", id: `c${finds}`, result: {} });
+            return { content: finds === 1 ? "found it" : "found it again" };
+          },
+        };
+        for (const shape of ["content", "order"] as const) {
+          finds = 0;
+          const t = await boot({ behaviour, config: { export: { includeTools: true } }, through: (storage) => hostShaped(storage, shape) });
+          await t.send("chat");
+          const found = await t.send("find");
+          await t.call("POST", `/conversations/${t.id}/messages/${(found.body as any).response.id}/regenerate`);
+          const json = JSON.parse(text(await exp(t, { tools: "1", format: "json" })));
+          const answers = json.messages.filter((m: any) => m.role === "assistant").map((m: any) => [m.content, (m.toolCalls ?? []).map((c: any) => c.name)]);
+          // (by what the answers say the new one is told apart; with nothing to tell them apart, none is guessed)
+          expect(answers).toEqual([["plain answer", []], ["found it again", shape === "content" ? ["search_again"] : []]]);
+        }
+      });
     });
 
     it("renders PDF only when the host has a renderer, and says what to do otherwise", async () => {

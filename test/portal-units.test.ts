@@ -6,7 +6,8 @@ import { describe, expect, it } from "vitest";
 import { readActions } from "../src/host.js";
 import { CLIENT_TOOL_GRACE_SECONDS, recordableResolution, stampDeadlines } from "../src/hitl.js";
 import { closedExperience, effectiveExperience, experienceFromMetadata, mergeExperience, normalizeReasons, normalizeStarters, normalizeWelcome, resolveExperience } from "../src/experience.js";
-import { exportFileName, htmlContentSecurityPolicy, messageText, renderHtml, renderJson, renderMarkdown, resolveLabels } from "../src/export.js";
+import { exportFileName, htmlContentSecurityPolicy, messageText, renderHtml, renderJson, renderMarkdown, resolveLabels, toolCallsByAnswer } from "../src/export.js";
+import type { ToolLogEvent } from "../src/export.js";
 import type { Transcript } from "../src/export.js";
 import { assertTitleGeneration, cleanTitle, titlePrompt } from "../src/titles.js";
 import type { Message, PendingAction } from "../src/index.js";
@@ -243,5 +244,131 @@ describe("export", () => {
     expect(htmlContentSecurityPolicy(false)).not.toContain("script-src");
     expect(htmlContentSecurityPolicy(true)).toMatch(/script-src 'sha256-/);
     expect(htmlContentSecurityPolicy(false)).toContain("default-src 'none'");
+  });
+});
+
+describe("tool calls of an export", () => {
+  const msg = (id: string, role: Message["role"], content: string): Message => ({
+    id,
+    conversationId: "conv_1",
+    role,
+    content,
+    createdAt: new Date("2026-10-11T10:00:00.000Z"),
+    updatedAt: new Date("2026-10-11T10:00:00.000Z"),
+  });
+  /** user, answer (searched), user, answer (nothing), user, answer (two tools, one failed) */
+  const history = [msg("u1", "user", "q1"), msg("a1", "assistant", "r1"), msg("u2", "user", "q2"), msg("a2", "assistant", "r2"), msg("u3", "user", "q3"), msg("a3", "assistant", "r3")];
+
+  /** A log in the order this server writes it, snake_case and with a run on every event. */
+  function serverLog(): ToolLogEvent[] {
+    let seq = 0;
+    const e = (type: string, data: Record<string, unknown>, runId?: string): ToolLogEvent => ({ seq: ++seq, type, data, ...(runId ? { runId } : {}) });
+    return [
+      e("user.message", { content: "q1", message_id: "u1" }, "run_1"),
+      e("agent.tool_use", { tool_call_id: "c1", name: "search", args: { q: "x" } }, "run_1"),
+      e("agent.tool_result", { tool_call_id: "c1", name: "search", ok: true, duration_ms: 7 }, "run_1"),
+      e("agent.message", { content: "r1", message_id: "a1" }, "run_1"),
+      e("user.message", { content: "q2", message_id: "u2" }, "run_2"),
+      e("agent.message", { content: "r2", message_id: "a2" }, "run_2"),
+      e("user.message", { content: "q3", message_id: "u3" }, "run_3"),
+      e("agent.tool_use", { tool_call_id: "c2", name: "fetch", args: {} }, "run_3"),
+      e("agent.tool_use", { tool_call_id: "c3", name: "write", args: { path: "a" } }, "run_3"),
+      e("agent.tool_result", { tool_call_id: "c2", name: "fetch", ok: false, error: "timeout" }, "run_3"),
+      e("agent.tool_result", { tool_call_id: "c3", name: "write", ok: true }, "run_3"),
+      e("agent.message", { content: "r3", message_id: "a3" }, "run_3"),
+    ];
+  }
+  const search = { name: "search", args: { q: "x" }, ok: true, durationMs: 7 };
+  const fetchFailed = { name: "fetch", args: {}, ok: false, error: "timeout" };
+  const write = { name: "write", args: { path: "a" }, ok: true };
+  const expected = () => new Map([["a1", [search]], ["a3", [fetchFailed, write]]]);
+
+  /** The log of a host that keeps its own: camelCase, and no run (and, as asked, no message id or index). */
+  const hostLog = (options: { ids?: boolean; index?: boolean; bare?: boolean } = {}): ToolLogEvent[] => {
+    const indexOf: Record<string, number> = { a1: 1, a2: 3, a3: 5 };
+    return serverLog().map(({ runId: _run, ...event }) => {
+      const data = Object.fromEntries(
+        Object.entries(event.data).map(([key, value]) => [key.replace(/_([a-z])/g, (_m, c: string) => c.toUpperCase()), value])
+      );
+      if (event.type === "agent.message") {
+        const id = data.messageId as string;
+        delete data.messageId;
+        if (options.bare) delete data.content;
+        return { ...event, data: { ...data, ...(options.ids ? { messageId: id } : {}), ...(options.index ? { messageIndex: indexOf[id] } : {}) } };
+      }
+      if (event.type === "user.message") delete data.messageId;
+      return { ...event, data };
+    });
+  };
+
+  it("matches the calls of a run to the answer that names the run", () => {
+    expect(toolCallsByAnswer(serverLog(), history)).toEqual(expected());
+  });
+
+  it("matches calls of events without a run by the id of the answer", () => {
+    expect(toolCallsByAnswer(hostLog({ ids: true }), history)).toEqual(expected());
+  });
+
+  it("matches a host's own log (camelCase, no run, no id) by the position its answer reports", () => {
+    expect(toolCallsByAnswer(hostLog({ index: true }), history)).toEqual(expected());
+  });
+
+  it("matches a host's log by what each answer says when it reports no id and no position", () => {
+    expect(toolCallsByAnswer(hostLog(), history)).toEqual(expected());
+    // an event that was cut to its size limit
+    const cut = hostLog().map((event) => (event.type === "agent.message" && event.data.content === "r3" ? { ...event, data: { content: "r...", _truncated: true } } : event));
+    expect(toolCallsByAnswer(cut, history)).toEqual(expected());
+  });
+
+  it("matches a log that says nothing but the order, from the newest answer back", () => {
+    expect(toolCallsByAnswer(hostLog({ bare: true }), history)).toEqual(expected());
+  });
+
+  it("trusts the position over the words only while the words fit", () => {
+    // the host rewrote the text of its answers: the position it reports is all there is
+    const rewritten = history.map((m) => (m.role === "assistant" ? { ...m, content: `${m.content}!` } : m));
+    expect(toolCallsByAnswer(hostLog({ index: true }), rewritten)).toEqual(expected());
+    // the transcript was cut back: the position now points at another answer, the words at the right one
+    const shifted = [msg("x1", "user", "z"), msg("x2", "assistant", "other"), ...history];
+    expect(toolCallsByAnswer(hostLog({ index: true }), shifted)).toEqual(expected());
+  });
+
+  it("does not hand the calls of a pruned turn to another answer", () => {
+    // the log lost its oldest events: the first turn's calls are gone, the others keep their answers
+    const pruned = hostLog({ bare: true }).slice(6);
+    expect(toolCallsByAnswer(pruned, history)).toEqual(new Map([["a3", [fetchFailed, write]]]));
+    expect(toolCallsByAnswer(hostLog().slice(6), history)).toEqual(new Map([["a3", [fetchFailed, write]]]));
+    // ... and so does a log that kept an answer which has been regenerated away
+    const regenerated = history.filter((m) => m.id !== "a3").concat(msg("a3b", "assistant", "r3 again"));
+    const again = hostLog();
+    again.push({ seq: 99, type: "agent.tool_use", data: { toolCallId: "c9", name: "retry", args: {} } }, { seq: 100, type: "agent.message", data: { content: "r3 again" } });
+    expect(toolCallsByAnswer(again, regenerated)).toEqual(new Map([["a1", [search]], ["a3b", [{ name: "retry", args: {} }]]]));
+    // (the stale answer is not handed to a neighbour)
+    expect([...toolCallsByAnswer(again, regenerated).keys()]).not.toContain("a2");
+  });
+
+  it("leaves out the calls of a turn that never answered", () => {
+    const log = hostLog();
+    // a stopped turn: a call, no answer; then the next question gets its own
+    log.splice(4, 0, { seq: 50, type: "agent.tool_use", data: { toolCallId: "stray", name: "stray", args: {} } });
+    const found = toolCallsByAnswer(log, history);
+    expect(JSON.stringify([...found.values()])).not.toContain("stray");
+    expect(found.get("a1")).toEqual([search]);
+  });
+
+  it("keeps a call that was asked before a pause and answered after it", () => {
+    const log: ToolLogEvent[] = [
+      { seq: 1, type: "user.message", data: { content: "q" } },
+      { seq: 2, type: "agent.tool_use", data: { toolCallId: "c1", name: "deploy", args: { env: "x" } } },
+      { seq: 3, type: "session.status_idle", data: { stopReason: "requires_action" } },
+      { seq: 4, type: "agent.tool_result", data: { toolCallId: "c1", name: "deploy", ok: true } },
+      { seq: 5, type: "agent.message", data: { content: "done", messageIndex: 1 } },
+    ];
+    expect(toolCallsByAnswer(log, [msg("u", "user", "q"), msg("a", "assistant", "done")])).toEqual(new Map([["a", [{ name: "deploy", args: { env: "x" }, ok: true }]]]));
+  });
+
+  it("answers nothing for a log without calls, and for events of a conversation that has no such answers", () => {
+    expect(toolCallsByAnswer([], history).size).toBe(0);
+    expect(toolCallsByAnswer(hostLog({ ids: true }), [msg("u1", "user", "q")]).size).toBe(0);
   });
 });

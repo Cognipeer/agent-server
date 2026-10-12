@@ -68,6 +68,7 @@ import type {
   ListEventsResponse,
   CancelConversationResponse,
   NewConversationEvent,
+  ConversationEvent,
   TaskStatus,
   ListFilesResponse,
   AgentFilesConfig,
@@ -206,6 +207,8 @@ import {
   renderJson,
   renderMarkdown,
   resolveLabels,
+  TOOL_LOG_TYPES,
+  toolCallsByAnswer,
   type ExportFormat,
   type ExportTool,
   type Transcript,
@@ -2118,6 +2121,8 @@ export class AgentServer {
     }
 
     if (body?.budget === undefined || title !== undefined || body.metadata !== undefined || body.pinned !== undefined) {
+      // The metadata the write that went through asked the store to hold (the build runs again when somebody else got in first)
+      let wroteMetadata: Record<string, unknown> | undefined;
       // (built from the conversation as it is when the write happens, so a pin never undoes a title another request just stored)
       const done = await this.mutateConversation(conversationId, ctx.context, (fresh) => {
         let metadata = body?.metadata !== undefined ? this.clientMetadata(body.metadata, fresh.metadata) : undefined;
@@ -2136,9 +2141,10 @@ export class AgentServer {
           metadata = { ...(metadata ?? fresh.metadata ?? {}) };
           delete metadata.titleGenerated;
         }
+        wroteMetadata = metadata;
         return { title, metadata };
       });
-      conversation = done.conversation;
+      conversation = this.asWritten(done.conversation, wroteMetadata);
       if (body?.pinned !== undefined && (existing.metadata?.pinned === true) !== body.pinned) {
         await this.recordAudit(ctx, {
           action: body.pinned ? "conversation.pin" : "conversation.unpin",
@@ -2153,6 +2159,21 @@ export class AgentServer {
       status: 200,
       body: this.publicConversation(conversation, runtime, agent),
     };
+  }
+
+  /**
+   * A conversation as an update left it. A host's storage answers an update with its own idea of the record, and that can be stale: it
+   * may still carry what the update took away (a pin, after an unpin) or leave out what the update put there. The answer is the record
+   * the store returned with the `metadata` the update wrote laid over it - the store's own keys (a portal's `portalId`) stay, whatever the
+   * update wrote is what it wrote, and the server's keys (`pinned`, `pinnedAt`, `titleGenerated`) that the update did not write are gone.
+   */
+  private asWritten<T extends Conversation>(stored: T, wrote: Record<string, unknown> | undefined): T {
+    if (!wrote) return stored;
+    const metadata: Record<string, unknown> = { ...(stored.metadata ?? {}), ...wrote };
+    for (const key of SERVER_METADATA_KEYS) {
+      if (!(key in wrote)) delete metadata[key];
+    }
+    return { ...stored, metadata };
   }
 
   /** Stops a conversation's turn, tells a host agent its requests are gone, and deletes the conversation. 409 when it runs on another node. */
@@ -2437,46 +2458,23 @@ export class AgentServer {
   // Export
   // ============================================================================
 
-  /** Tool calls by the assistant message that made them, from the event log (what it still holds: a pruned or in-memory log gives fewer). */
-  private async toolCallsByMessage(conversationId: string, ctx: RouteContext): Promise<Map<string, ExportTool[]>> {
-    const byRun = new Map<string, Map<string, ExportTool & { id: string }>>();
-    const runOfMessage = new Map<string, string>();
+  /**
+   * Tool calls by the assistant message that made them, from the event log (what it still holds: a pruned or in-memory log gives fewer).
+   * Events with a run id are matched by run; a host's own log, whose events carry none, by the order they were written in
+   * (see {@link toolCallsByAnswer}).
+   */
+  private async toolCallsByMessage(conversationId: string, history: Message[], ctx: RouteContext): Promise<Map<string, ExportTool[]>> {
+    const events: ConversationEvent[] = [];
     let after = 0;
     for (let page = 0; page < 20; page++) {
-      const result = await this.eventStore.list(
-        conversationId,
-        { after, limit: 1000, types: [EVENT_TYPES.toolUse, EVENT_TYPES.toolResult, EVENT_TYPES.message] },
-        ctx.context
-      );
-      for (const event of result.events) {
-        if (!event.runId) continue;
-        const data = event.data;
-        if (event.type === EVENT_TYPES.message) {
-          if (typeof data.message_id === "string") runOfMessage.set(data.message_id, event.runId);
-          continue;
-        }
-        const id = typeof data.tool_call_id === "string" ? data.tool_call_id : `${event.seq}`;
-        const calls = byRun.get(event.runId) ?? new Map<string, ExportTool & { id: string }>();
-        byRun.set(event.runId, calls);
-        const call = calls.get(id) ?? { id, name: typeof data.name === "string" ? data.name : "tool" };
-        if (event.type === EVENT_TYPES.toolUse) {
-          if (data.args && typeof data.args === "object") call.args = data.args as Record<string, unknown>;
-        } else {
-          call.ok = data.ok !== false;
-          if (typeof data.error === "string") call.error = data.error;
-          if (typeof data.duration_ms === "number") call.durationMs = data.duration_ms;
-        }
-        calls.set(id, call);
-      }
+      const result = await this.eventStore.list(conversationId, { after, limit: 1000, types: TOOL_LOG_TYPES }, ctx.context);
+      events.push(...result.events);
       if (!result.hasMore) break;
       after = result.lastSeq;
     }
-    const out = new Map<string, ExportTool[]>();
-    for (const [messageId, runId] of runOfMessage) {
-      const calls = byRun.get(runId);
-      if (calls?.size) out.set(messageId, [...calls.values()].map(({ id: _id, ...call }) => call));
-    }
-    return out;
+    // (a store that does not order them is read in the order it was written)
+    events.sort((a, b) => a.seq - b.seq);
+    return toolCallsByAnswer(events, history);
   }
 
   /**
@@ -2520,7 +2518,8 @@ export class AgentServer {
     try {
       const configured = this.config.export?.maxMessages;
       const max = typeof configured === "number" && Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : DEFAULT_EXPORT_MAX_MESSAGES;
-      const all = exportable(await this.loadHistory(conversationId, ctx.context)).filter(
+      const history = await this.loadHistory(conversationId, ctx.context);
+      const all = exportable(history).filter(
         // (the husk a paused or stopped turn leaves behind says nothing)
         (message) => !(message.role === "assistant" && messageText(message) === "" && !message.files?.length)
       );
@@ -2530,7 +2529,7 @@ export class AgentServer {
         conversation,
         agentName: agent?.info.name ?? conversation.agentId,
         messages: truncated ? all.slice(all.length - max) : all,
-        ...(wantTools ? { tools: await this.toolCallsByMessage(conversationId, ctx) } : {}),
+        ...(wantTools ? { tools: await this.toolCallsByMessage(conversationId, history, ctx) } : {}),
         truncated,
         labels: resolveLabels(locale, this.config.export?.labels),
         exportedAt: new Date(),

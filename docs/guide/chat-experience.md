@@ -104,6 +104,10 @@ Replaces a **user** message. The new text is stored as a new user message (`meta
 
 Pin order is a property of the storage provider: the four built-in providers order pinned conversations first inside the query (`capabilities().pinnedFirst`), so paging stays correct. A [custom provider](./custom-storage.md) without it only gets the pinned conversations moved to the top of the page it returned.
 
+**The experience flags in `metadata` come from the server.** `pinned`, `pinnedAt` and `titleGenerated` are written by the server alone, through `pinned` and the title routes; what a client puts under those names in `metadata` (on create or on update) is dropped, and an update of `metadata` leaves the ones the conversation has as they are. A host that keeps conversations in its own store reports them back in the conversation's `metadata` (a pin as `pinned: true` with `pinnedAt`), and treats them as read-only.
+
+`PATCH /conversations/:id` answers the conversation **as the update left it**, not as the store happens to echo it. A host's `updateConversation` may return a record that still carries what the update took away (the pin, right after an unpin) or leaves out what it put there; the answer is the stored record with the metadata the update wrote laid over it: keys the store added itself stay, what the update wrote is what it wrote, and `pinned` / `pinnedAt` / `titleGenerated` that the update did not write are not in the answer (so is the top-level `pinned`). A later `GET` is the store's own word.
+
 ## Generated titles
 
 `titleGeneration` makes a short title after the **first answer** of a conversation that has none: at most `maxWords` words (default 6), in the language of the conversation, from the first message and the first answer. Either point it at an OpenAI-compatible endpoint, or give it a function when you have
@@ -193,6 +197,8 @@ createAgentServer({
 
 The HTML page escapes every message (nothing a person or a model wrote is ever markup) and is served with a `Content-Security-Policy` that allows no network, no frames and - with `print=1` - exactly one script, the one that opens the print dialog.
 Tool calls come from the event log (name, arguments, result status, duration; never the tool's output) and are included only when `tools=1` **and** the agent allows it. Every export reaches the [`audit` hook](./embedding.md#audit).
+
+The calls of a turn are put with its answer by the run that wrote them. A host that keeps its own log - one whose events carry **no run id** - gets the same result from the order the events were written in: the calls between a question (`user.message`) and the answer after it are that answer's. Which stored message an answer is: the one it names (`message_id`), else the one at the position it reports (`message_index`, an index into the whole transcript), else the one that says the same text (`content`), else - when it says nothing about itself - the answers are lined up with the stored ones from the newest back (a log that lost its oldest events still gives the newest answers their calls). Fields are read as `tool_call_id` or `toolCallId`, `duration_ms` or `durationMs`. An answer that matches no stored message (one that was regenerated away), and a log with more answers than the transcript has and nothing to tell them apart, show no calls rather than another answer's.
 
 ## Next Steps
 
