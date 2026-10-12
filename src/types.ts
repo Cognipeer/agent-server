@@ -211,11 +211,28 @@ export interface ContextRequest {
 // Agent Types
 // ============================================================================
 
+/** One model a caller may pick for a turn of an agent (`AgentInfo.models`). */
+export interface AgentModelOption {
+  /** What the request's `model` carries. */
+  key: string;
+  /** What a chat client shows. */
+  label: string;
+  description?: string;
+  /** The model the agent uses when a request names none. Exactly one entry has it. */
+  default: boolean;
+}
+
 export interface AgentInfo {
   id: string;
   name: string;
   description?: string;
   version?: string;
+  /**
+   * The models a caller may choose between per message. Set by the host (a console-backed agent reports the list the caller
+   * may use) or statically for a local agent. Advertise it only with two or more entries; a request's `model` has to be one of
+   * these keys (400 `model_not_allowed` otherwise).
+   */
+  models?: AgentModelOption[];
   /**
    * Host data. The server adds the keys a chat client reads to show the agent's experience (see {@link AgentInfoMetadata}):
    * `welcome` (Markdown), `starters` and `experience` - the switches for message actions, history management,
@@ -492,6 +509,8 @@ export interface ProcessMessageParams {
   mode?: TurnMode;
   /** The message `mode` started from; present with `mode`. */
   fromMessageId?: string;
+  /** The model key the caller chose (one of `AgentInfo.models`); absent when the request named none. */
+  model?: string;
   /** The files this message carries (uploaded earlier and attached by id, or sent inline - those are stored first, so every entry has a real id). */
   files?: FileAttachment[];
   state?: Record<string, unknown>;
@@ -590,6 +609,8 @@ export interface HostInvokeInput {
   mode?: TurnMode;
   /** The message `mode` started from; present with `mode`. */
   fromMessageId?: string;
+  /** The model key the caller chose (one of `AgentInfo.models`); absent when the request named none. */
+  model?: string;
   /** The conversation so far, oldest first, including this message. Hosts that keep their own transcript ignore it. */
   history: Message[];
   /** The files this message carries (every entry is a stored file with a real id). */
@@ -755,6 +776,12 @@ export interface AgentRegistration {
   pricing?: PricingFn;
   /** What a chat client shows around this agent; each field overrides the server's `experience` (see {@link AgentExperience}). */
   experience?: AgentExperience;
+  /**
+   * Called before a turn of an `sdkAgent` when the request named a model (`AgentInfo.models`), so the local runner can switch to it.
+   * Host agents and handlers get `model` in their input instead; chat-completions / Responses agents use it as the request's model.
+   * The agent instance is shared by all conversations: a hook that mutates it should serialise turns itself.
+   */
+  selectModel?: (input: { model: string; conversationId: string; context: RequestContext }) => void | Promise<void>;
   /** Title generation for this agent's conversations: its own settings, or `false` for none whatever the server says. */
   titleGeneration?: TitleGenerationConfig | false;
 }
@@ -1898,6 +1925,8 @@ export interface SendMessageRequest {
    */
   fileIds?: string[];
   metadata?: Record<string, unknown>;
+  /** The model to answer with: one of the agent's `models` keys (400 `model_not_allowed` otherwise). Default: the agent's own. */
+  model?: string;
   /**
    * Enable streaming response via Server-Sent Events (SSE)
    */
@@ -2202,6 +2231,8 @@ export interface RegenerateMessageRequest {
   stream?: boolean;
   /** Passed to the agent as the turn's `metadata`. */
   metadata?: Record<string, unknown>;
+  /** The model to answer with (see {@link SendMessageRequest.model}). */
+  model?: string;
 }
 
 /** `POST /conversations/:id/messages/:messageId/edit`: replaces a user message and re-runs the conversation from it. */
@@ -2217,6 +2248,8 @@ export interface EditMessageRequest {
   /** Files sent inline, base64 (stored first, like `POST .../messages`). */
   files?: SendMessageRequest["files"];
   metadata?: Record<string, unknown>;
+  /** The model to answer with (see {@link SendMessageRequest.model}). */
+  model?: string;
   stream?: boolean;
 }
 

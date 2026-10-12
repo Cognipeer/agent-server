@@ -27,6 +27,7 @@ export interface OpenAPISpec {
 export const ERROR_CODES: ReadonlyArray<{ code: string; status: number; meaning: string }> = [
   { code: "VALIDATION_ERROR", status: 400, meaning: "The request is malformed or breaks a limit (details.reason says which, e.g. file_too_large)" },
   { code: "INVALID_REQUEST", status: 400, meaning: "A task comment that is not valid" },
+  { code: "model_not_allowed", status: 400, meaning: "The request's model is not one of the agent's advertised models (details.allowed lists the keys)" },
   { code: "invalid_budget", status: 400, meaning: "Not a budget, or one at or below what the conversation has already spent" },
   { code: "budget_unavailable", status: 400, meaning: "The agent has no pricing, so a budget cannot be counted against" },
   { code: "invalid_approved_args", status: 400, meaning: "The edited arguments are not accepted by the tool's schema" },
@@ -130,6 +131,20 @@ function generateSchemas(): Record<string, unknown> {
             experience: { $ref: "#/components/schemas/ResolvedExperience" },
           },
         },
+        models: {
+          type: "array",
+          description: "Models a caller may choose between per message (two or more). Send the key as `model` with a message.",
+          items: {
+            type: "object",
+            properties: {
+              key: { type: "string" },
+              label: { type: "string" },
+              description: { type: "string" },
+              default: { type: "boolean" },
+            },
+            required: ["key", "label", "default"],
+          },
+        },
         capabilities: {
           type: "object",
           description: "What the agent can do.",
@@ -227,6 +242,7 @@ function generateSchemas(): Record<string, unknown> {
       properties: {
         stream: { type: "boolean", default: false, description: "Stream the new answer as SSE." },
         metadata: { type: "object", additionalProperties: true, description: "Passed to the agent as the turn's metadata." },
+        model: { type: "string", description: "One of the agent's `models` keys; 400 `model_not_allowed` otherwise. Default: the agent's own model." },
       },
     },
     EditMessageRequest: {
@@ -245,6 +261,7 @@ function generateSchemas(): Record<string, unknown> {
           },
         },
         metadata: { type: "object", additionalProperties: true },
+        model: { type: "string", description: "One of the agent's `models` keys; 400 `model_not_allowed` otherwise. Default: the agent's own model." },
         stream: { type: "boolean", default: false },
       },
     },
@@ -622,6 +639,7 @@ function generateSchemas(): Record<string, unknown> {
             "Files uploaded earlier with POST /files (conversationId set to this conversation) that this message attaches. A file that is not one of this conversation's, or that the caller did not upload, is a 404. The agent is given their contents.",
         },
         metadata: { type: "object", additionalProperties: true },
+        model: { type: "string", description: "One of the agent's `models` keys; 400 `model_not_allowed` otherwise. Default: the agent's own model." },
         stream: {
           type: "boolean",
           default: false,

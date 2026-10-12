@@ -7,6 +7,7 @@
 
 import { normalizeUsage } from "./usage.js";
 import type {
+  AgentModelOption,
   AgentRegistration,
   FileAttachment,
   HostAgentDefinition,
@@ -65,7 +66,7 @@ export function hostAgentRegistration(definition: HostAgentDefinition): AgentReg
   }
   const { info, files, hitl, budget, pricing, experience, titleGeneration } = definition;
   return {
-    info: { ...info, name: info.name || id },
+    info: { ...info, name: info.name || id, ...(info.models && { models: readModels(info.models, id) }) },
     // (called as methods of the definition, so a class instance keeps its `this`)
     host: {
       invoke: (input, io) => definition.invoke(input, io),
@@ -80,6 +81,25 @@ export function hostAgentRegistration(definition: HostAgentDefinition): AgentReg
     ...(experience && { experience }),
     ...(titleGeneration !== undefined && { titleGeneration }),
   };
+}
+
+/** Checks `AgentInfo.models` (non-empty keys, labels default to the key, exactly one default - the first when none says so). */
+export function readModels(models: unknown, agentId: string): AgentModelOption[] {
+  if (!Array.isArray(models)) throw new Error(`Agent "${agentId}": models has to be an array`);
+  const seen = new Set<string>();
+  const out = models.map((entry, i): AgentModelOption => {
+    if (!isObject(entry) || !isText(entry.key)) throw new Error(`Agent "${agentId}": models[${i}].key has to be a non-empty string`);
+    if (seen.has(entry.key)) throw new Error(`Agent "${agentId}": models[${i}].key "${entry.key}" is used twice`);
+    seen.add(entry.key);
+    return {
+      key: entry.key,
+      label: optionalText(entry.label) ?? entry.key,
+      ...(optionalText(entry.description) !== undefined && { description: entry.description as string }),
+      default: entry.default === true,
+    };
+  });
+  const first = out.findIndex((m) => m.default);
+  return out.map((m, i) => ({ ...m, default: first === -1 ? i === 0 : i === first }));
 }
 
 // ----------------------------------------------------------------------------
