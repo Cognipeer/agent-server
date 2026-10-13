@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-13
+
+### Added
+
+- **Reasoning stream.** A host agent may emit `{ type: "thinking", text }`; the server sends it as a `stream.thinking` SSE frame (`StreamThinkingEvent`, `{ thinking }`). It is live only and not part of the answer.
+- **`AgentInfo.showReasoning`** (default `true`): with `false` no `stream.thinking` frame is sent. Published by `GET /agents` and `GET /agents/:id`.
+- **`reasoningEffort`** on `POST .../messages`, `.../regenerate` and `.../edit` (`none`, `minimal`, `low`, `medium`, `high`; any other value answers 400). Forwarded as `HostInvokeInput.reasoningEffort` and `ProcessMessageParams.reasoningEffort`. New exports `ReasoningEffort`, `REASONING_EFFORTS`.
+
 ## [0.4.0] - 2026-10-12
 
 ### Added

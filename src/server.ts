@@ -41,6 +41,8 @@ import type {
   ValidationError,
   StreamStartEvent,
   StreamTextEvent,
+  StreamThinkingEvent,
+  ReasoningEffort,
   StreamToolCallEvent,
   StreamToolResultEvent,
   StreamProgressEvent,
@@ -193,7 +195,7 @@ import {
   type ImageSource,
 } from "./files/images.js";
 import { runWithTurnFiles, type TurnFiles } from "./files/turn.js";
-import { NotFoundError as NotFoundErrorClass } from "./types.js";
+import { NotFoundError as NotFoundErrorClass, REASONING_EFFORTS } from "./types.js";
 import { closedExperience, experienceMetadata, resolveExperience, type ResolveInputs } from "./experience.js";
 import { assertTitleGeneration, generateConversationTitle } from "./titles.js";
 import {
@@ -330,6 +332,13 @@ function createSdkBridge(run: ActiveRun, partial: { text: string }) {
           isFinal: false,
           seq,
         } satisfies StreamTextEvent),
+      });
+    },
+    /** A chunk of reasoning: a live frame for the starting connection; never stored, never part of the answer. */
+    onThinking: (thinking: string) => {
+      if (thinking === "") return;
+      run.emit({
+        frame: (seq) => ({ type: "stream.thinking", timestamp: Date.now(), thinking, seq } satisfies StreamThinkingEvent),
       });
     },
     onEvent: (event: { type: string; [key: string]: unknown }) => {
@@ -1312,6 +1321,7 @@ export class AgentServer {
         description: info?.description,
         metadata: info?.metadata,
         ...(info?.models && { models: info.models }),
+        ...(info?.showReasoning !== undefined && { showReasoning: info.showReasoning }),
         ...(capabilities && { capabilities }),
       },
       sdkAgent: agent,
@@ -3172,6 +3182,19 @@ export class AgentServer {
     return raw;
   }
 
+  /** The reasoning effort a request names. `undefined` when it names none; 400 for anything but `none`, `minimal`, `low`, `medium`, `high`. */
+  private requestedReasoningEffort(raw: unknown): ReasoningEffort | undefined {
+    if (raw === undefined || raw === null || raw === "") return undefined;
+    if (typeof raw !== "string" || !REASONING_EFFORTS.includes(raw as ReasoningEffort)) {
+      throw {
+        statusCode: 400,
+        code: "VALIDATION_ERROR",
+        message: `reasoningEffort has to be one of ${REASONING_EFFORTS.join(", ")}`,
+      } as ValidationError;
+    }
+    return raw as ReasoningEffort;
+  }
+
   private async handleSendMessage(
     ctx: RouteContext
   ): Promise<RouteResult<SendMessageResponse>> {
@@ -3212,6 +3235,7 @@ export class AgentServer {
     const { agent } = loaded;
     let { conversation } = loaded;
     const model = this.requestedModel(agent, body.model);
+    const reasoningEffort = this.requestedReasoningEffort(body.reasoningEffort);
 
     // Work that costs something is the host's to limit (429 rate_limited)
     const release = await this.admit(ctx, { operation: "message.send", conversationId, agentId: conversation.agentId, streaming });
@@ -3245,7 +3269,7 @@ export class AgentServer {
     }
 
     const stream = streaming ? this.attachStream(run) : undefined;
-    this.launch(run, ctx, () => this.executeMessage(run, { ctx, conversation, agent, body: { ...body, model }, attachments, budget }));
+    this.launch(run, ctx, () => this.executeMessage(run, { ctx, conversation, agent, body: { ...body, model, reasoningEffort }, attachments, budget }));
     void run.done.then(release, release);
     if (stream) return { status: 200, headers: SSE_HEADERS, stream: stream.generator, close: stream.close };
 
@@ -3405,6 +3429,7 @@ export class AgentServer {
     const loaded = await this.loadForTurn(conversationId, ctx);
     this.assertExperience(loaded.agent, "messageActions", "regenerate", "Regenerating an answer");
     const model = this.requestedModel(loaded.agent, body.model);
+    const reasoningEffort = this.requestedReasoningEffort(body.reasoningEffort);
     return this.runMessageVariant(ctx, {
       operation: "message.regenerate",
       loaded,
@@ -3414,7 +3439,7 @@ export class AgentServer {
         const variant = await this.regenerationVariant(conversationId, messageId, ctx);
         return {
           variant,
-          body: { message: messageText(variant.user), metadata: body.metadata, stream: !!body.stream, model },
+          body: { message: messageText(variant.user), metadata: body.metadata, stream: !!body.stream, model, reasoningEffort },
         };
       },
     });
@@ -3431,6 +3456,7 @@ export class AgentServer {
     const loaded = await this.loadForTurn(conversationId, ctx);
     this.assertExperience(loaded.agent, "messageActions", "edit", "Editing a message");
     const model = this.requestedModel(loaded.agent, body.model);
+    const reasoningEffort = this.requestedReasoningEffort(body.reasoningEffort);
 
     // The message has to be the person's own, and be there before the files of the edit are looked at
     const target = await this.messageOf(conversationId, messageId, ctx);
@@ -3453,7 +3479,7 @@ export class AgentServer {
         const after = await this.messagesAfter(conversationId, current.id, ctx);
         return {
           variant: { mode: "edit", fromMessageId: current.id, remove: [current, ...after], previousUser: current },
-          body: { message: text, metadata: body.metadata, stream: !!body.stream, model },
+          body: { message: text, metadata: body.metadata, stream: !!body.stream, model, reasoningEffort },
           attachments,
         };
       },
@@ -3852,6 +3878,7 @@ export class AgentServer {
                 message: body.message,
                 ...turnMode,
                 ...(body.model && { model: body.model }),
+                ...(body.reasoningEffort && { reasoningEffort: body.reasoningEffort }),
                 history,
                 files: files ?? [],
                 metadata: x.handlerMetadata ?? body.metadata,
@@ -3879,6 +3906,7 @@ export class AgentServer {
           message: body.message,
           ...turnMode,
           ...(body.model && { model: body.model }),
+          ...(body.reasoningEffort && { reasoningEffort: body.reasoningEffort }),
           files,
           state: conversation.state,
           metadata: x.handlerMetadata ?? body.metadata,
@@ -3999,6 +4027,9 @@ export class AgentServer {
         switch (event.type) {
           case "text":
             if (event.text !== "") bridge.onStream({ text: event.text });
+            break;
+          case "thinking":
+            if (agent.info.showReasoning !== false) bridge.onThinking(event.text);
             break;
           case "tool_use":
             toolNames.set(event.id, event.name);

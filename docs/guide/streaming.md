@@ -74,6 +74,19 @@ interface StreamTextEvent {
 }
 ```
 
+### stream.thinking
+
+```ts
+interface StreamThinkingEvent {
+  type: 'stream.thinking';
+  thinking: string;
+  timestamp: number;
+  seq?: number;
+}
+```
+
+A chunk of the model's reasoning, sent only when the agent reports it and `AgentInfo.showReasoning` is not `false`. Show it apart from the answer.
+
 ### stream.tool_call / stream.tool_result
 
 ```typescript

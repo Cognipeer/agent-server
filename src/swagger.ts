@@ -131,6 +131,7 @@ function generateSchemas(): Record<string, unknown> {
             experience: { $ref: "#/components/schemas/ResolvedExperience" },
           },
         },
+        showReasoning: { type: "boolean", description: "Whether the agent's reasoning text is shown (default true). With false the server sends no `stream.thinking` frames." },
         models: {
           type: "array",
           description: "Models a caller may choose between per message (two or more). Send the key as `model` with a message.",
@@ -243,6 +244,7 @@ function generateSchemas(): Record<string, unknown> {
         stream: { type: "boolean", default: false, description: "Stream the new answer as SSE." },
         metadata: { type: "object", additionalProperties: true, description: "Passed to the agent as the turn's metadata." },
         model: { type: "string", description: "One of the agent's `models` keys; 400 `model_not_allowed` otherwise. Default: the agent's own model." },
+        reasoningEffort: { type: "string", enum: ["none", "minimal", "low", "medium", "high"], description: "How hard the model may think. 400 for any other value. Default: the agent's own setting." },
       },
     },
     EditMessageRequest: {
@@ -262,6 +264,7 @@ function generateSchemas(): Record<string, unknown> {
         },
         metadata: { type: "object", additionalProperties: true },
         model: { type: "string", description: "One of the agent's `models` keys; 400 `model_not_allowed` otherwise. Default: the agent's own model." },
+        reasoningEffort: { type: "string", enum: ["none", "minimal", "low", "medium", "high"], description: "How hard the model may think. 400 for any other value. Default: the agent's own setting." },
         stream: { type: "boolean", default: false },
       },
     },
@@ -640,6 +643,7 @@ function generateSchemas(): Record<string, unknown> {
         },
         metadata: { type: "object", additionalProperties: true },
         model: { type: "string", description: "One of the agent's `models` keys; 400 `model_not_allowed` otherwise. Default: the agent's own model." },
+        reasoningEffort: { type: "string", enum: ["none", "minimal", "low", "medium", "high"], description: "How hard the model may think. 400 for any other value. Default: the agent's own setting." },
         stream: {
           type: "boolean",
           default: false,
@@ -907,6 +911,16 @@ function generateSchemas(): Record<string, unknown> {
         seq: { type: "integer", description: "Event-log cursor at this frame; resume with GET /conversations/{id}/events/stream?after=<seq>." },
         text: { type: "string" },
         isFinal: { type: "boolean" },
+      },
+    },
+    StreamThinkingEvent: {
+      type: "object",
+      description: "A chunk of the model's reasoning. Not part of the answer; not sent when the agent's `showReasoning` is false.",
+      properties: {
+        type: { type: "string", enum: ["stream.thinking"] },
+        timestamp: { type: "integer" },
+        seq: { type: "integer", description: "Event-log cursor at this frame." },
+        thinking: { type: "string" },
       },
     },
     StreamToolCallEvent: {
