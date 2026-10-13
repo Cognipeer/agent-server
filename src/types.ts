@@ -211,6 +211,12 @@ export interface ContextRequest {
 // Agent Types
 // ============================================================================
 
+/** How hard the model may think, as a request names it (`reasoningEffort`). */
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high";
+
+/** The values a request's `reasoningEffort` may take. */
+export const REASONING_EFFORTS: readonly ReasoningEffort[] = ["none", "minimal", "low", "medium", "high"];
+
 /** One model a caller may pick for a turn of an agent (`AgentInfo.models`). */
 export interface AgentModelOption {
   /** What the request's `model` carries. */
@@ -233,6 +239,11 @@ export interface AgentInfo {
    * these keys (400 `model_not_allowed` otherwise).
    */
   models?: AgentModelOption[];
+  /**
+   * Whether the agent's reasoning text is shown to callers (default `true`). With `false` the server sends no `stream.thinking`
+   * frames; chat clients also hide a reasoning block they already hold. Token accounting is not affected.
+   */
+  showReasoning?: boolean;
   /**
    * Host data. The server adds the keys a chat client reads to show the agent's experience (see {@link AgentInfoMetadata}):
    * `welcome` (Markdown), `starters` and `experience` - the switches for message actions, history management,
@@ -511,6 +522,8 @@ export interface ProcessMessageParams {
   fromMessageId?: string;
   /** The model key the caller chose (one of `AgentInfo.models`); absent when the request named none. */
   model?: string;
+  /** The reasoning effort the caller asked for; absent when the request named none. */
+  reasoningEffort?: ReasoningEffort;
   /** The files this message carries (uploaded earlier and attached by id, or sent inline - those are stored first, so every entry has a real id). */
   files?: FileAttachment[];
   state?: Record<string, unknown>;
@@ -558,6 +571,7 @@ export interface ProcessMessageResult {
  * and `stream.*` frames an agent-sdk agent produces, so clients cannot tell the difference.
  *
  *  - `text`: a chunk of the answer. The chunks are the answer when `content` is left empty.
+ *  - `thinking`: a chunk of the model's reasoning. Sent as `stream.thinking` unless `AgentInfo.showReasoning` is `false`; never part of the answer.
  *  - `tool_use` / `tool_result`: a tool call started / ended. Pair them by `id`.
  *  - `action_required`: the turn waits on these. Same as returning them as `pendingActions` (the result wins when it
  *    has any); the pause is stored first and announced when the turn ends.
@@ -566,6 +580,7 @@ export interface ProcessMessageResult {
  */
 export type HostEvent =
   | { type: "text"; text: string }
+  | { type: "thinking"; text: string }
   | { type: "tool_use"; id: string; name: string; args?: Record<string, unknown> }
   | { type: "tool_result"; id: string; name?: string; result?: unknown; error?: string }
   | { type: "action_required"; actions: PendingAction[] }
@@ -611,6 +626,8 @@ export interface HostInvokeInput {
   fromMessageId?: string;
   /** The model key the caller chose (one of `AgentInfo.models`); absent when the request named none. */
   model?: string;
+  /** The reasoning effort the caller asked for (`none`, `minimal`, `low`, `medium`, `high`); absent when the request named none. */
+  reasoningEffort?: ReasoningEffort;
   /** The conversation so far, oldest first, including this message. Hosts that keep their own transcript ignore it. */
   history: Message[];
   /** The files this message carries (every entry is a stored file with a real id). */
@@ -1927,6 +1944,8 @@ export interface SendMessageRequest {
   metadata?: Record<string, unknown>;
   /** The model to answer with: one of the agent's `models` keys (400 `model_not_allowed` otherwise). Default: the agent's own. */
   model?: string;
+  /** How hard the model may think: `none`, `minimal`, `low`, `medium` or `high` (400 otherwise). Default: the agent's own setting. */
+  reasoningEffort?: ReasoningEffort;
   /**
    * Enable streaming response via Server-Sent Events (SSE)
    */
@@ -2009,6 +2028,14 @@ export interface StreamTextEvent extends StreamEventBase {
   type: "stream.text";
   text: string;
   isFinal?: boolean;
+}
+
+/**
+ * Reasoning chunk - the model's thinking so far. Not part of the answer; not sent when `AgentInfo.showReasoning` is `false`.
+ */
+export interface StreamThinkingEvent extends StreamEventBase {
+  type: "stream.thinking";
+  thinking: string;
 }
 
 /**
@@ -2106,6 +2133,7 @@ export interface StreamActionResolvedEvent extends StreamEventBase {
 export type StreamEvent =
   | StreamStartEvent
   | StreamTextEvent
+  | StreamThinkingEvent
   | StreamToolCallEvent
   | StreamToolResultEvent
   | StreamProgressEvent
@@ -2233,6 +2261,8 @@ export interface RegenerateMessageRequest {
   metadata?: Record<string, unknown>;
   /** The model to answer with (see {@link SendMessageRequest.model}). */
   model?: string;
+  /** See {@link SendMessageRequest.reasoningEffort}. */
+  reasoningEffort?: ReasoningEffort;
 }
 
 /** `POST /conversations/:id/messages/:messageId/edit`: replaces a user message and re-runs the conversation from it. */
@@ -2250,6 +2280,8 @@ export interface EditMessageRequest {
   metadata?: Record<string, unknown>;
   /** The model to answer with (see {@link SendMessageRequest.model}). */
   model?: string;
+  /** See {@link SendMessageRequest.reasoningEffort}. */
+  reasoningEffort?: ReasoningEffort;
   stream?: boolean;
 }
 

@@ -378,6 +378,12 @@ server.registerSDKAgent("support", agent, {
 - Host agents get it as `HostInvokeInput.model`, custom handlers as `ProcessMessageParams.model`, Chat Completions / Responses agents use it as the request's model, and SDK agents get the `selectModel` hook. A request without `model` leaves all of these unset (the agent's own model runs).
 - The answer's `metadata.model` holds the key it came from (the requested one, else the advertised default), for "answered with" footers.
 
+## Reasoning
+
+- **Stream.** A host agent reports the model's reasoning with `emit({ type: "thinking", text })`. The server sends it as `stream.thinking` frames (`{ thinking }`) next to `stream.text`. It is live only and never part of the stored answer.
+- **Hiding it.** `AgentInfo.showReasoning` (default `true`, also published by `GET /agents`): with `false` no `stream.thinking` frame is sent. Token accounting is unaffected.
+- **Effort.** `POST .../messages`, `.../regenerate` and `.../edit` accept `reasoningEffort` (`none`, `minimal`, `low`, `medium`, `high`; 400 otherwise). Host agents get it as `HostInvokeInput.reasoningEffort`, custom handlers as `ProcessMessageParams.reasoningEffort`. A request without it leaves both unset.
+
 ## Request Context & Dynamic Agents
 
 Resolve who is calling (and anything else your host knows, e.g. tenant) once per

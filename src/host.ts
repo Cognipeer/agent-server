@@ -245,6 +245,9 @@ export function readHostEvent(raw: unknown): Checked<HostEvent> {
     case "text":
       if (typeof raw.text !== "string") return fail("text.text must be a string");
       return { ok: true, value: { type: "text", text: raw.text } };
+    case "thinking":
+      if (typeof raw.text !== "string") return fail("thinking.text must be a string");
+      return { ok: true, value: { type: "thinking", text: raw.text } };
     case "tool_use":
       if (!isText(raw.id) || !isText(raw.name)) return fail("tool_use needs an id and a name");
       if (raw.args !== undefined && !isObject(raw.args)) return fail("tool_use.args must be an object");

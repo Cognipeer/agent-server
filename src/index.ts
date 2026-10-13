@@ -188,6 +188,8 @@ export type {
   StreamEventBase,
   StreamStartEvent,
   StreamTextEvent,
+  StreamThinkingEvent,
+  ReasoningEffort,
   StreamToolCallEvent,
   StreamToolResultEvent,
   StreamProgressEvent,
@@ -198,7 +200,7 @@ export type {
 } from "./types.js";
 
 // Constants of the chat experience
-export { DEFAULT_FEEDBACK_REASONS, MAX_STARTERS } from "./types.js";
+export { DEFAULT_FEEDBACK_REASONS, MAX_STARTERS, REASONING_EFFORTS } from "./types.js";
 
 // Error exports
 export {
