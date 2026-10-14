@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-14
+
+### Added
+
+- **Conversation search.** `GET /conversations?q=<text>` finds conversations by title and message text (user and assistant text parts), case-insensitive and literal, newest activity first, within the same user / agent scope as the plain list (`limit`, `offset`, `agentId`, `userId` as before; pinned-first does not apply). `q` is trimmed: under 2 characters is no search, over 200 answers 400 `invalid_request`. Each hit may carry `searchMatch` (`{ field: "title" | "message", messageId?, role?, snippet }`, snippet at most 160 characters) and the response says `searchMode` (`full` | `title`).
+- **`StorageCapabilities.search` / `GetConversationsParams.search`**, implemented by the memory, SQLite, PostgreSQL and MongoDB providers. A custom provider without it gets a title-only search over the caller's 500 most recently updated conversations (`searchMode: "title"`).
+- **`GET /agents` publishes `features.conversationSearch`** (`"full"` | `"title"`), so a client can tell what it has. New exports `ConversationSearchMatch`, `ServerFeatures`.
+
 ## [0.6.0] - 2026-10-14
 
 ### Added

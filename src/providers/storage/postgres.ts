@@ -5,7 +5,7 @@
 import { BaseStorageProvider, type EventQuery, type StoredEventInput } from "./base.js";
 import { NotFoundError, ValidationError } from "../../types.js";
 import { nextStopReason } from "../../events.js";
-import { MAX_BUFFER_BYTES, pageResult } from "./shared.js";
+import { MAX_BUFFER_BYTES, buildSearchMatch, escapeLike, pageResult, searchTerm } from "./shared.js";
 import type {
   AcquireLeaseParams,
   AcquireLeaseResult,
@@ -210,6 +210,7 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       fileIndex: true,
       actionDeadlines: true,
       pinnedFirst: true,
+      search: true,
     };
   }
 
@@ -640,6 +641,15 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       values.push(params.actionDueBefore);
     }
 
+    // Search: the title or the text of a user / assistant message contains the text (literal, case-insensitive)
+    const needle = searchTerm(params.search);
+    const pattern = needle ? `%${escapeLike(needle)}%` : undefined;
+    if (pattern) {
+      const p = `$${paramIndex++}`;
+      conditions.push(`(title ILIKE ${p} ESCAPE '\\' OR EXISTS (SELECT 1 FROM ${this.tables.messages} m WHERE m.conversation_id = ${this.tables.conversations}.id AND ${this.messageTextMatch("m", p)}))`);
+      values.push(pattern);
+    }
+
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
     // Get total count
@@ -652,7 +662,9 @@ export class PostgresStorageProvider extends BaseStorageProvider {
     // Get paginated results; the insertion sequence breaks ties between rows created in one millisecond
     // `pinnedFirst`: conversations with metadata.pinned === true lead, each group in the requested order
     const pinned = params.pinnedFirst ? `CASE WHEN metadata @> '{"pinned": true}'::jsonb THEN 0 ELSE 1 END, ` : "";
-    const ordering = params.actionDueBefore ? "action_due_at ASC, seq ASC" : `${pinned}${orderBy} ${order}, seq ${order}`;
+    const ordering = pattern
+      ? "updated_at DESC, seq DESC"
+      : params.actionDueBefore ? "action_due_at ASC, seq ASC" : `${pinned}${orderBy} ${order}, seq ${order}`;
     const result = await this.pool.query<DbConversation>(
       `SELECT * FROM ${this.tables.conversations}
        ${whereClause}
@@ -661,12 +673,35 @@ export class PostgresStorageProvider extends BaseStorageProvider {
       [...values, normalized.limit, normalized.offset]
     );
 
-    return pageResult(
-      result.rows.map((row) => this.mapConversation(row)),
-      total,
-      normalized.limit,
-      normalized.offset
-    );
+    const data = result.rows.map((row) => this.mapConversation(row));
+    if (needle && pattern && data.length > 0) {
+      // Where each one matched: its title, else its first matching message
+      const found = await this.pool.query<DbMessage>(
+        `SELECT DISTINCT ON (m.conversation_id) m.* FROM ${this.tables.messages} m
+         WHERE m.conversation_id = ANY($1) AND ${this.messageTextMatch("m", "$2")}
+         ORDER BY m.conversation_id, m.created_at ASC, m.id ASC`,
+        [data.map((c) => c.id), pattern]
+      );
+      const firstMessage = new Map(found.rows.map((row) => [row.conversation_id, this.mapMessage(row)]));
+      for (const conversation of data) {
+        const searchMatch = buildSearchMatch(conversation.title, needle, firstMessage.get(conversation.id));
+        if (searchMatch) conversation.searchMatch = searchMatch;
+      }
+    }
+
+    return pageResult(data, total, normalized.limit, normalized.offset);
+  }
+
+  /**
+   * SQL that is true when a user / assistant message `alias` has text matching the `ILIKE` pattern in the
+   * placeholder `p`: a string content, or a `text` part of a content array.
+   */
+  private messageTextMatch(alias: string, p: string): string {
+    return `(${alias}.role IN ('user', 'assistant') AND (
+      (jsonb_typeof(${alias}.content) = 'string' AND (${alias}.content #>> '{}') ILIKE ${p} ESCAPE '\\')
+      OR (jsonb_typeof(${alias}.content) = 'array' AND EXISTS (
+        SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(${alias}.content) = 'array' THEN ${alias}.content ELSE '[]'::jsonb END) e
+        WHERE e->>'type' = 'text' AND e->>'text' ILIKE ${p} ESCAPE '\\'))))`;
   }
 
   protected async _updateConversation(

@@ -77,6 +77,7 @@ GET /conversations
 | offset | number | Pagination offset (default: 0) |
 | orderBy | string | `createdAt` (default) or `updatedAt` (last activity) |
 | order | string | `desc` (default, newest first) or `asc` |
+| q | string | Search the titles and message text (case-insensitive, literal), newest activity first; `orderBy`, `order` and `pinned` do not apply. Trimmed: under 2 characters is no search, over 200 answers `400 invalid_request` |
 | pinned | string | `first` (default): [pinned](#update-conversation) conversations lead, each group in the requested order, across pages. `none`: by time alone |
 
 **Response:**
@@ -98,6 +99,8 @@ GET /conversations
   "hasMore": true
 }
 ```
+
+With `q`, a hit may carry `searchMatch` (`{ "field": "title" | "message", "messageId"?, "role"?, "snippet" }`; the snippet is plain text of at most 160 characters around the first match) and the response says `"searchMode": "full"` (titles and messages) or `"title"` (the storage cannot search messages: the titles of the 500 most recently updated conversations are filtered). `GET /agents` publishes `features.conversationSearch` (`"full"` | `"title"`).
 
 `runtime` says whether the conversation is running, waiting for a human or idle, and why its last turn stopped - see [Runs, Cancel & Reattach](../guide/runs). `continuable` (next to it, in `GET /conversations/:id` too) says whether a turn the [budget](../guide/budgets) cut short waits for `POST /conversations/:id/continue`.
 

@@ -120,6 +120,18 @@ export interface Conversation {
    * (raising the budget then only reopens the conversation). While the budget is still used up, `continue` answers 402.
    */
   continuable?: boolean;
+  /** Present only in a search response (`GET /conversations?q=`): where the text was found. */
+  searchMatch?: ConversationSearchMatch;
+}
+
+/** Where a conversation search found its text: the title, or one message (the first that matches). */
+export interface ConversationSearchMatch {
+  field: "title" | "message";
+  /** `field: "message"`: the matching message. */
+  messageId?: string;
+  role?: "user" | "assistant";
+  /** Plain text, at most 160 characters: a window around the first match, whitespace collapsed, `…` where it was cut. */
+  snippet: string;
 }
 
 /** Why a turn stopped. Stored on the assistant message (`metadata.stopReason`) and in `session.status_idle` events. */
@@ -1066,6 +1078,11 @@ export interface StorageCapabilities {
    * in the requested order), across pages. Without it the server can only move pinned conversations to the top of the page it got.
    */
   pinnedFirst?: boolean;
+  /**
+   * `getConversations({ search })` finds text in conversation titles and message text. Without it the server searches
+   * titles only, over the 500 most recently updated conversations of the caller (`searchMode: "title"`).
+   */
+  search?: boolean;
 }
 
 export interface CreateConversationParams {
@@ -1090,6 +1107,12 @@ export interface GetConversationsParams {
   actionDueBefore?: Date;
   /** Conversations whose `metadata.pinned` is `true` first, then the rest; `orderBy` / `order` apply within each group. Needs `capabilities().pinnedFirst`. */
   pinnedFirst?: boolean;
+  /**
+   * Only conversations whose title or message text contains this text (case-insensitive, literal), most recently
+   * updated first (`orderBy` / `order` / `pinnedFirst` are ignored). Each result carries `searchMatch` when the provider
+   * can tell where. Needs `capabilities().search`.
+   */
+  search?: string;
 }
 
 export interface UpdateConversationParams {
@@ -2144,6 +2167,13 @@ export type StreamEvent =
 
 export interface ListAgentsResponse {
   agents: AgentInfo[];
+  /** What the server can do beyond the agents themselves, so a client can adapt its UI. */
+  features?: ServerFeatures;
+}
+
+export interface ServerFeatures {
+  /** `GET /conversations?q=`: `full` searches titles and message text, `title` titles only, `false` not at all. */
+  conversationSearch: "full" | "title" | false;
 }
 
 export interface ListConversationsResponse {
@@ -2152,6 +2182,8 @@ export interface ListConversationsResponse {
   limit: number;
   offset: number;
   hasMore: boolean;
+  /** Present when the request had `q`: `full` (title and message text) or `title` (the storage cannot search messages). */
+  searchMode?: "full" | "title";
 }
 
 /** Where a page of `GET /conversations/:id` messages sits in the conversation. */

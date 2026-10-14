@@ -267,6 +267,9 @@ export abstract class BaseStorageProvider implements StorageProvider {
     if (params?.actionDueBefore !== undefined && !validDate(params.actionDueBefore)) {
       throw new ValidationError("actionDueBefore must be a valid Date");
     }
+    if (params?.search !== undefined && typeof params.search !== "string") {
+      throw new ValidationError("search must be a string");
+    }
     const result = await this._getConversations(params, ctx);
     return { ...result, data: result.data.map(normalizeConversation) };
   }
@@ -713,6 +716,7 @@ function normalizeConversation(c: Conversation): Conversation {
     updatedAt: c.updatedAt,
     version: typeof c.version === "number" ? c.version : undefined,
     actionDueAt: c.actionDueAt ? new Date(c.actionDueAt) : undefined,
+    ...(c.searchMatch ? { searchMatch: c.searchMatch } : {}),
   };
 }
 
