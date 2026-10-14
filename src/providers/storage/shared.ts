@@ -5,7 +5,7 @@
 
 import { Buffer, constants } from "node:buffer";
 import { StorageLimitError } from "../../types.js";
-import type { PaginatedResult, TaskComment } from "../../types.js";
+import type { ConversationSearchMatch, PaginatedResult, TaskComment } from "../../types.js";
 
 /** Largest `Buffer` Node can hold; the file API passes whole files as one Buffer. */
 export const MAX_BUFFER_BYTES = constants.MAX_LENGTH;
@@ -75,3 +75,66 @@ export function reviveComments(comments: TaskComment[] | undefined): TaskComment
 /** `undefined` for `null` / empty-string columns, which every provider stores differently. */
 export const optional = <T>(value: T | null | undefined): T | undefined =>
   value === null || value === undefined || (value as unknown) === "" ? undefined : value;
+
+// ---- conversation search ----
+
+/** Longest `searchMatch.snippet`. */
+export const SNIPPET_MAX = 160;
+
+/** The text of `getConversations({ search })` once trimmed; `undefined` when there is nothing to look for. */
+export const searchTerm = (search: string | undefined): string | undefined => search?.trim() || undefined;
+
+/** `text` for a `LIKE` pattern that must match it literally (with `ESCAPE '\'`). */
+export const escapeLike = (text: string): string => text.replace(/[\\%_]/g, "\\$&");
+
+/** `text` for a regular expression that must match it literally. */
+export const escapeRegex = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** The text a person sees in a message: a string as is, otherwise its `text` parts joined by a space. */
+export function messageSearchText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const part of content) {
+    const p = part as { type?: unknown; text?: unknown } | null;
+    if (p && p.type === "text" && typeof p.text === "string") parts.push(p.text);
+  }
+  return parts.join(" ");
+}
+
+const collapse = (text: string): string => text.replace(/\s+/g, " ").trim();
+
+/**
+ * A window of at most {@link SNIPPET_MAX} characters around the first (case-insensitive) occurrence of `needle` in `text`,
+ * whitespace collapsed, `…` at a cut end. `undefined` when `text` does not contain it.
+ */
+export function searchSnippet(text: string, needle: string): string | undefined {
+  const flat = collapse(text);
+  const target = collapse(needle);
+  const hit = target ? new RegExp(escapeRegex(target), "i").exec(flat) : null;
+  if (!hit) return undefined;
+  if (flat.length <= SNIPPET_MAX) return flat;
+  const start = Math.max(0, hit.index - 40);
+  const end = Math.min(flat.length, start + SNIPPET_MAX);
+  const pre = start > 0 ? "…" : "";
+  let body = flat.slice(start, end);
+  let cut = end < flat.length;
+  if (pre.length + body.length + (cut ? 1 : 0) > SNIPPET_MAX) {
+    body = body.slice(0, SNIPPET_MAX - pre.length - 1);
+    cut = true;
+  }
+  return `${pre}${body}${cut ? "…" : ""}`;
+}
+
+/** Where a conversation matched: its title first, else the given (first matching) message. */
+export function buildSearchMatch(
+  title: string | undefined,
+  needle: string,
+  message?: { id: string; role: string; content: unknown }
+): ConversationSearchMatch | undefined {
+  const inTitle = title ? searchSnippet(title, needle) : undefined;
+  if (inTitle) return { field: "title", snippet: inTitle };
+  if (!message || (message.role !== "user" && message.role !== "assistant")) return undefined;
+  const snippet = searchSnippet(messageSearchText(message.content), needle);
+  return snippet ? { field: "message", messageId: message.id, role: message.role, snippet } : undefined;
+}

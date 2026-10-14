@@ -8,7 +8,7 @@
 import { BaseStorageProvider, type EventQuery, type StoredEventInput } from "./base.js";
 import { NotFoundError } from "../../types.js";
 import { nextStopReason } from "../../events.js";
-import { MAX_BUFFER_BYTES, pageResult, toBuffer } from "./shared.js";
+import { MAX_BUFFER_BYTES, buildSearchMatch, escapeLike, pageResult, searchTerm, toBuffer } from "./shared.js";
 import type {
   AcquireLeaseParams,
   AcquireLeaseResult,
@@ -128,6 +128,7 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       atomicUpdate: true,
       events: true,
       leases: true,
+      search: true,
       fileIndex: true,
       actionDeadlines: true,
       pinnedFirst: true,
@@ -462,6 +463,14 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
       values.push(params.actionDueBefore.toISOString());
     }
 
+    // Search: the title or the text of a user / assistant message contains the text (literal, ASCII case-insensitive)
+    const needle = searchTerm(params.search);
+    const pattern = needle ? `%${escapeLike(needle)}%` : undefined;
+    if (pattern) {
+      conditions.push(`(title LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM ${this.tables.messages} m WHERE m.conversation_id = ${this.tables.conversations}.id AND ${this.messageTextMatch("m")}))`);
+      values.push(pattern, pattern, pattern);
+    }
+
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
     const countRow = this.db.prepare(
@@ -472,16 +481,44 @@ export class SQLiteStorageProvider extends BaseStorageProvider {
     // Insertion order (rowid) breaks ties between rows created in the same millisecond
     // `pinnedFirst`: conversations with metadata.pinned === true lead, each group in the requested order
     const pinned = params.pinnedFirst ? "CASE WHEN json_extract(metadata, '$.pinned') = 1 THEN 0 ELSE 1 END, " : "";
-    const ordering = params.actionDueBefore
-      ? "action_due_at ASC, rowid ASC"
-      : `${pinned}${orderBy} ${order}, rowid ${order}`;
+    const ordering = pattern
+      ? "updated_at DESC, rowid DESC"
+      : params.actionDueBefore
+        ? "action_due_at ASC, rowid ASC"
+        : `${pinned}${orderBy} ${order}, rowid ${order}`;
     const rows = this.db.prepare(
       `SELECT * FROM ${this.tables.conversations} ${whereClause}
        ORDER BY ${ordering}
        LIMIT ? OFFSET ?`
     ).all(...values, normalized.limit, normalized.offset) as DbConversation[];
 
-    return pageResult(rows.map((row) => this.mapConversation(row)), total, normalized.limit, normalized.offset);
+    const data = rows.map((row) => this.mapConversation(row));
+    if (needle && pattern) {
+      // Where each one matched: its title, else its first matching message
+      const first = this.db.prepare(
+        `SELECT * FROM ${this.tables.messages} m WHERE m.conversation_id = ? AND ${this.messageTextMatch("m")}
+         ORDER BY m.created_at ASC, m.rowid ASC LIMIT 1`
+      );
+      for (const conversation of data) {
+        const row = first.get(conversation.id, pattern, pattern) as DbMessage | undefined;
+        const searchMatch = buildSearchMatch(conversation.title, needle, row ? this.mapMessage(row) : undefined);
+        if (searchMatch) conversation.searchMatch = searchMatch;
+      }
+    }
+
+    return pageResult(data, total, normalized.limit, normalized.offset);
+  }
+
+  /**
+   * SQL that is true when a user / assistant message `alias` has text containing the `LIKE` pattern
+   * (two `?`: a string content, a `text` part of a content array).
+   */
+  private messageTextMatch(alias: string): string {
+    return `(${alias}.role IN ('user', 'assistant') AND (
+      (json_type(${alias}.content) = 'text' AND json_extract(${alias}.content, '$') LIKE ? ESCAPE '\\')
+      OR (json_type(${alias}.content) = 'array' AND EXISTS (
+        SELECT 1 FROM json_each(${alias}.content) j
+        WHERE json_extract(j.value, '$.type') = 'text' AND json_extract(j.value, '$.text') LIKE ? ESCAPE '\\'))))`;
   }
 
   protected async _updateConversation(

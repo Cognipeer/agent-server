@@ -28,6 +28,7 @@ export const ERROR_CODES: ReadonlyArray<{ code: string; status: number; meaning:
   { code: "VALIDATION_ERROR", status: 400, meaning: "The request is malformed or breaks a limit (details.reason says which, e.g. file_too_large)" },
   { code: "INVALID_REQUEST", status: 400, meaning: "A task comment that is not valid" },
   { code: "model_not_allowed", status: 400, meaning: "The request's model is not one of the agent's advertised models (details.allowed lists the keys)" },
+  { code: "invalid_request", status: 400, meaning: "The search text q of GET /conversations is longer than 200 characters" },
   { code: "invalid_budget", status: 400, meaning: "Not a budget, or one at or below what the conversation has already spent" },
   { code: "budget_unavailable", status: 400, meaning: "The agent has no pricing, so a budget cannot be counted against" },
   { code: "invalid_approved_args", status: 400, meaning: "The edited arguments are not accepted by the tool's schema" },
@@ -340,6 +341,17 @@ function generateSchemas(): Record<string, unknown> {
           type: "array",
           items: { type: "string" },
           description: "Tools the person asked not to be asked about again in this conversation (GET / DELETE .../remembered-tools).",
+        },
+        searchMatch: {
+          type: "object",
+          description: "Only in a search response (q): where the text was found.",
+          properties: {
+            field: { type: "string", enum: ["title", "message"] },
+            messageId: { type: "string", description: "field message: the first matching message." },
+            role: { type: "string", enum: ["user", "assistant"] },
+            snippet: { type: "string", maxLength: 160, description: "Plain text around the first match, whitespace collapsed, … at a cut end." },
+          },
+          required: ["field", "snippet"],
         },
         pinned: {
           type: "boolean",
@@ -873,6 +885,11 @@ function generateSchemas(): Record<string, unknown> {
         limit: { type: "integer" },
         offset: { type: "integer" },
         hasMore: { type: "boolean" },
+        searchMode: {
+          type: "string",
+          enum: ["full", "title"],
+          description: "Present when the request had q: full (titles and message text) or title (the storage cannot search messages).",
+        },
       },
       required: ["conversations", "total", "limit", "offset", "hasMore"],
     },
@@ -1232,6 +1249,17 @@ function generatePaths(
                       type: "array",
                       items: { $ref: "#/components/schemas/Agent" },
                     },
+                    features: {
+                      type: "object",
+                      description: "What the server can do beyond the agents, so a client can adapt its UI.",
+                      properties: {
+                        conversationSearch: {
+                          type: "string",
+                          enum: ["full", "title"],
+                          description: "GET /conversations?q=: full searches titles and message text, title only titles.",
+                        },
+                      },
+                    },
                   },
                 },
               },
@@ -1313,6 +1341,14 @@ function generatePaths(
             in: "query",
             description: "desc (default, newest first) or asc",
             schema: { type: "string", enum: ["asc", "desc"], default: "desc" },
+          },
+          {
+            name: "q",
+            in: "query",
+            description:
+              "Search: conversations whose title or message text contains this text (case-insensitive, literal), newest activity first; orderBy, order and pinned do not apply. " +
+              "Trimmed; under 2 characters is no search, over 200 answers 400 invalid_request. Hits carry searchMatch; searchMode says whether messages were searched (full) or only titles (title).",
+            schema: { type: "string", minLength: 2, maxLength: 200 },
           },
           {
             name: "pinned",

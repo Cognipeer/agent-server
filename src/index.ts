@@ -166,6 +166,8 @@ export type {
   WireEvent,
   CancelConversationResponse,
   ListAgentsResponse,
+  ServerFeatures,
+  ConversationSearchMatch,
   ListConversationsResponse,
   GetConversationResponse,
   MessagesPage,

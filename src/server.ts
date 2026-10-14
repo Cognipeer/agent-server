@@ -13,6 +13,7 @@ import type {
   AgentInfo,
   AuthUser,
   Conversation,
+  PaginatedResult,
   FileAttachment,
   Message,
   FileRecord,
@@ -198,6 +199,7 @@ import { runWithTurnFiles, type TurnFiles } from "./files/turn.js";
 import { NotFoundError as NotFoundErrorClass, REASONING_EFFORTS } from "./types.js";
 import { closedExperience, experienceMetadata, resolveExperience, type ResolveInputs } from "./experience.js";
 import { assertTitleGeneration, generateConversationTitle } from "./titles.js";
+import { searchSnippet } from "./providers/storage/shared.js";
 import {
   DEFAULT_EXPORT_MAX_MESSAGES,
   EXPORT_FORMATS,
@@ -670,6 +672,11 @@ interface Route {
 
 /** Page size is capped and offset floored, so a hostile query string never reaches the storage layer raw. */
 const DEFAULT_MAX_PAGE_SIZE = 200;
+/** `GET /conversations?q=`: the text to look for, in characters (shorter is no search, longer is 400). */
+const MIN_SEARCH_LENGTH = 2;
+const MAX_SEARCH_LENGTH = 200;
+/** Search without storage support: how many recent conversations' titles are looked through. */
+const FALLBACK_SEARCH_SCAN = 500;
 function parsePaging(
   query: Record<string, unknown>,
   defaultLimit: number,
@@ -1833,7 +1840,10 @@ export class AgentServer {
   private async handleListAgents(ctx: RouteContext): Promise<RouteResult<ListAgentsResponse>> {
     return {
       status: 200,
-      body: { agents: await this.getAgentsFor(ctx.context) },
+      body: {
+        agents: await this.getAgentsFor(ctx.context),
+        features: { conversationSearch: this.config.storage.capabilities?.().search === true ? "full" : "title" },
+      },
     };
   }
 
@@ -1865,6 +1875,15 @@ export class AgentServer {
     // Resolve userId: from query param, ctx.user (token), or resolveUserId callback
     const resolvedUserId = await this.listOwner(ctx, userId);
     const registry = await this.resolveRegistry(ctx.context!);
+
+    // `q`: find text in titles and messages (2..200 characters once trimmed; shorter is no search)
+    const q = typeof ctx.query.q === "string" ? ctx.query.q.trim() : "";
+    if (q.length > MAX_SEARCH_LENGTH) {
+      throw { statusCode: 400, code: "invalid_request", message: `q must be at most ${MAX_SEARCH_LENGTH} characters` };
+    }
+    if (q.length >= MIN_SEARCH_LENGTH) {
+      return this.searchConversations(ctx, q, { agentId, userId: resolvedUserId, limit, offset }, registry);
+    }
 
     // Newest created first by default; `orderBy=updatedAt` lists by last activity, `order=asc` reverses
     const orderBy = ctx.query.orderBy === "updatedAt" ? "updatedAt" : "createdAt";
@@ -1899,6 +1918,53 @@ export class AgentServer {
         limit: result.limit,
         offset: result.offset,
         hasMore: result.hasMore,
+      },
+    };
+  }
+
+  /**
+   * `GET /conversations?q=`: the storage searches titles and messages when it can (`searchMode: "full"`); otherwise the
+   * titles of the caller's {@link FALLBACK_SEARCH_SCAN} most recently updated conversations are filtered here
+   * (`searchMode: "title"`). Pinned conversations get no lead: results come by last activity.
+   */
+  private async searchConversations(
+    ctx: RouteContext,
+    q: string,
+    scope: { agentId?: string; userId?: string; limit: number; offset: number },
+    registry: Map<string, AgentRegistration>
+  ): Promise<RouteResult<ListConversationsResponse>> {
+    const { limit, offset, ...filters } = scope;
+    const full = this.config.storage.capabilities?.().search === true;
+    let page: PaginatedResult<Conversation>;
+    if (full) {
+      page = await this.config.storage.getConversations({ ...filters, search: q, limit, offset }, ctx.context);
+    } else {
+      const recent = await this.config.storage.getConversations(
+        { ...filters, limit: FALLBACK_SEARCH_SCAN, offset: 0, orderBy: "updatedAt", order: "desc" },
+        ctx.context
+      );
+      const hits: Conversation[] = [];
+      for (const conv of recent.data) {
+        const snippet = conv.title ? searchSnippet(conv.title, q) : undefined;
+        if (snippet) hits.push({ ...conv, searchMatch: { field: "title", snippet } });
+      }
+      const data = hits.slice(offset, offset + limit);
+      page = { data, total: hits.length, limit, offset, hasMore: offset + data.length < hits.length };
+    }
+
+    const runtimes = await this.runtimesFor(page.data, ctx.context);
+    return {
+      status: 200,
+      body: {
+        conversations: page.data.map((conv) => ({
+          ...this.publicConversation(conv, runtimes.get(conv.id), registry.get(conv.agentId)),
+          agentName: registry.get(conv.agentId)?.info.name,
+        })),
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+        hasMore: page.hasMore,
+        searchMode: full ? "full" : "title",
       },
     };
   }

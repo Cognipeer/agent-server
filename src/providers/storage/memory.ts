@@ -11,7 +11,7 @@
 import { BaseStorageProvider, type EventQuery, type StoredEventInput } from "./base.js";
 import { NotFoundError, StorageLimitError } from "../../types.js";
 import { MemoryEventLog } from "../../events.js";
-import { MAX_BUFFER_BYTES, pageResult } from "./shared.js";
+import { MAX_BUFFER_BYTES, buildSearchMatch, escapeRegex, messageSearchText, pageResult, searchTerm } from "./shared.js";
 import type {
   AcquireLeaseParams,
   AcquireLeaseResult,
@@ -22,6 +22,7 @@ import type {
   RenewLeaseParams,
   RequestContext,
   Conversation,
+  ConversationSearchMatch,
   Message,
   FileRecord,
   Task,
@@ -94,6 +95,7 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
       fileIndex: true,
       actionDeadlines: true,
       pinnedFirst: true,
+      search: true,
     };
   }
 
@@ -207,8 +209,26 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
       conversations = conversations.filter((c) => c.actionDueAt !== undefined && c.actionDueAt.getTime() <= before);
     }
 
-    // Sort: the conversations whose actions lapsed first when asked for those, else by time
-    if (params.actionDueBefore) {
+    // Search: the title or a user / assistant message contains the text; most recently updated first
+    const needle = searchTerm(params.search);
+    const matches = new Map<string, ConversationSearchMatch | undefined>();
+    if (needle) {
+      const found = new RegExp(escapeRegex(needle), "i");
+      conversations = conversations.filter((c) => {
+        const message = (this.messages.get(c.id) ?? []).find(
+          (m) => (m.role === "user" || m.role === "assistant") && found.test(messageSearchText(m.content))
+        );
+        const inTitle = c.title !== undefined && found.test(c.title);
+        if (!inTitle && !message) return false;
+        matches.set(c.id, buildSearchMatch(c.title, needle, message));
+        return true;
+      });
+    }
+
+    // Sort: a search lists by last activity; the conversations whose actions lapsed first when asked for those, else by time
+    if (needle) {
+      this.sortByTime(conversations, (c) => c.updatedAt.getTime(), -1);
+    } else if (params.actionDueBefore) {
       this.sortByTime(conversations, (c) => c.actionDueAt!.getTime(), 1);
     } else {
       const orderBy = params.orderBy === "updatedAt" ? "updatedAt" : "createdAt";
@@ -225,7 +245,7 @@ export class InMemoryStorageProvider extends BaseStorageProvider {
     // Paginate
     const data = conversations
       .slice(normalized.offset, normalized.offset + normalized.limit)
-      .map(copy);
+      .map((c) => (matches.get(c.id) ? { ...copy(c), searchMatch: matches.get(c.id) } : copy(c)));
 
     return pageResult(data, total, normalized.limit, normalized.offset);
   }

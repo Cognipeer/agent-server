@@ -11,7 +11,7 @@
 import { BaseStorageProvider, type EventQuery, type StoredEventInput } from "./base.js";
 import { NotFoundError, StorageLimitError } from "../../types.js";
 import { nextStopReason } from "../../events.js";
-import { MAX_BUFFER_BYTES, jsonBytes, nextSeq, pageResult, toBuffer } from "./shared.js";
+import { MAX_BUFFER_BYTES, buildSearchMatch, escapeRegex, jsonBytes, nextSeq, pageResult, searchTerm, toBuffer } from "./shared.js";
 import type {
   AcquireLeaseParams,
   AcquireLeaseResult,
@@ -160,6 +160,7 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
       fileIndex: true,
       actionDeadlines: true,
       pinnedFirst: true,
+      search: true,
     };
   }
 
@@ -393,12 +394,29 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
 
     const collection = this.db.collection<MongoConversation>(this.collections.conversations);
 
+    // Search: the title or the text of a user / assistant message contains the text (an escaped, case-insensitive regex)
+    const needle = searchTerm(params.search);
+    const found = needle ? new RegExp(escapeRegex(needle), "i") : undefined;
+    if (found) {
+      // The conversations with a matching message (a scan of the messages, bounded), then the title / those, in the caller's scope
+      const withMessage = await this.db
+        .collection<MongoMessage>(this.collections.messages)
+        .aggregate([
+          { $match: { role: { $in: ["user", "assistant"] }, ...MESSAGE_TEXT_FILTER(found) } },
+          { $group: { _id: "$conversationId" } },
+          { $limit: SEARCH_MESSAGE_CONVERSATIONS },
+        ])
+        .toArray();
+      filter.$or = [{ title: found }, { _id: { $in: withMessage.map((d) => d._id) } }];
+    }
+
     // Get total count
     const total = await collection.countDocuments(filter);
 
     // Get paginated results
-    const docs =
-      params.pinnedFirst && !params.actionDueBefore
+    const docs = found
+      ? await collection.find(filter).sort({ updatedAt: -1, seq: -1 }).skip(normalized.offset).limit(normalized.limit).toArray()
+      : params.pinnedFirst && !params.actionDueBefore
         ? // conversations with metadata.pinned === true lead, each group in the requested order
           await collection
             .aggregate([
@@ -417,12 +435,26 @@ export class MongoDBStorageProvider extends BaseStorageProvider {
             .limit(normalized.limit)
             .toArray();
 
-    return pageResult(
-      docs.map((doc) => this.mapConversation(doc)),
-      total,
-      normalized.limit,
-      normalized.offset
-    );
+    const data = docs.map((doc) => this.mapConversation(doc));
+    if (needle && found && data.length > 0) {
+      // Where each one matched: its title, else its first matching message
+      const firsts = await this.db
+        .collection<MongoMessage>(this.collections.messages)
+        .aggregate([
+          { $match: { conversationId: { $in: data.map((c) => c.id) }, role: { $in: ["user", "assistant"] }, ...MESSAGE_TEXT_FILTER(found) } },
+          { $sort: { createdAt: 1, seq: 1 } },
+          { $group: { _id: "$conversationId", doc: { $first: "$$ROOT" } } },
+          { $replaceRoot: { newRoot: "$doc" } },
+        ])
+        .toArray();
+      const firstMessage = new Map(firsts.map((doc) => [doc.conversationId, this.mapMessage(doc)]));
+      for (const conversation of data) {
+        const searchMatch = buildSearchMatch(conversation.title, needle, firstMessage.get(conversation.id));
+        if (searchMatch) conversation.searchMatch = searchMatch;
+      }
+    }
+
+    return pageResult(data, total, normalized.limit, normalized.offset);
   }
 
   protected async _updateConversation(
@@ -1294,6 +1326,14 @@ interface MongoConversation {
   /** Insertion sequence: breaks ties between rows created in the same millisecond. */
   seq?: number;
 }
+
+/** Most conversations a search takes from a scan of the messages (the newest titles are not capped). */
+const SEARCH_MESSAGE_CONVERSATIONS = 10_000;
+
+/** A message whose text matches: a string content, or a `text` part of a content array. */
+const MESSAGE_TEXT_FILTER = (found: RegExp) => ({
+  $or: [{ content: found }, { content: { $elemMatch: { type: "text", text: found } } }],
+});
 
 interface MongoMessage {
   _id: string;

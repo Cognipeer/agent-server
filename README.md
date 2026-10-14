@@ -181,6 +181,22 @@ export const { GET, POST, PATCH, DELETE, OPTIONS } =
 `GET /conversations` and `GET /tasks` list one user's records and need a user (`401 identity_required` otherwise, unless `allowAnonymousList: true`).
 The full reference is in [docs/api/endpoints.md](docs/api/endpoints.md); the server serves its own OpenAPI document at `{basePath}/docs/openapi.json`.
 
+## Searching conversations
+
+`GET /conversations?q=<text>` finds conversations whose title or message text contains `q` (case-insensitive, literal: `%` and `_` are ordinary characters). It takes the usual `limit`, `offset`, `agentId` and `userId`, is scoped like the plain list, and returns the newest activity first (pinned conversations get no lead). `q` is trimmed: shorter than 2 characters is no search, longer than 200 answers `400 invalid_request`.
+
+Each hit may carry `searchMatch`, and the response says how it searched:
+
+```json
+{
+  "conversations": [{ "id": "c1", "title": "Budget", "searchMatch": { "field": "message", "messageId": "m7", "role": "assistant", "snippet": "…the budget is approved…" } }],
+  "total": 1, "limit": 20, "offset": 0, "hasMore": false,
+  "searchMode": "full"
+}
+```
+
+`searchMode` is `full` when the storage searched titles and messages (`capabilities().search`: the built-in memory, SQLite, PostgreSQL and MongoDB providers), or `title` when it cannot: the server then filters the titles of the caller's 500 most recently updated conversations. `GET /agents` publishes the same as `features.conversationSearch` (`"full"` | `"title"`) so a client knows what to offer. A custom provider opts in by handling `GetConversationsParams.search` and reporting `search: true`.
+
 ## Storage Providers
 
 ### PostgreSQL

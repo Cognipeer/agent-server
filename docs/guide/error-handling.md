@@ -43,6 +43,7 @@ Every `error.code` the server answers with. Besides `400` / `401` / `404`, the o
 | 400 | `VALIDATION_ERROR` | The request is malformed or breaks a limit (details.reason says which, e.g. file_too_large) |
 | 400 | `INVALID_REQUEST` | A task comment that is not valid |
 | 400 | `model_not_allowed` | The request's `model` is not one of the agent's advertised `models` (`details.allowed` lists the keys) |
+| 400 | `invalid_request` | The search text `q` of `GET /conversations` is longer than 200 characters |
 | 400 | `invalid_budget` | Not a budget, or one at or below what the conversation has already spent |
 | 400 | `budget_unavailable` | The agent has no pricing, so a budget cannot be counted against |
 | 400 | `invalid_approved_args` | The edited arguments are not accepted by the tool's schema |

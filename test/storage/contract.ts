@@ -100,6 +100,91 @@ export function runStorageContract(
       s().createConversation({ agentId: uniq("agent"), ...extra });
 
     // ------------------------------------------------------------------------
+    describe("conversation search", () => {
+      const setup = async () => {
+        const agentId = uniq("agent");
+        const user = uniq("user");
+        const make = async (title: string | undefined, messages: Array<[string, string | unknown[]]> = []) => {
+          const c = await s().createConversation({ agentId, userId: user, title });
+          for (const [role, content] of messages) {
+            await s().createMessage({ conversationId: c.id, role: role as "user", content: content as string });
+          }
+          return c;
+        };
+        return { agentId, user, make, search: (q: string, extra = {}) => s().getConversations({ agentId, userId: user, search: q, ...extra }) };
+      };
+
+      it("reports the capability", () => {
+        expect(caps().search).toBe(true);
+      });
+
+      it("finds a title or message text, case-insensitively, newest activity first, with where it matched", async () => {
+        const { make, search } = await setup();
+        const byTitle = await make("Quarterly Budget review");
+        const byMessage = await make("Chat", [["user", "hello"], ["assistant", "The BUDGET is approved, said the board."]]);
+        await make("Other", [["user", "nothing here"]]);
+        const parts = await make(undefined, [["user", [{ type: "image_url", image_url: { url: "x" } }, { type: "text", text: "budget in a text part" }]]]);
+        const result = await search("budget");
+        expect(result.total).toBe(3);
+        expect(result.data.map((c) => c.id)).toEqual([parts.id, byMessage.id, byTitle.id]);
+        expect(result.data.find((c) => c.id === byTitle.id)!.searchMatch).toMatchObject({ field: "title" });
+        const hit = result.data.find((c) => c.id === byMessage.id)!.searchMatch!;
+        expect(hit).toMatchObject({ field: "message", role: "assistant" });
+        expect(hit.snippet).toContain("BUDGET is approved");
+        expect(hit.messageId).toBeTruthy();
+        expect(result.data.find((c) => c.id === parts.id)!.searchMatch).toMatchObject({ field: "message", role: "user" });
+      });
+
+      it("does not look at keys, tool messages or non-text parts", async () => {
+        const { make, search } = await setup();
+        await make("x1", [["user", [{ type: "text", text: "plain" }]], ["tool", "secret-token-xyz"]]);
+        expect((await search("secret-token")).total).toBe(0);
+        expect((await search("image_url")).total).toBe(0);
+        expect((await search("type")).total).toBe(0);
+      });
+
+      it("matches % _ and \\ literally", async () => {
+        const { make, search } = await setup();
+        const pct = await make("Saved 50% today", [["user", "a_b"]]);
+        const under = await make("with_under", [["user", "back\\slash here"]]);
+        await make("plain text", [["user", "50 percent aXb"]]);
+        expect((await search("50%")).data.map((c) => c.id)).toEqual([pct.id]);
+        expect((await search("%")).data.map((c) => c.id)).toEqual([pct.id]);
+        expect((await search("a_b")).data.map((c) => c.id)).toEqual([pct.id]);
+        expect((await search("_under")).data.map((c) => c.id)).toEqual([under.id]);
+        expect((await search("back\\slash")).data.map((c) => c.id)).toEqual([under.id]);
+        expect((await search("a.b")).total).toBe(0);
+        expect((await search("'; DROP TABLE x; --")).total).toBe(0);
+      });
+
+      it("stays inside the user and agent scope", async () => {
+        const { agentId, user, make } = await setup();
+        await make("shared word zebra");
+        await s().createConversation({ agentId, userId: uniq("other"), title: "zebra of someone else" });
+        await s().createConversation({ agentId: uniq("agent"), userId: user, title: "zebra in another agent" });
+        const mine = await s().getConversations({ agentId, userId: user, search: "zebra" });
+        expect(mine.total).toBe(1);
+        expect(mine.data[0]!.userId).toBe(user);
+        expect((await s().getConversations({ userId: user, search: "zebra" })).total).toBe(2);
+      });
+
+      it("pages the results, cuts long snippets, and ignores a blank search", async () => {
+        const { agentId, user, make, search } = await setup();
+        const long = `${"word ".repeat(80)}NEEDLE${" tail".repeat(80)}`;
+        for (let i = 0; i < 3; i++) await make(`t${i}`, [["user", long]]);
+        const page = await search("needle", { limit: 2, offset: 1 });
+        expect(page.total).toBe(3);
+        expect(page.data).toHaveLength(2);
+        expect(page.hasMore).toBe(false);
+        const snippet = page.data[0]!.searchMatch!.snippet;
+        expect(snippet.length).toBeLessThanOrEqual(160);
+        expect(snippet).toContain("NEEDLE");
+        expect(snippet.startsWith("…") && snippet.endsWith("…")).toBe(true);
+        expect((await s().getConversations({ agentId, userId: user, search: "   " })).total).toBe(3);
+      });
+    });
+
+    // ------------------------------------------------------------------------
     describe("capabilities", () => {
       it("reports what the provider can hold", () => {
         const c = caps();
