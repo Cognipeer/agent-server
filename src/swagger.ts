@@ -661,6 +661,12 @@ function generateSchemas(): Record<string, unknown> {
           default: false,
           description: "Enable streaming response via Server-Sent Events (SSE). When true, response is sent as text/event-stream.",
         },
+        titleFrame: {
+          type: "boolean",
+          default: false,
+          description:
+            "Streaming only. The title generated for the first exchange comes as its own stream.title frame after stream.done, so the done frame (and the end of the turn) does not wait for the title model. Without it the title is in stream.done.",
+        },
       },
       required: ["message"],
     },
@@ -1005,6 +1011,16 @@ function generateSchemas(): Record<string, unknown> {
         runId: { type: "string" },
         budget: { $ref: "#/components/schemas/SessionBudget" },
         spentUsd: { type: "number" },
+      },
+    },
+    StreamTitleEvent: {
+      type: "object",
+      description: "The conversation's generated title, after stream.done (only for a request that set titleFrame)",
+      properties: {
+        type: { type: "string", enum: ["stream.title"] },
+        timestamp: { type: "integer" },
+        conversationId: { type: "string" },
+        title: { type: "string" },
       },
     },
     StreamActionRequiredEvent: {

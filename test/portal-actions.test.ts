@@ -650,6 +650,56 @@ function suite() {
       expect(seen).toHaveLength(1);
     });
 
+    it("with titleFrame, ends the turn first and sends the title as its own frame after the done frame", async () => {
+      const titleGate = gate();
+      let asked = 0;
+      const t = await boot({
+        settings: { titleGeneration: { generate: async () => { asked += 1; await titleGate.promise; return "Late title"; } } },
+      });
+      const res = await t.send("plan a trip", { stream: true, titleFrame: true });
+      const reader = res.stream![Symbol.asyncIterator]();
+      let text = "";
+      while (!parseSse(text).some((f) => f.type === "stream.done")) {
+        const next = await reader.next();
+        if (next.done) break;
+        text += next.value;
+      }
+      // the done frame is out while the title model is still working, without a title
+      const done = parseSse(text).find((f) => f.type === "stream.done") as any;
+      expect(done).toMatchObject({ conversationId: t.id, content: "answer 1" });
+      expect(done.title).toBeUndefined();
+      await eventually(() => asked === 1);
+      // ... and the conversation is free: the next message is taken at once
+      expect((await t.get()).conversation.runtime.status).toBe("idle");
+      const second = await t.send("and then?");
+      expect(second.status).toBe(200);
+      expect((second.body as any).response.content).toBe("answer 2");
+
+      titleGate.open();
+      for (;;) {
+        const next = await reader.next();
+        if (next.done) break;
+        text += next.value;
+      }
+      const frames = parseSse(text);
+      expect(frames.map((f) => f.type).slice(-2)).toEqual(["stream.done", "stream.title"]);
+      expect(frames.at(-1)).toMatchObject({ type: "stream.title", conversationId: t.id, title: "Late title" });
+      expect((await t.get()).conversation.title).toBe("Late title");
+      expect((await t.events()).filter((e) => e.type === "session.title").map((e) => e.data.title)).toEqual(["Late title"]);
+      expect(asked).toBe(1);
+    });
+
+    it("without titleFrame keeps the title in the done frame, and with it closes right after the done frame when there is no title to make", async () => {
+      const t = await boot({ settings: { titleGeneration: { generate: async () => "Early title" } } });
+      const first = await t.drain(await t.send("one", { stream: true }));
+      expect(first.find((f) => f.type === "stream.done")).toMatchObject({ title: "Early title" });
+      expect(first.some((f) => f.type === "stream.title")).toBe(false);
+
+      const second = await t.drain(await t.send("two", { stream: true, titleFrame: true }));
+      expect(second.at(-1)!.type).toBe("stream.done");
+      expect(second.some((f) => f.type === "stream.title")).toBe(false);
+    });
+
     it("can be switched off for one agent whatever the server says, and costs the conversation nothing when the generator fails", async () => {
       const generate = vi.fn(async () => "Server title");
       const off = await boot({ config: { titleGeneration: { generate } }, settings: { titleGeneration: false } });

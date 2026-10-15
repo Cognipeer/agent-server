@@ -156,6 +156,11 @@ export class ActiveRun {
   /** Resolves once the run has given the conversation back - also for a run that never got to start. */
   readonly released: Promise<void>;
   lease?: LeaseKeeper;
+  /**
+   * Work left for after the conversation is given back, with the starting connection still open: the title of a turn
+   * whose request asked for it as a frame of its own (`titleFrame`). Set by the turn; run (and awaited) by `launch`.
+   */
+  afterRelease?: () => Promise<void>;
 
   private subscribers = new Set<(item: RunItem) => void>();
   private chain: Promise<void> = Promise.resolve();
@@ -253,6 +258,20 @@ export class ActiveRun {
     for (const subscriber of [...this.subscribers]) subscriber({ kind: "end" });
     this.subscribers.clear();
     this.release();
+  }
+
+  /**
+   * The run is over and the conversation given back, but the starting connection(s) stay open for {@link sendLate}
+   * until {@link end}. Nothing more goes into the run's log (`emit` is closed).
+   */
+  handBack(): void {
+    this.finished = true;
+    this.release();
+  }
+
+  /** A frame for the starting connection(s) after {@link handBack} (the turn's own output has all been delivered). */
+  sendLate(frame: Record<string, unknown>): void {
+    for (const subscriber of [...this.subscribers]) subscriber({ kind: "frame", frame });
   }
 
   /**
