@@ -134,6 +134,7 @@ server.registerSDKAgent('scratch', agent, {}, { titleGeneration: false });
 
 - The call is bounded (`timeoutMs`, default 10 s) and stops when the turn is cancelled; a title that does not arrive is skipped.
 - The title is returned in `conversationTitle` / `stream.done.title`, stored on the conversation with `metadata.titleGenerated: true`, and announced by a **`session.title`** event: `{ title, purpose: "title", model?, usage? }`. The `purpose` tag is what lets a host count the call to the person's usage separately from the turn.
+- A streamed message with `"titleFrame": true` does not wait for the title: `stream.done` comes as soon as the answer is stored (the conversation is free for the next message), and the title follows on the same stream as a [`stream.title`](./streaming.md#stream-title) frame. The `session.title` event comes after `session.status_idle` then.
 - Regenerating or editing does not re-title, except as described under [Edit and resend](#edit-and-resend).
 
 ## Feedback

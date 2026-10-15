@@ -199,6 +199,7 @@ export type {
   StreamActionRequiredEvent,
   StreamActionResolvedEvent,
   StreamDoneEvent,
+  StreamTitleEvent,
 } from "./types.js";
 
 // Constants of the chat experience

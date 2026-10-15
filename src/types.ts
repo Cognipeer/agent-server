@@ -1973,6 +1973,13 @@ export interface SendMessageRequest {
    * Enable streaming response via Server-Sent Events (SSE)
    */
   stream?: boolean;
+  /**
+   * Streaming only. The title generated for the conversation's first exchange arrives as its own `stream.title` frame
+   * after `stream.done` instead of inside it: the done frame (and with it the end of the turn and the conversation, free
+   * for the next message) does not wait for the title model. The stream closes after the title, or at once when no
+   * title is generated. A client that does not set this gets the title in `stream.done`, as before.
+   */
+  titleFrame?: boolean;
 }
 
 export interface SendMessageResponse {
@@ -2122,6 +2129,15 @@ export interface StreamDoneEvent extends StreamEventBase {
 }
 
 /**
+ * The conversation's generated title, after `stream.done` (only for a request that set `titleFrame`)
+ */
+export interface StreamTitleEvent extends StreamEventBase {
+  type: "stream.title";
+  conversationId: string;
+  title: string;
+}
+
+/**
  * The agent paused and is waiting on a human
  */
 export interface StreamActionRequiredEvent extends StreamEventBase {
@@ -2163,7 +2179,8 @@ export type StreamEvent =
   | StreamErrorEvent
   | StreamActionRequiredEvent
   | StreamActionResolvedEvent
-  | StreamDoneEvent;
+  | StreamDoneEvent
+  | StreamTitleEvent;
 
 export interface ListAgentsResponse {
   agents: AgentInfo[];

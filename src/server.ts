@@ -49,6 +49,7 @@ import type {
   StreamProgressEvent,
   StreamErrorEvent,
   StreamDoneEvent,
+  StreamTitleEvent,
   StreamActionRequiredEvent,
   StreamActionResolvedEvent,
   PendingAction,
@@ -198,7 +199,7 @@ import {
 import { runWithTurnFiles, type TurnFiles } from "./files/turn.js";
 import { NotFoundError as NotFoundErrorClass, REASONING_EFFORTS } from "./types.js";
 import { closedExperience, experienceMetadata, resolveExperience, type ResolveInputs } from "./experience.js";
-import { assertTitleGeneration, generateConversationTitle } from "./titles.js";
+import { assertTitleGeneration, generateConversationTitle, type GeneratedTitle } from "./titles.js";
 import { searchSnippet } from "./providers/storage/shared.js";
 import {
   DEFAULT_EXPORT_MAX_MESSAGES,
@@ -3125,11 +3126,12 @@ export class AgentServer {
     return run;
   }
 
-  /** Gives the conversation back. */
-  private async endRun(run: ActiveRun): Promise<void> {
+  /** Gives the conversation back (`keepOpen`: the starting connection stays open for what the run left for afterwards). */
+  private async endRun(run: ActiveRun, keepOpen = false): Promise<void> {
     await run.lease?.stop();
     if (this.runs.get(run.conversationId) === run) this.runs.delete(run.conversationId);
-    run.end();
+    if (keepOpen) run.handBack();
+    else run.end();
   }
 
   /**
@@ -3150,8 +3152,20 @@ export class AgentServer {
       } catch (error) {
         console.error(`[AgentServer] Could not finish run ${run.id}:`, error);
       }
-      // The conversation is given back before the task says it is done: whoever sees the task settle can use the conversation
-      await this.endRun(run);
+      const later = run.afterRelease;
+      if (later) {
+        // The conversation is free (and the done frame out) before the work the turn left for afterwards
+        await this.endRun(run, true);
+        try {
+          await later();
+        } catch (error) {
+          console.error(`[AgentServer] Could not finish run ${run.id} after it ended:`, error);
+        }
+        run.end();
+      } else {
+        // The conversation is given back before the task says it is done: whoever sees the task settle can use the conversation
+        await this.endRun(run);
+      }
       try {
         await this.syncTask(run, outcome, ctx.context);
       } catch (error) {
@@ -3336,7 +3350,8 @@ export class AgentServer {
 
     const stream = streaming ? this.attachStream(run) : undefined;
     this.launch(run, ctx, () => this.executeMessage(run, { ctx, conversation, agent, body: { ...body, model, reasoningEffort }, attachments, budget }));
-    void run.done.then(release, release);
+    // (a title asked for as a frame of its own is made after the turn: the next message is not held back by it)
+    void (streaming && body.titleFrame === true ? run.released : run.done).then(release, release);
     if (stream) return { status: 200, headers: SSE_HEADERS, stream: stream.generator, close: stream.close };
 
     const outcome = await run.done;
@@ -3718,6 +3733,7 @@ export class AgentServer {
       userMessage,
       // (a task's conversation gets no generated title: it is not a chat)
       firstExchange: history.length === 1 && !run.taskId ? body.message : undefined,
+      titleFrame: body.titleFrame === true,
       budget,
       model: body.model ?? agent.info.models?.find((m) => m.default)?.key,
       // A regeneration replaces the answers it re-ran, once the new one is stored
@@ -4302,6 +4318,36 @@ export class AgentServer {
     };
   }
 
+  /** Generates the title of a conversation's first exchange and stores it; `undefined` when none was made or stored. */
+  private async storeGeneratedTitle(
+    config: TitleGenerationConfig,
+    x: { conversation: Conversation; agent: AgentRegistration; user: string; assistant: string; ctx: RouteContext; signal?: AbortSignal }
+  ): Promise<GeneratedTitle | undefined> {
+    const conversationId = x.conversation.id;
+    const generated = await generateConversationTitle(config, {
+      conversation: x.conversation,
+      agent: x.agent.info,
+      user: x.user,
+      assistant: x.assistant,
+      context: x.ctx.context!,
+      pricing: this.pricingFor(x.agent),
+      signal: x.signal,
+    });
+    if (!generated) return undefined;
+    const stored = await this.mutateConversation(conversationId, x.ctx.context, (fresh) => {
+      // (a person who named the conversation in the meantime keeps their title)
+      if (fresh.title) return null;
+      return { title: generated.title, metadata: { ...(fresh.metadata ?? {}), titleGenerated: true } };
+    }).then(
+      (result) => result.written,
+      (error) => {
+        console.error(`[AgentServer] Could not store the title of conversation ${conversationId}:`, error);
+        return false;
+      }
+    );
+    return stored ? generated : undefined;
+  }
+
   /**
    * Stores what a step produced as the assistant message, records what it waits on, settles the money, and reports
    * the end of the turn (events, then the legacy done frame). A pause whose state the store cannot hold
@@ -4317,6 +4363,8 @@ export class AgentServer {
       userMessage?: Message;
       /** The first message of the conversation: a title is generated from it. */
       firstExchange?: string;
+      /** The request asked for the title as a `stream.title` frame after the done frame (streamed requests only). */
+      titleFrame?: boolean;
       budget: TurnBudget;
       /** The model key the answer came from (the request's, else the advertised default): stored as `metadata.model`. */
       model?: string;
@@ -4448,43 +4496,31 @@ export class AgentServer {
     let conversationTitle: string | undefined;
     const titleConfig = this.titleConfigFor(x.agent);
     if (titleConfig && !conversation.title && x.firstExchange && !step.cancelled) {
-      const generated = await generateConversationTitle(titleConfig, {
-        conversation,
-        agent: x.agent.info,
-        user: x.firstExchange,
-        assistant: content,
-        context: ctx.context!,
-        pricing: this.pricingFor(x.agent),
-        signal: run.signal,
+      const user = x.firstExchange;
+      const titleEvent = (generated: GeneratedTitle): { type: string; data: Record<string, unknown> } => ({
+        type: EVENT_TYPES.title,
+        data: {
+          title: generated.title,
+          purpose: "title",
+          ...(generated.model ? { model: generated.model } : {}),
+          ...(generated.usage ? { usage: tokens(generated.usage), ...(generated.usage.costUsd !== undefined ? { cost_usd: generated.usage.costUsd } : {}) } : {}),
+        },
       });
-      const stored = generated
-        ? await this.mutateConversation(conversationId, ctx.context, (fresh) => {
-            // (a person who named the conversation in the meantime keeps their title)
-            if (fresh.title) return null;
-            return { title: generated.title, metadata: { ...(fresh.metadata ?? {}), titleGenerated: true } };
-          }).then(
-            (result) => result.written,
-            (error) => {
-              console.error(`[AgentServer] Could not store the title of conversation ${conversationId}:`, error);
-              return false;
-            }
-          )
-        : false;
-      if (generated && stored) {
-        conversationTitle = generated.title;
-        run.emit({
-          events: [
-            {
-              type: EVENT_TYPES.title,
-              data: {
-                title: generated.title,
-                purpose: "title",
-                ...(generated.model ? { model: generated.model } : {}),
-                ...(generated.usage ? { usage: tokens(generated.usage), ...(generated.usage.costUsd !== undefined ? { cost_usd: generated.usage.costUsd } : {}) } : {}),
-              },
-            },
-          ],
-        });
+      if (x.titleFrame && run.streaming) {
+        // Asked for as a frame of its own: made once the conversation is given back, so neither the done frame nor the
+        // next message waits for the title model. (No run signal: the run is over by then; the title has its own timeout.)
+        run.afterRelease = async () => {
+          const generated = await this.storeGeneratedTitle(titleConfig, { conversation, agent: x.agent, user, assistant: content, ctx });
+          if (!generated) return;
+          await this.appendEvents(conversationId, [{ ...titleEvent(generated), runId: run.id }], ctx.context);
+          run.sendLate({ type: "stream.title", timestamp: Date.now(), conversationId, title: generated.title } satisfies StreamTitleEvent);
+        };
+      } else {
+        const generated = await this.storeGeneratedTitle(titleConfig, { conversation, agent: x.agent, user, assistant: content, ctx, signal: run.signal });
+        if (generated) {
+          conversationTitle = generated.title;
+          run.emit({ events: [titleEvent(generated)] });
+        }
       }
     }
 

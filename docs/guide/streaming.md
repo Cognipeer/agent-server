@@ -136,7 +136,7 @@ interface StreamDoneEvent {
   conversationId: string;
   messageId: string;                 // the assistant message
   content: string;
-  title?: string;                    // generated on the first exchange
+  title?: string;                    // generated on the first exchange (absent when the request set titleFrame)
   usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cachedInputTokens?: number; costUsd?: number };   // this turn only
   budget?: { maxCostUsd: number; onReach: 'pause' | 'stop' };   // when the conversation has a budget ...
   spentUsd?: number;                                            // ... and what it has spent, this turn included
@@ -151,6 +151,20 @@ interface StreamDoneEvent {
 
 A turn that is [cancelled](./runs.md#cancel) ends with `stream.done` and `status: "cancelled"`, carrying the text streamed so far. A turn that fails ends with `stream.error`
 (nothing is stored for the assistant). Clients ignore event types they do not know.
+
+### stream.title
+
+A message request with `"titleFrame": true` gets the [generated title](./chat-experience.md#generated-titles) of the first exchange as a frame of its own, **after** `stream.done`, instead of inside it:
+
+```typescript
+interface StreamTitleEvent {
+  type: 'stream.title';
+  conversationId: string;
+  title: string;
+}
+```
+
+The done frame then does not wait for the title model: the turn is over and the conversation free for the next message as soon as the answer is stored, and the stream stays open until the title is made (or closes right after `stream.done` when there is none to make). A client that does not set `titleFrame` gets the title in `stream.done`, as before.
 
 ## Client implementation
 
