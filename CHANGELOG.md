@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-15
+
 ### Added
 
 - **`titleFrame` on a streamed message.** With `"titleFrame": true` the generated title of the first exchange comes as its own `stream.title` frame (`{ conversationId, title }`) after `stream.done`, instead of inside it. The done frame no longer waits for the title model, and the conversation is given back (free for the next message, its `rateLimit` slot released) as soon as the answer is stored; the stream closes after the title, or right after `stream.done` when there is none to make. Without the flag nothing changes. New export `StreamTitleEvent`.
