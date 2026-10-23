@@ -400,6 +400,12 @@ server.registerSDKAgent("support", agent, {
 - **Hiding it.** `AgentInfo.showReasoning` (default `true`, also published by `GET /agents`): with `false` no `stream.thinking` frame is sent. Token accounting is unaffected.
 - **Effort.** `POST .../messages`, `.../regenerate` and `.../edit` accept `reasoningEffort` (`none`, `minimal`, `low`, `medium`, `high`; 400 otherwise). Host agents get it as `HostInvokeInput.reasoningEffort`, custom handlers as `ProcessMessageParams.reasoningEffort`. A request without it leaves both unset.
 
+## Plan and context compaction
+
+- **Plan.** A host agent reports its plan with `emit({ type: "plan", plan: { version?, operation?, steps: [{ id?, title, status }] } })`; the server stores it as an `agent.plan` event and sends a `stream.plan` frame, in order with the tool events around it. Every emit carries the whole plan (a later one replaces the earlier). Statuses: `not-started`, `in-progress`, `completed`, `blocked`. `operation` (`write` or `update`) says whether the agent wrote the plan out or changed it, so a client can label "plan created" and "plan updated"; it travels in the frame and the stored event, and is left out when the agent does not report it. An agent-sdk agent's `plan` events (`write` / `update`) are published the same way, with their `operation`. `AgentInfo.capabilities.plan` tells a client the agent may publish one.
+- **Compaction.** `emit({ type: "compaction", id?, phase? })` marks where the agent condensed its earlier context (`start`, `done` - the default - or `skipped`). A finished pass is stored as `agent.compaction` (`{ id?, at }`) and sent as `stream.compaction`; `start` and `skipped` are live frames only. An agent-sdk agent's `summarization` events are published the same way. Nothing of the summary is carried over.
+- A step or pass reported by a delegated sub-agent (an agent-sdk event stamped `subagentId`, `subagentName` or `delegatedTo`) is not the turn's own and is not published.
+
 ## Request Context & Dynamic Agents
 
 Resolve who is calling (and anything else your host knows, e.g. tenant) once per

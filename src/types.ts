@@ -333,6 +333,8 @@ export interface AgentCapabilities {
   askUser?: boolean;
   /** The agent can pause for a tool that runs in the page that embeds the chat (`client_tool` pending actions). */
   clientTools?: boolean;
+  /** The agent may publish a plan (`stream.plan` frames, `agent.plan` events), so a client can make room for it. */
+  plan?: boolean;
   /**
    * What the agent accepts as attachments. The server fills it from the `files` option (server and
    * agent) for `GET /agents`; whatever the host sets here wins field by field. Clients show the
@@ -589,6 +591,13 @@ export interface ProcessMessageResult {
  *    has any); the pause is stored first and announced when the turn ends.
  *  - `usage`: what one model call used. Added up, unless the result carries `usage` of its own.
  *  - `stop`: why the turn stopped, when it is known before the host returns (the result's `stopReason` wins).
+ *  - `plan`: the agent's plan as it stands now (every step, with its status). Sent as `stream.plan` and stored as `agent.plan`,
+ *    in order with the tool events around it. Only titles and statuses travel: anything else the host knows about a step stays with it.
+ *    `operation` (`write` or `update`) says whether the agent wrote the plan out or changed it, so a client can tell "plan created"
+ *    from "plan updated"; leave it out when the agent does not make the difference.
+ *  - `compaction`: the agent condensed its earlier context. A marker only - what was condensed is not reported. `phase` is `start`,
+ *    `done` (the default) or `skipped`; `id` pairs a `start` with its end. Only `done` is stored (`agent.compaction`); the other two
+ *    are live `stream.compaction` frames.
  */
 export type HostEvent =
   | { type: "text"; text: string }
@@ -597,7 +606,40 @@ export type HostEvent =
   | { type: "tool_result"; id: string; name?: string; result?: unknown; error?: string }
   | { type: "action_required"; actions: PendingAction[] }
   | { type: "usage"; usage: UsageInfo & { model?: string } }
-  | { type: "stop"; stopReason: StopReason; detail?: string };
+  | { type: "stop"; stopReason: StopReason; detail?: string }
+  | { type: "plan"; plan: PlanSnapshot }
+  | { type: "compaction"; id?: string; phase?: CompactionPhase };
+
+/** Where a plan step stands. */
+export type PlanStepStatus = "not-started" | "in-progress" | "completed" | "blocked";
+
+/** One step of an agent's plan: what the person sees of it. */
+export interface PlanStep {
+  /** The agent's own handle for the step (a number or a short string). */
+  id?: string | number;
+  /** At most 500 characters. */
+  title: string;
+  status: PlanStepStatus;
+}
+
+/** What the agent did to its plan: `write` wrote it out (it made the plan, or started over), `update` changed steps of the plan it had. */
+export type PlanOperation = "write" | "update";
+
+/** The agent's plan at one moment: every step, not a change. A later snapshot replaces the earlier one. */
+export interface PlanSnapshot {
+  /** Grows with every change the agent makes to the plan. */
+  version?: number;
+  /**
+   * What the agent did to get here. It is what tells a client "plan created" (`write`) from "plan updated" (`update`) while the
+   * turn runs; a client that is not given it goes by whether it has seen a plan in the turn before. Left out when the agent does not say.
+   */
+  operation?: PlanOperation;
+  /** At most 100 steps. */
+  steps: PlanStep[];
+}
+
+/** `start`: the agent began condensing its context. `done`: it did. `skipped`: it began, and found nothing to condense. */
+export type CompactionPhase = "start" | "done" | "skipped";
 
 /** The files of the conversation a host agent runs in. Only those: any other id answers `null`. */
 export interface HostFiles {
@@ -933,7 +975,7 @@ export interface StorageProvider {
  * One entry of a conversation's event log. `type` and `data` follow the Console client wire
  * (snake_case): `user.message`, `session.status_running`, `agent.tool_use`, `agent.tool_result`,
  * `agent.message`, `action.required`, `action.resolved`, `session.usage`, `session.status_idle`,
- * `session.work_done`, `session.error`, `budget.reached`.
+ * `session.work_done`, `session.error`, `budget.reached`, `agent.plan`, `agent.compaction`.
  */
 export interface ConversationEvent {
   conversationId: string;
@@ -2069,6 +2111,27 @@ export interface StreamThinkingEvent extends StreamEventBase {
 }
 
 /**
+ * The agent's plan as it stands now (every step, not a change). A later frame replaces the earlier one. It is also stored, as
+ * an `agent.plan` event, so a follower or a reload sees the same plan in the same place. `plan.operation` says whether this
+ * snapshot is the plan being written (`write`) or changed (`update`), when the agent reports it.
+ */
+export interface StreamPlanEvent extends StreamEventBase {
+  type: "stream.plan";
+  plan: PlanSnapshot;
+}
+
+/**
+ * The agent condensed its earlier context: a marker in the flow, with nothing of what was condensed. `start` has no stored
+ * counterpart (it is live only), `done` is stored as `agent.compaction`, and `skipped` ends a `start` that found nothing to do.
+ * `id` pairs the frames of one pass.
+ */
+export interface StreamCompactionEvent extends StreamEventBase {
+  type: "stream.compaction";
+  id?: string;
+  phase: CompactionPhase;
+}
+
+/**
  * Tool call event - agent is calling a tool
  */
 export interface StreamToolCallEvent extends StreamEventBase {
@@ -2173,6 +2236,8 @@ export type StreamEvent =
   | StreamStartEvent
   | StreamTextEvent
   | StreamThinkingEvent
+  | StreamPlanEvent
+  | StreamCompactionEvent
   | StreamToolCallEvent
   | StreamToolResultEvent
   | StreamProgressEvent

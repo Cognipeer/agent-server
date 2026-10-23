@@ -685,7 +685,15 @@ type HostEvent =
   | { type: 'tool_result'; id: string; name?: string; result?: unknown; error?: string }
   | { type: 'action_required'; actions: PendingAction[] }
   | { type: 'usage'; usage: UsageInfo & { model?: string } }
-  | { type: 'stop'; stopReason: StopReason; detail?: string };
+  | { type: 'stop'; stopReason: StopReason; detail?: string }
+  | { type: 'plan'; plan: PlanSnapshot }                       // -> agent.plan + stream.plan
+  | { type: 'compaction'; id?: string; phase?: 'start' | 'done' | 'skipped' }; // -> agent.compaction (done) + stream.compaction
+
+interface PlanSnapshot {
+  version?: number;
+  operation?: 'write' | 'update';           // the agent wrote the plan out / changed it; left out when it does not say
+  steps: Array<{ id?: string | number; title: string; status: 'not-started' | 'in-progress' | 'completed' | 'blocked' }>;
+}
 
 interface HostTurnResult {
   content?: string;                         // empty: the streamed text is the answer

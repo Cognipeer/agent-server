@@ -392,6 +392,7 @@ interface AgentInfo {
     toolApproval?: boolean;
     askUser?: boolean;
     clientTools?: boolean; // pauses for a tool that runs in the page embedding the chat
+    plan?: boolean; // may publish a plan (stream.plan frames, agent.plan events)
 
     attachments?: { enabled?: boolean; maxFiles?: number; maxFileSize?: number; allowedMimeTypes?: string[]; acceptsImages?: boolean };
   };
@@ -496,7 +497,7 @@ interface HostAgent {
 }
 
 interface HostRunIo {
-  emit(event: HostEvent): void; // text | tool_use | tool_result | action_required | usage | stop
+  emit(event: HostEvent): void; // text | thinking | tool_use | tool_result | action_required | usage | stop | plan | compaction
   signal: AbortSignal;          // aborted when the run is cancelled
   files: HostFiles;             // list() / read(id) / text(id), scoped to the conversation
 }
