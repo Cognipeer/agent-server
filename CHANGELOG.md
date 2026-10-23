@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-23
+
+### Added
+
+- **Plan.** A host agent may emit `{ type: "plan", plan: { version?, operation?, steps: [{ id?, title, status }] } }` (status `not-started`, `in-progress`, `completed` or `blocked`). The server checks it field by field (a title is clipped to 500 characters, at most 100 steps, a step with another status is dropped, other fields are stripped), stores it as an `agent.plan` event and sends a `stream.plan` frame (`StreamPlanEvent`, `{ plan }`), in order with the tool events around it. Each snapshot is the whole plan.
+- **Plan `operation`.** A snapshot may say what the agent did to get there: `write` (it wrote the plan out) or `update` (it changed the plan it had). A client uses it to label a live plan "created" or "updated", which it could not tell from the snapshots alone. It is carried by the `stream.plan` frame and the stored `agent.plan` event, and left out when the agent does not report it; a value other than `write` or `update` is dropped and the plan is kept.
+- **Compaction marker.** A host agent may emit `{ type: "compaction", id?, phase? }` (`start`, `done` - the default - or `skipped`). A finished pass is stored as `agent.compaction` (`{ id?, at }`); every phase is sent as a `stream.compaction` frame (`StreamCompactionEvent`, `{ id?, phase }`), `start` and `skipped` as live frames only. It marks where the agent condensed its context; nothing of what was condensed is carried.
+- **agent-sdk agents publish both.** The SDK's `plan` events (`write` and `update`, which is the snapshot's `operation`) become a plan, its `summarization` events a compaction marker (`phase` as the SDK reports it, `done` when it does not). Events stamped by a delegated child (`subagentId`, `subagentName`, `delegatedTo`) are skipped.
+- **`AgentInfo.capabilities.plan`**: the agent may publish a plan. New exports `PlanSnapshot`, `PlanOperation`, `PlanStep`, `PlanStepStatus`, `CompactionPhase`, `StreamPlanEvent`, `StreamCompactionEvent`.
+- A client that does not know the new frames and events ignores them. A host that emits `plan` or `compaction` to an older server gets the usual one warning per turn for an unknown event.
+
 ## [0.8.0] - 2026-10-15
 
 ### Added

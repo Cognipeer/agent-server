@@ -43,6 +43,10 @@ import type {
   StreamStartEvent,
   StreamTextEvent,
   StreamThinkingEvent,
+  StreamPlanEvent,
+  StreamCompactionEvent,
+  CompactionPhase,
+  PlanSnapshot,
   ReasoningEffort,
   StreamToolCallEvent,
   StreamToolResultEvent,
@@ -146,7 +150,15 @@ import {
   snapshotLedger,
 } from "./usage.js";
 import { findToolSchema, toJsonSchema, validateAgainstSchema } from "./schema.js";
-import { readModels, hostAgentRegistration, readHostEvent, readHostResult, type HostCollected } from "./host.js";
+import {
+  readModels,
+  hostAgentRegistration,
+  readHostEvent,
+  readHostResult,
+  planFromSdkEvent,
+  compactionFromSdkEvent,
+  type HostCollected,
+} from "./host.js";
 import { generateOpenAPISpec, generateSwaggerHTML } from "./swagger.js";
 import {
   invokeChatCompletions,
@@ -344,8 +356,44 @@ function createSdkBridge(run: ActiveRun, partial: { text: string }) {
         frame: (seq) => ({ type: "stream.thinking", timestamp: Date.now(), thinking, seq } satisfies StreamThinkingEvent),
       });
     },
+    /**
+     * The plan as it stands: stored as `agent.plan` and sent as a `stream.plan` frame, in order with the tool events around it.
+     * Both carry the `operation` (`write` or `update`) when the agent reported it, so a follower or a reload labels the plan the way
+     * the live view did. (Only the fields of a plan snapshot are given here: a step's owner, exit criteria and evidence never get this far.)
+     */
+    onPlan: (plan: PlanSnapshot) => {
+      run.emit({
+        events: [
+          {
+            type: EVENT_TYPES.plan,
+            data: {
+              ...(plan.version !== undefined && { version: plan.version }),
+              ...(plan.operation !== undefined && { operation: plan.operation }),
+              steps: plan.steps.map((step) => ({ ...step })),
+            },
+          },
+        ],
+        frame: (seq) => ({ type: "stream.plan", timestamp: Date.now(), plan, seq } satisfies StreamPlanEvent),
+      });
+    },
+    /**
+     * The agent condensed its context. A finished pass is stored (`agent.compaction`, with the time it was stored) and sent as a
+     * frame; its start, and a pass that found nothing to do, are live frames only - a reload has no use for a pass that never was.
+     */
+    onCompaction: (id: string | undefined, phase: CompactionPhase) => {
+      run.emit({
+        ...(phase === "done" && { events: [{ type: EVENT_TYPES.compaction, data: { ...(id !== undefined && { id }), at: new Date().toISOString() } }] }),
+        frame: (seq) => ({ type: "stream.compaction", timestamp: Date.now(), ...(id !== undefined && { id }), phase, seq } satisfies StreamCompactionEvent),
+      });
+    },
     onEvent: (event: { type: string; [key: string]: unknown }) => {
-      if (event.type === "tool_call") {
+      if (event.type === "plan") {
+        const plan = planFromSdkEvent(event);
+        if (plan) bridge.onPlan(plan);
+      } else if (event.type === "summarization") {
+        const pass = compactionFromSdkEvent(event);
+        if (pass) bridge.onCompaction(pass.id, pass.phase);
+      } else if (event.type === "tool_call") {
         const phase = (event as { phase?: string }).phase;
         const props = extractToolEventProps(event);
 
@@ -4139,6 +4187,12 @@ export class AgentServer {
           case "stop":
             collected.stopReason = event.stopReason;
             collected.detail = event.detail;
+            break;
+          case "plan":
+            bridge.onPlan(event.plan);
+            break;
+          case "compaction":
+            bridge.onCompaction(event.id, event.phase ?? "done");
             break;
         }
       },

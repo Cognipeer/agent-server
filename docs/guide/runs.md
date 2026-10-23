@@ -115,6 +115,8 @@ snake_case types and data, `seq` unique and ascending within the conversation.
 | `session.status_running` | `trigger`: `message`, `resume` (an answer, or a [continuation](./budgets.md#raising-it-and-carrying-on)) or `timeout` (a request [lapsed](./human-in-the-loop.md#requests-that-lapse) and the agent carries on); `mode?`: `regenerate` or `edit` for a [regeneration or an edit-and-resend](./chat-experience.md#message-actions) |
 | `agent.tool_use` | `tool_call_id`, `name`, `args` |
 | `agent.tool_result` | `tool_call_id`, `name`, `ok`, `duration_ms?`, `error?` |
+| `agent.plan` | `version?`, `operation?` (`write` or `update`), `steps` (`id?`, `title`, `status`: `not-started`, `in-progress`, `completed` or `blocked`): the agent's [plan](./streaming.md#stream-plan) as it stands now, every step each time. Stored on every change, in order with the tool events |
+| `agent.compaction` | `id?`, `at` (when the server stored it): the agent condensed its earlier context. Only a finished pass is stored; [its start](./streaming.md#stream-compaction) is a live frame |
 | `agent.message` | `content`, `message_id`, `stop_reason`, `usage?` (`input_tokens`, `output_tokens`, `total_tokens`, `cached_input_tokens?`, `cost_usd?`) |
 | `session.usage` | `input_tokens`, `output_tokens`, `total_tokens`, `cached_input_tokens?` and - with [pricing](./budgets.md#prices) - `turn_cost_usd`, `spent_usd`, `budget?` (`max_cost_usd`, `on_reach`) |
 | `budget.reached` | `spent_usd`, `max_cost_usd`, `on_reach`; just before the `session.status_idle` with `stop_reason: budget_reached` |

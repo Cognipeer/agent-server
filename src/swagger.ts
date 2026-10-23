@@ -154,6 +154,7 @@ function generateSchemas(): Record<string, unknown> {
             toolApproval: { type: "boolean", description: "The agent can pause to ask for approval before running a tool." },
             askUser: { type: "boolean", description: "The agent can pause to ask the user a question." },
             clientTools: { type: "boolean", description: "The agent can pause for a tool that runs in the page embedding the chat (client_tool pending actions)." },
+            plan: { type: "boolean", description: "The agent may publish a plan (stream.plan frames, agent.plan events)." },
             attachments: { $ref: "#/components/schemas/AttachmentsCapability" },
           },
         },
@@ -478,7 +479,8 @@ function generateSchemas(): Record<string, unknown> {
       description:
         "One entry of a conversation's event log, in the Console client wire: dotted event types and snake_case data. " +
         "Types: user.message, session.status_running, agent.tool_use, agent.tool_result, agent.message, action.required, " +
-        "action.resolved, session.usage, session.status_idle, session.work_done, session.error, budget.reached, session.truncated " +
+        "action.resolved, session.usage, session.status_idle, session.work_done, session.error, budget.reached, " +
+        "agent.plan (the agent's plan as it stands: version?, operation? - write or update -, steps of id?, title and status) and agent.compaction (the agent condensed its earlier context: id?, at), session.truncated " +
         "(messages were removed: a regeneration dropped the answer it replaced, an edit dropped a message and everything after it; reload the history) " +
         "and session.title (a title was generated, with what making it used, tagged purpose: title). A client ignores the types it does not know.",
       properties: {
@@ -944,6 +946,54 @@ function generateSchemas(): Record<string, unknown> {
         timestamp: { type: "integer" },
         seq: { type: "integer", description: "Event-log cursor at this frame." },
         thinking: { type: "string" },
+      },
+    },
+    PlanStep: {
+      type: "object",
+      properties: {
+        id: { oneOf: [{ type: "string" }, { type: "number" }], description: "The agent's own handle for the step." },
+        title: { type: "string", maxLength: 500 },
+        status: { type: "string", enum: ["not-started", "in-progress", "completed", "blocked"] },
+      },
+      required: ["title", "status"],
+    },
+    PlanSnapshot: {
+      type: "object",
+      description: "The agent's plan at one moment: every step, not a change. A later snapshot replaces the earlier one.",
+      properties: {
+        version: { type: "number", description: "Grows with every change the agent makes to the plan." },
+        operation: {
+          type: "string",
+          enum: ["write", "update"],
+          description:
+            "What the agent did to get here: write wrote the plan out (it made the plan, or started over), update changed steps of the plan it had. " +
+            "Lets a client tell plan created from plan updated while the turn runs. Left out when the agent does not say.",
+        },
+        steps: { type: "array", maxItems: 100, items: { $ref: "#/components/schemas/PlanStep" } },
+      },
+      required: ["steps"],
+    },
+    StreamPlanEvent: {
+      type: "object",
+      description: "The agent's plan as it stands now. Also stored as an agent.plan event, so a follower or a reload sees the same plan in the same place.",
+      properties: {
+        type: { type: "string", enum: ["stream.plan"] },
+        timestamp: { type: "integer" },
+        seq: { type: "integer", description: "Event-log cursor at this frame." },
+        plan: { $ref: "#/components/schemas/PlanSnapshot" },
+      },
+    },
+    StreamCompactionEvent: {
+      type: "object",
+      description:
+        "The agent condensed its earlier context: a marker in the flow, with nothing of what was condensed. start is live only, done is also stored as " +
+        "an agent.compaction event, skipped ends a start that found nothing to do. id pairs the frames of one pass.",
+      properties: {
+        type: { type: "string", enum: ["stream.compaction"] },
+        timestamp: { type: "integer" },
+        seq: { type: "integer", description: "Event-log cursor at this frame." },
+        id: { type: "string" },
+        phase: { type: "string", enum: ["start", "done", "skipped"] },
       },
     },
     StreamToolCallEvent: {

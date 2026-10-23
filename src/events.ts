@@ -25,6 +25,10 @@ export const EVENT_TYPES = {
   statusRunning: "session.status_running",
   toolUse: "agent.tool_use",
   toolResult: "agent.tool_result",
+  /** The agent's plan as it stands (`version?`, `operation?`: `write` or `update`, `steps`: `id?`, `title`, `status`). Stored on every change, in order with the tool events. */
+  plan: "agent.plan",
+  /** The agent condensed its earlier context (`id?`, `at`). Only a finished pass is stored; its start is a live frame. */
+  compaction: "agent.compaction",
   message: "agent.message",
   messageDelta: "agent.message.delta",
   /** Not stored: the first frame of a follower that joins a run in progress (see {@link MessageSnapshotFrame}). */

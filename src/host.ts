@@ -12,8 +12,13 @@ import type {
   FileAttachment,
   HostAgentDefinition,
   HostEvent,
+  CompactionPhase,
   MessageStatus,
   PendingAction,
+  PlanOperation,
+  PlanSnapshot,
+  PlanStep,
+  PlanStepStatus,
   PricingFn,
   StopReason,
   UsageInfo,
@@ -235,6 +240,82 @@ export function readActions(raw: unknown, where: string): Checked<PendingAction[
 }
 
 // ----------------------------------------------------------------------------
+// Plan and compaction
+// ----------------------------------------------------------------------------
+
+export const PLAN_STEP_STATUSES: readonly PlanStepStatus[] = ["not-started", "in-progress", "completed", "blocked"];
+export const PLAN_OPERATIONS: readonly PlanOperation[] = ["write", "update"];
+export const COMPACTION_PHASES: readonly CompactionPhase[] = ["start", "done", "skipped"];
+
+/** What a plan carries at most: a step title, the steps, and the id a step or a compaction pass goes by. */
+export const MAX_PLAN_TITLE = 500;
+export const MAX_PLAN_STEPS = 100;
+const MAX_ID_LENGTH = 200;
+
+/**
+ * A plan from whatever a host or an SDK reports. Only the fields of {@link PlanSnapshot} are kept (a step's owner, exit criteria
+ * or evidence are the agent's business, not the caller's); a step without a title or with a status that is not one of ours is
+ * dropped rather than guessed at, the title is clipped, and the plan is cut to {@link MAX_PLAN_STEPS} steps. A `version` or an
+ * `operation` that is not usable is left out: it is a label on the plan, not a reason to lose it.
+ */
+function readPlan(steps: unknown[], version: unknown, operation: unknown): PlanSnapshot {
+  const out: PlanStep[] = [];
+  for (const entry of steps) {
+    if (out.length >= MAX_PLAN_STEPS) break;
+    if (!isObject(entry) || typeof entry.title !== "string") continue;
+    if (!PLAN_STEP_STATUSES.includes(entry.status as PlanStepStatus)) continue;
+    const id =
+      typeof entry.id === "number" && Number.isFinite(entry.id)
+        ? entry.id
+        : isText(entry.id)
+          ? entry.id.slice(0, MAX_ID_LENGTH)
+          : undefined;
+    out.push({
+      ...(id !== undefined && { id }),
+      title: entry.title.slice(0, MAX_PLAN_TITLE),
+      status: entry.status as PlanStepStatus,
+    });
+  }
+  return {
+    ...(typeof version === "number" && Number.isFinite(version) && { version }),
+    ...(PLAN_OPERATIONS.includes(operation as PlanOperation) && { operation: operation as PlanOperation }),
+    steps: out,
+  };
+}
+
+/** The id of a compaction pass, as far as it is one. */
+const passId = (value: unknown): string | undefined => (isText(value) ? value.slice(0, MAX_ID_LENGTH) : undefined);
+
+/** Whether an SDK event was forwarded from a delegated child (a sub-agent or an `asTool` agent): its plan and passes are not the turn's own. */
+const isChildEvent = (event: Record<string, unknown>): boolean =>
+  event.subagentId !== undefined || event.subagentName !== undefined || event.delegatedTo !== undefined;
+
+/**
+ * The plan an agent-sdk `plan` event stands for, or `undefined` when it is not one to show: a read (nothing changed), an event a
+ * delegated child stamped (it is the child's plan), or one without a list. A step's title is its `title`, else its `step` text.
+ * The snapshot keeps the event's `operation` (`write` or `update`), so a client can tell a plan being created from one being changed.
+ */
+export function planFromSdkEvent(event: Record<string, unknown>): PlanSnapshot | undefined {
+  if (event.type !== "plan" || isChildEvent(event)) return undefined;
+  if (event.operation !== "write" && event.operation !== "update") return undefined;
+  if (!Array.isArray(event.todoList)) return undefined;
+  const steps = event.todoList.map((step) => (isObject(step) ? { ...step, title: step.title ?? step.step } : step));
+  return readPlan(steps, event.version, event.operation);
+}
+
+/**
+ * The compaction marker an agent-sdk `summarization` event stands for, or `undefined` for one a delegated child stamped. An event
+ * without a phase is a finished pass (what SDKs sent before passes had a start). Nothing of the summary itself is carried over.
+ */
+export function compactionFromSdkEvent(event: Record<string, unknown>): { id?: string; phase: CompactionPhase } | undefined {
+  if (event.type !== "summarization" || isChildEvent(event)) return undefined;
+  const phase = event.phase ?? "done";
+  if (!COMPACTION_PHASES.includes(phase as CompactionPhase)) return undefined;
+  const id = passId(event.id);
+  return { ...(id !== undefined && { id }), phase: phase as CompactionPhase };
+}
+
+// ----------------------------------------------------------------------------
 // Events
 // ----------------------------------------------------------------------------
 
@@ -283,6 +364,20 @@ export function readHostEvent(raw: unknown): Checked<HostEvent> {
         ok: true,
         value: { type: "stop", stopReason: raw.stopReason as StopReason, ...(optionalText(raw.detail) !== undefined && { detail: raw.detail as string }) },
       };
+    case "plan": {
+      if (!isObject(raw.plan) || !Array.isArray(raw.plan.steps)) return fail("plan.plan needs a list of steps");
+      return { ok: true, value: { type: "plan", plan: readPlan(raw.plan.steps, raw.plan.version, raw.plan.operation) } };
+    }
+    case "compaction": {
+      if (raw.phase !== undefined && !COMPACTION_PHASES.includes(raw.phase as CompactionPhase)) {
+        return fail(`compaction.phase must be one of ${COMPACTION_PHASES.join(", ")}`);
+      }
+      const id = passId(raw.id);
+      return {
+        ok: true,
+        value: { type: "compaction", ...(id !== undefined && { id }), ...(raw.phase !== undefined && { phase: raw.phase as CompactionPhase }) },
+      };
+    }
     default:
       return fail(`unknown event type "${raw.type}"`);
   }

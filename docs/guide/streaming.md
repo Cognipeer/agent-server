@@ -87,6 +87,37 @@ interface StreamThinkingEvent {
 
 A chunk of the model's reasoning, sent only when the agent reports it and `AgentInfo.showReasoning` is not `false`. Show it apart from the answer.
 
+### stream.plan
+
+```ts
+interface StreamPlanEvent {
+  type: 'stream.plan';
+  plan: {
+    version?: number;
+    operation?: 'write' | 'update';
+    steps: Array<{ id?: string | number; title: string; status: 'not-started' | 'in-progress' | 'completed' | 'blocked' }>;
+  };
+  timestamp: number;
+  seq?: number;
+}
+```
+
+The agent's plan as it stands now - every step, not a change: a later frame replaces the earlier one. Only titles and statuses are sent (a title is at most 500 characters, a plan at most 100 steps). The same plan is stored as an [`agent.plan` event](./runs.md#the-event-log), so a follower or a reload shows it in the same place among the tool calls. `operation` tells whether the agent wrote the plan out (`write`: it made the plan, or started over) or changed it (`update`), so a client can label a frame "plan created" or "plan updated"; it is left out when the agent does not say, and a client then goes by whether it has seen a plan in the turn before. An agent that may publish a plan says so with `AgentInfo.capabilities.plan`.
+
+### stream.compaction
+
+```ts
+interface StreamCompactionEvent {
+  type: 'stream.compaction';
+  id?: string;
+  phase: 'start' | 'done' | 'skipped';
+  timestamp: number;
+  seq?: number;
+}
+```
+
+The agent condensed its earlier context, so a long turn can show where. It is a marker only: nothing of what was condensed is sent. `start` comes before the pass and is live only, `done` ends it (and is stored as an `agent.compaction` event), `skipped` ends a `start` that found nothing to condense. `id`, when there is one, pairs the frames of a pass. A turn may hold several passes.
+
 ### stream.tool_call / stream.tool_result
 
 ```typescript
