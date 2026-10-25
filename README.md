@@ -4,7 +4,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@cognipeer/agent-server)](https://www.npmjs.com/package/@cognipeer/agent-server) [![npm downloads](https://img.shields.io/npm/dm/@cognipeer/agent-server)](https://www.npmjs.com/package/@cognipeer/agent-server) [![license](https://img.shields.io/github/license/Cognipeer/agent-server)](LICENSE) [![docs](https://img.shields.io/badge/docs-docs.cognipeer.com-0A7CFF)](https://docs.cognipeer.com/agent-server/) [![GitHub stars](https://img.shields.io/github/stars/Cognipeer/agent-server?style=social)](https://github.com/Cognipeer/agent-server)
 
-[Docs](https://docs.cognipeer.com/agent-server/) · [Quick start](#quick-start) · [Examples](examples/) · [Changelog](CHANGELOG.md)
+[Docs](https://docs.cognipeer.com/agent-server/) · [Quick start](#quick-start) · [Examples](examples/) · [Changelog](CHANGELOG.md) · [Contact](mailto:developer@cognipeer.com)
 
 REST API server infrastructure - a ready-made API layer for AI agents.
 
@@ -532,6 +532,8 @@ The OpenAPI spec is available at `{basePath}/docs/openapi.json`.
 | [cognipeer-observability](https://github.com/Cognipeer/cognipeer-observability) | Drop-in agent tracing for LangChain, LangGraph, OpenAI Agents and OpenTelemetry |
 
 If this project is useful to you, a ⭐ on GitHub helps other developers find it.
+
+Questions or enterprise support: [developer@cognipeer.com](mailto:developer@cognipeer.com).
 
 ## License
 
