@@ -1,5 +1,11 @@
 # @cognipeer/agent-server
 
+**Ready-made REST API layer for AI agents, for developers who want to serve and persist agents without writing the plumbing.**
+
+[![npm version](https://img.shields.io/npm/v/@cognipeer/agent-server)](https://www.npmjs.com/package/@cognipeer/agent-server) [![npm downloads](https://img.shields.io/npm/dm/@cognipeer/agent-server)](https://www.npmjs.com/package/@cognipeer/agent-server) [![license](https://img.shields.io/github/license/Cognipeer/agent-server)](LICENSE) [![docs](https://img.shields.io/badge/docs-docs.cognipeer.com-0A7CFF)](https://docs.cognipeer.com/agent-server/) [![GitHub stars](https://img.shields.io/github/stars/Cognipeer/agent-server?style=social)](https://github.com/Cognipeer/agent-server)
+
+[Docs](https://docs.cognipeer.com/agent-server/) · [Quick start](#quick-start) · [Examples](examples/) · [Changelog](CHANGELOG.md)
+
 REST API server infrastructure - a ready-made API layer for AI agents.
 
 
@@ -512,6 +518,20 @@ The OpenAPI spec is available at `{basePath}/docs/openapi.json`.
 - [ ] Rate limiting
 - [ ] Request logging
 - [ ] Metrics and monitoring
+
+## Cognipeer open-source projects
+
+| Project | What it does |
+| --- | --- |
+| [Cognipeer Console](https://github.com/Cognipeer/console) | Self-hosted AI gateway and control plane: OpenAI-compatible routing, RAG, MCP hub, guardrails and agent tracing |
+| [console-sdk](https://github.com/Cognipeer/console-sdk) | TypeScript SDK for the Cognipeer Console API |
+| [agent-sdk](https://github.com/Cognipeer/agent-sdk) | Lightweight, message-first agent runtime |
+| [chat-ui](https://github.com/Cognipeer/chat-ui) | React chat UI components for AI agents |
+| [to-markdown](https://github.com/Cognipeer/to-markdown) | Convert PDF, Office, HTML and more to Markdown for LLM pipelines |
+| [graph-builder](https://github.com/Cognipeer/graph-builder) | Turn text sources into a queryable graph |
+| [cognipeer-observability](https://github.com/Cognipeer/cognipeer-observability) | Drop-in agent tracing for LangChain, LangGraph, OpenAI Agents and OpenTelemetry |
+
+If this project is useful to you, a ⭐ on GitHub helps other developers find it.
 
 ## License
 
