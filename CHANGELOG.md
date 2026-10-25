@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-25
+
+### Fixed
+
+- **`stream.done` carries the answer's files.** The files a turn produced (`HostTurnResult.files`, a handler's `files`) were stored on the assistant message but left off the done frame, so a chat showed them only after it loaded the conversation again (a reload). The frame now has `files`, as the stored message has them; it is left out when the answer has none. For a storage that reports the stored answer itself (a console portal), these are the files of its record. `StreamDoneEvent.files` is new in the types and the OpenAPI document. A client that does not read it is unaffected.
+
 ## [0.9.0] - 2026-10-23
 
 ### Added
