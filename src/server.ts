@@ -4607,6 +4607,8 @@ export class AgentServer {
         content,
         title: conversationTitle,
         usage: step.usage,
+        // The files the answer carries, as the stored message has them: a chat shows them without loading the conversation again
+        ...(assistant.files?.length && { files: assistant.files }),
         ...(legacyStatus && { status: legacyStatus }),
         ...(pendingActions.length > 0 && { pendingActions }),
         ...(saved.warnings && { warnings: saved.warnings }),

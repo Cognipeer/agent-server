@@ -1054,6 +1054,7 @@ function generateSchemas(): Record<string, unknown> {
         messageId: { type: "string" },
         content: { type: "string" },
         usage: { $ref: "#/components/schemas/UsageInfo" },
+        files: { type: "array", items: { $ref: "#/components/schemas/FileAttachment" }, description: "The files the answer carries, as the stored message has them" },
         status: { type: "string", enum: ["completed", "requires_action", "incomplete", "cancelled"] },
         pendingActions: { type: "array", items: { $ref: "#/components/schemas/PendingAction" } },
         warnings: { type: "array", items: { $ref: "#/components/schemas/TurnWarning" } },
