@@ -67,7 +67,12 @@
     "rest-api",
     "server",
     "cognipeer",
-    "llm"
+    "llm",
+    "ai-agent",
+    "express",
+    "sse",
+    "openapi",
+    "agent-server"
   ],
   "author": "Cognipeer",
   "license": "MIT",
