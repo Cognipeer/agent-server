@@ -87,7 +87,7 @@ A malformed event (an unknown type, a `tool_use` without an id) is ignored, with
 | `status` | `requires_action` is implied by `pendingActions`; `incomplete` / `cancelled` say the turn did not finish |
 | `stopReason` | `end_turn` (default), `requires_action` (implied), `cancelled`, `max_turns`, `limit`, `budget_reached`, `error`. The result wins over an emitted `stop` |
 | `usage` | `{ inputTokens, outputTokens, totalTokens, cachedInputTokens, costUsd, model }`. Replaces the emitted `usage` events |
-| `files` | Files the answer produced (`{ id, name, mimeType, size }`, already stored with `POST /files`) |
+| `files` | Files the answer produced (`{ id, name, mimeType, size }`, already stored with `POST /files`). They are on the message and on `stream.done` |
 | `metadata`, `detail` | Reported with the turn; `detail` is the `detail` of `session.status_idle` |
 
 A result the server cannot use - not an object, a `status` it does not know, a pending action without an id, two actions with one id, an `expiresAt` that is no date - is a `500

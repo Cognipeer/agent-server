@@ -2181,6 +2181,8 @@ export interface StreamDoneEvent extends StreamEventBase {
   /** Auto-generated conversation title (only present on the first message) */
   title?: string;
   usage?: UsageInfo;
+  /** The files the answer carries (`HostTurnResult.files`, a handler's `files`), as the stored message has them. */
+  files?: FileAttachment[];
   /** Only set when the turn did not simply complete (e.g. `"requires_action"`). */
   status?: MessageStatus;
   pendingActions?: PendingAction[];

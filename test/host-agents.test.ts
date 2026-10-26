@@ -814,6 +814,61 @@ function hostSuite() {
       await t.resolve("a");
       expect(text).toBe("hello");
     });
+
+    it("puts the files an answer produced on the done frame, as the message keeps them", async () => {
+      const store = async (t: Awaited<ReturnType<typeof boot>>, name: string) =>
+        ((await t.call("POST", "/files", {
+          body: { file: { name, content: Buffer.from(`# ${name}`).toString("base64"), mimeType: "text/markdown" }, conversationId: t.id },
+        })).body as any).file as { id: string; name: string; mimeType: string; size: number };
+      const produced: Array<{ id: string; name: string; mimeType: string; size: number }> = [];
+      const t = await boot({
+        invoke: async (input) =>
+          input.message === "pause" ? { content: "", pendingActions: [approval("a")] } : { content: "Here it is.", files: produced.slice(0, 1) },
+        resolveAction: async () => ({ content: "Written.", files: produced.slice(1) }),
+      });
+      produced.push(await store(t, "report.md"), await store(t, "after.md"));
+      const attachment = ({ id, name, mimeType, size }: (typeof produced)[number]) => ({ id, name, mimeType, size });
+
+      const done = (await t.drain(await t.send("write it", { stream: true }))).at(-1);
+      expect(done).toMatchObject({ type: "stream.done", content: "Here it is." });
+      expect(done!.files).toEqual([attachment(produced[0]!)]);
+
+      // the continuation of an answered request ends the same way
+      await t.send("pause");
+      const resumed = (await t.drain(await t.call("POST", `/conversations/${t.id}/actions/a`, { body: { resolution: allow, stream: true } }))).at(-1);
+      expect(resumed).toMatchObject({ type: "stream.done", content: "Written." });
+      expect(resumed!.files).toEqual([attachment(produced[1]!)]);
+
+      const answers = ((await t.get()).messages as any[]).filter((m) => m.role === "assistant" && m.files?.length);
+      expect(answers.map((m) => m.files)).toEqual([[attachment(produced[0]!)], [attachment(produced[1]!)]]);
+      // an answer without files says nothing about them
+      const plain = (await t.drain(await t.send("pause", { stream: true }))).at(-1);
+      expect(plain).not.toHaveProperty("files");
+    });
+
+    it("sends the files of the stored answer, for a host whose storage keeps its own transcript", async () => {
+      // A storage that reports the answer as its own transcript has it (a console portal: the answer and the files the
+      // agent wrote are already stored there, and the turn result names none)
+      const storage = currentStorage();
+      const kept = { id: "file_kept", name: "out.md", mimeType: "text/markdown", size: 3 };
+      const keeping = new Proxy(storage, {
+        get(target, prop) {
+          if (prop === "createMessage") {
+            return (params: Parameters<StorageProvider["createMessage"]>[0], ctx?: Parameters<StorageProvider["createMessage"]>[1]) =>
+              target.createMessage(params.role === "assistant" ? { ...params, files: [kept] } : params, ctx);
+          }
+          const value = Reflect.get(target, prop, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const server = createAgentServer({ basePath: "/api", storage: keeping, ...quiet() });
+      server.registerHostAgent({ info: { id: "h", name: "Host" }, invoke: async () => ({ content: "Written." }) });
+      const id = ((await server.handleRoute("POST", "/conversations", { query: {}, body: { agentId: "h" } })).body as any).conversation.id;
+      const res = await server.handleRoute("POST", `/conversations/${id}/messages`, { query: {}, body: { message: "write", stream: true } });
+      let text = "";
+      for await (const chunk of res.stream!) text += chunk;
+      expect(parseSse(text).at(-1)).toMatchObject({ type: "stream.done", content: "Written.", files: [kept] });
+    });
   });
 }
 

@@ -169,6 +169,7 @@ interface StreamDoneEvent {
   content: string;
   title?: string;                    // generated on the first exchange (absent when the request set titleFrame)
   usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cachedInputTokens?: number; costUsd?: number };   // this turn only
+  files?: FileAttachment[];          // the files the answer carries, as the stored message has them
   budget?: { maxCostUsd: number; onReach: 'pause' | 'stop' };   // when the conversation has a budget ...
   spentUsd?: number;                                            // ... and what it has spent, this turn included
   status?: 'requires_action' | 'incomplete' | 'cancelled';   // only when the turn did not simply complete
