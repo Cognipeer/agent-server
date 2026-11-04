@@ -86,7 +86,7 @@
   },
   "dependencies": {
     "nanoid": "^5.0.7",
-    "zod": "^3.23.8"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
@@ -103,7 +103,7 @@
     "typescript": "^5.4.5",
     "typescript-eslint": "^8.71.1",
     "vitepress": "^1.0.0",
-    "vitest": "^1.6.0"
+    "vitest": "^4.1.11"
   },
   "peerDependencies": {
     "@cognipeer/agent-sdk": ">=0.1.0",
